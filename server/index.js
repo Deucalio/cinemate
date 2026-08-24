@@ -765,8 +765,14 @@ app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => 
     let activeProcess = null;
     let fileStream = null;
 
+    if (startSec > 0) {
+      const startByteEstimate = Math.floor((startSec / 3300) * fileSize);
+      const pSize = torrentInfo ? (torrentInfo.piece_size || 2 * 1024 * 1024) : 2 * 1024 * 1024;
+      await prioritizeByteRange(matchedHash, startByteEstimate, startByteEstimate + 12 * 1024 * 1024, pSize, 0, 3000);
+    }
+
     if (isEAC3orDTS || ext === '.mkv') {
-      console.log(`[Audio Remuxer] Converting audio to AAC stereo for universal browser sound: "${torrentName}" (Start: ${startSec}s)`);
+      console.log(`[Audio Remuxer] Converting audio to AAC stereo for universal browser sound: "${torrentName}" (Seek: ${startSec}s)`);
 
       res.writeHead(200, {
         'Content-Type': 'video/mp4',

@@ -298,13 +298,13 @@ export class PlayerModalManager {
     playPauseBtn.addEventListener('click', () => this._togglePlay());
     video.addEventListener('click', () => this._togglePlay());
 
-    // Skip
+    // Skip forward/back
     skipBackBtn.addEventListener('click', () => {
-      video.currentTime = Math.max(0, video.currentTime - 10);
+      this._seekTo(Math.max(0, this._getEffectiveTime() - 10));
     });
 
     skipFwdBtn.addEventListener('click', () => {
-      video.currentTime = Math.min(video.duration || this.duration, video.currentTime + 10);
+      this._seekTo(this._getEffectiveTime() + 10);
     });
 
     // Volume
@@ -703,13 +703,40 @@ export class PlayerModalManager {
     if (icon) icon.textContent = '▶';
   }
 
+  _getEffectiveTime() {
+    return (this.currentStartSec || 0) + (this.videoElement ? this.videoElement.currentTime : 0);
+  }
+
+  _seekTo(targetSeconds) {
+    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    const clamped = Math.max(0, Math.min(totalDur, targetSeconds));
+
+    if (this.currentMagnet) {
+      this.currentStartSec = clamped;
+      const newUrl = streamingBridge.getStreamUrl(
+        this.currentMagnet,
+        this.currentStreamTitle,
+        this.sessionId,
+        null,
+        clamped
+      );
+      this._showBufferingHUD('Seeking to ' + this._formatTime(clamped) + '...', 'Transcoding and fast-forwarding stream');
+      this.videoElement.src = newUrl;
+      this.videoElement.load();
+      this._play();
+    } else if (this.videoElement) {
+      this.videoElement.currentTime = clamped;
+    }
+  }
+
   _scrub(e) {
     const timeline = this.modal.querySelector('#player-timeline-wrap');
     if (!timeline) return;
     const rect = timeline.getBoundingClientRect();
     const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
     const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
-    this.videoElement.currentTime = pos * totalDur;
+    const targetSeconds = Math.floor(pos * totalDur);
+    this._seekTo(targetSeconds);
   }
 
   _updateProgressBar() {
@@ -718,7 +745,7 @@ export class PlayerModalManager {
     if (!progressFill || !progressHandle) return;
 
     const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
-    const current = this.videoElement ? this.videoElement.currentTime : 0;
+    const current = this._getEffectiveTime();
     const percent = Math.min(100, Math.max(0, (current / totalDur) * 100));
 
     progressFill.style.width = `${percent}%`;
@@ -729,7 +756,7 @@ export class PlayerModalManager {
     const curEl = this.modal ? this.modal.querySelector('#player-current-time') : null;
     const durEl = this.modal ? this.modal.querySelector('#player-total-duration') : null;
     const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
-    const current = this.videoElement ? this.videoElement.currentTime : 0;
+    const current = this._getEffectiveTime();
 
     if (curEl) curEl.textContent = this._formatTime(current);
     if (durEl) durEl.textContent = this._formatTime(totalDur);
