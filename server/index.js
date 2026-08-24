@@ -1,13 +1,14 @@
 /**
  * CineStream Pro — High-Performance Streaming Bridge
  * Powered by qBittorrent (127.0.0.1:18080) & Prowlarr (127.0.0.1:9696)
- * Direct disk sequential streaming with HTTP 206 Range-Request seeking
+ * Direct disk sequential streaming with HTTP 206 Range-Request seeking & FFmpeg fMP4 remuxing
  */
 
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -19,19 +20,18 @@ const PORT = process.env.PORT || 8888;
 const QBT_URL = process.env.QBT_URL || 'http://127.0.0.1:18080';
 const QBT_USER = process.env.QBT_USER || 'admin';
 const QBT_PASS = process.env.QBT_PASS || 'adminadmin';
-const QBT_SAVE_PATH = process.env.QBT_SAVE_PATH || '/tmp/cinestream-media';
 
 const PROWLARR_URL = process.env.PROWLARR_URL || 'http://127.0.0.1:9696';
 const PROWLARR_KEY = process.env.PROWLARR_KEY || '5a197b3359f247e8a69c7866650058e4';
 
-// Ensure download directory exists
-if (!fs.existsSync(QBT_SAVE_PATH)) {
-  try {
-    fs.mkdirSync(QBT_SAVE_PATH, { recursive: true });
-  } catch (e) {
-    console.warn(`Could not create ${QBT_SAVE_PATH}, fallback to /tmp`);
-  }
-}
+// Common download directories to search
+const SEARCH_DIRS = [
+  '/var/lib/stream/incoming',
+  '/var/lib/stream/incoming/tv-stream',
+  '/tmp/cinestream-media',
+  '/home/rdpuser/Downloads',
+  '/tmp'
+];
 
 // Enable CORS
 app.use(cors({
@@ -68,12 +68,11 @@ class QBittorrentClient {
       const setCookie = res.headers.get('set-cookie');
       if (setCookie) {
         this.cookie = setCookie.split(';')[0];
-        console.log(`[qBittorrent] Logged in successfully`);
         return true;
       }
       return false;
     } catch (err) {
-      console.warn(`[qBittorrent] Login failed:`, err.message);
+      console.warn(`[qBittorrent] Login warning:`, err.message);
       return false;
     }
   }
@@ -90,7 +89,6 @@ class QBittorrentClient {
 
     let res = await fetch(url, { ...options, headers });
     if (res.status === 403 || res.status === 401) {
-      // Re-login and retry
       await this.login();
       if (this.cookie) headers['Cookie'] = this.cookie;
       res = await fetch(url, { ...options, headers });
@@ -103,12 +101,11 @@ class QBittorrentClient {
     return match ? match[1].toLowerCase() : null;
   }
 
-  async addTorrent(magnet, savePath = QBT_SAVE_PATH) {
+  async addTorrent(magnet) {
     await this.login();
 
     const formData = new URLSearchParams();
     formData.append('urls', magnet);
-    formData.append('savepath', savePath);
     formData.append('sequentialDownload', 'true');
     formData.append('firstLastPiecePrio', 'true');
 
@@ -121,57 +118,78 @@ class QBittorrentClient {
     return res.ok;
   }
 
-  async getTorrentInfo(infoHash) {
-    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/info?hashes=${infoHash}`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    return Array.isArray(data) && data.length > 0 ? data[0] : null;
-  }
-
-  async getTorrentFiles(infoHash) {
-    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/files?hash=${infoHash}`);
+  async getAllTorrents() {
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/info`);
     if (!res.ok) return [];
     return await res.json();
+  }
+
+  async findTorrent(infoHash, nameHint = '') {
+    const list = await this.getAllTorrents();
+    if (!Array.isArray(list) || list.length === 0) return null;
+
+    if (infoHash) {
+      const match = list.find(t =>
+        t.hash.toLowerCase() === infoHash.toLowerCase() ||
+        (t.magnet_uri && t.magnet_uri.toLowerCase().includes(infoHash.toLowerCase()))
+      );
+      if (match) return match;
+    }
+
+    if (nameHint) {
+      const hintClean = nameHint.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const matchName = list.find(t => t.name && t.name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(hintClean));
+      if (matchName) return matchName;
+    }
+
+    // Return the latest active downloading or seeding torrent
+    return list.find(t => t.state === 'downloading' || t.state === 'stalledDL' || t.state === 'seeding') || list[0];
   }
 }
 
 const qbt = new QBittorrentClient(QBT_URL, QBT_USER, QBT_PASS);
 
-// ----------------- HELPER: LOCATE VIDEO FILE ON DISK -----------------
+// ----------------- HELPER: RECURSIVE MEDIA FILE FINDER -----------------
 
 const VIDEO_EXTS = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v', '.ts'];
 
-function findMediaFileRecursively(dir) {
-  if (!fs.existsSync(dir)) return null;
+function findMediaFileRecursively(targetPath) {
+  if (!targetPath || !fs.existsSync(targetPath)) return null;
 
-  const stat = fs.statSync(dir);
-  if (!stat.isDirectory()) {
-    const ext = path.extname(dir).toLowerCase();
-    return VIDEO_EXTS.includes(ext) ? dir : null;
-  }
+  try {
+    const stat = fs.statSync(targetPath);
+    if (!stat.isDirectory()) {
+      const ext = path.extname(targetPath).toLowerCase();
+      return VIDEO_EXTS.includes(ext) ? targetPath : null;
+    }
 
-  let largestFile = null;
-  let maxBytes = 0;
+    let largestFile = null;
+    let maxBytes = 0;
 
-  function scan(currentDir) {
-    const files = fs.readdirSync(currentDir);
-    for (const f of files) {
-      const fullPath = path.join(currentDir, f);
-      const s = fs.statSync(fullPath);
-      if (s.isDirectory()) {
-        scan(fullPath);
-      } else {
-        const ext = path.extname(f).toLowerCase();
-        if (VIDEO_EXTS.includes(ext) && s.size > maxBytes) {
-          maxBytes = s.size;
-          largestFile = fullPath;
-        }
+    function scan(currentDir) {
+      const files = fs.readdirSync(currentDir);
+      for (const f of files) {
+        const full = path.join(currentDir, f);
+        try {
+          const s = fs.statSync(full);
+          if (s.isDirectory()) {
+            scan(full);
+          } else {
+            const ext = path.extname(f).toLowerCase();
+            if (VIDEO_EXTS.includes(ext) && s.size > maxBytes) {
+              maxBytes = s.size;
+              largestFile = full;
+            }
+          }
+        } catch {}
       }
     }
-  }
 
-  scan(dir);
-  return largestFile;
+    scan(targetPath);
+    return largestFile;
+  } catch {
+    return null;
+  }
 }
 
 // ----------------- ROUTES -----------------
@@ -181,14 +199,20 @@ function findMediaFileRecursively(dir) {
  */
 app.get('/health', async (req, res) => {
   let qbtStatus = false;
+  let torrentsCount = 0;
   try {
     qbtStatus = await qbt.login();
+    if (qbtStatus) {
+      const list = await qbt.getAllTorrents();
+      torrentsCount = list.length;
+    }
   } catch {}
 
   res.json({
     status: 'online',
     service: 'CineStream Torrent Bridge (qBittorrent & Prowlarr)',
     qBittorrentConnected: qbtStatus,
+    activeTorrentsCount: torrentsCount,
     qbtEndpoint: QBT_URL,
     prowlarrEndpoint: PROWLARR_URL,
     uptime: process.uptime()
@@ -196,11 +220,11 @@ app.get('/health', async (req, res) => {
 });
 
 /**
- * Proxy Prowlarr Search (Lets frontend search VPS Prowlarr on 127.0.0.1 without tunnel)
+ * Proxy Prowlarr Search (Lets frontend query Prowlarr on VPS loopback)
  */
 app.get('/api/search', async (req, res) => {
   const query = req.query.query;
-  const limit = req.query.limit || 15;
+  const limit = req.query.limit || 20;
 
   if (!query) {
     return res.status(400).json({ error: 'Missing query parameter' });
@@ -228,10 +252,24 @@ app.get('/api/search', async (req, res) => {
 });
 
 /**
- * Streaming Endpoint: Adds magnet to qBittorrent & streams file via HTTP 206 Partial Content
+ * Active Torrents Status Endpoint
+ */
+app.get('/api/status', async (req, res) => {
+  try {
+    const list = await qbt.getAllTorrents();
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Streaming Endpoint: Connects to qBittorrent & streams file via HTTP 206 Partial Content
  */
 app.get('/api/stream', async (req, res) => {
   const magnet = req.query.magnet || req.query.link;
+  const nameHint = req.query.title || '';
+
   if (!magnet) {
     return res.status(400).send('Missing magnet link parameter');
   }
@@ -242,45 +280,44 @@ app.get('/api/stream', async (req, res) => {
     // 1. Add to qBittorrent with sequential priority
     await qbt.addTorrent(magnet);
 
-    // 2. Poll for torrent metadata & file path (up to 12 seconds)
+    // 2. Poll for torrent metadata & file path
     let torrentInfo = null;
     let targetFilePath = null;
 
-    for (let i = 0; i < 12; i++) {
-      if (infoHash) {
-        torrentInfo = await qbt.getTorrentInfo(infoHash);
-      }
+    for (let i = 0; i < 15; i++) {
+      torrentInfo = await qbt.findTorrent(infoHash, nameHint);
       if (torrentInfo && torrentInfo.content_path) {
         targetFilePath = findMediaFileRecursively(torrentInfo.content_path);
-        if (targetFilePath && fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size > 1024 * 1024) {
+        if (targetFilePath && fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size > 512 * 1024) {
           break;
         }
       }
+
+      // Check common search directories
+      for (const d of SEARCH_DIRS) {
+        targetFilePath = findMediaFileRecursively(d);
+        if (targetFilePath && fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size > 512 * 1024) {
+          break;
+        }
+      }
+
+      if (targetFilePath) break;
       await new Promise(r => setTimeout(r, 1000));
     }
 
-    // If content_path not yet created, search download dir directly
-    if (!targetFilePath && torrentInfo && torrentInfo.name) {
-      const directPath = path.join(QBT_SAVE_PATH, torrentInfo.name);
-      targetFilePath = findMediaFileRecursively(directPath);
-    }
-
-    // 3. Fallback check inside download dir
-    if (!targetFilePath) {
-      targetFilePath = findMediaFileRecursively(QBT_SAVE_PATH);
-    }
-
     if (!targetFilePath || !fs.existsSync(targetFilePath)) {
-      return res.status(503).send('Buffering metadata from BitTorrent swarm... Please retry in a few seconds.');
+      return res.status(503).send('Buffering metadata and initial chunks from BitTorrent swarm... Please retry in a moment.');
     }
 
-    // 4. Stream media file with HTTP 206 Partial Content (Range Requests)
+    console.log(`[Stream] Serving video file: ${targetFilePath}`);
+
+    // 3. Serve file via HTTP Range (206 Partial Content)
     const stat = fs.statSync(targetFilePath);
     const fileSize = stat.size;
     const range = req.headers.range;
 
     const ext = path.extname(targetFilePath).toLowerCase();
-    const contentType = ext === '.mp4' ? 'video/mp4' : (ext === '.webm' || ext === '.mkv' ? 'video/webm' : 'video/mp4');
+    const contentType = ext === '.mp4' ? 'video/mp4' : (ext === '.webm' ? 'video/webm' : 'video/mp4');
 
     if (!range) {
       res.writeHead(200, {
@@ -323,7 +360,7 @@ app.get('/api/stream', async (req, res) => {
 // Start Server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
-  console.log(`🎬 CineStream Torrent Bridge (qBittorrent Powered)`);
+  console.log(`🎬 CineStream Torrent Bridge (qBittorrent & Prowlarr)`);
   console.log(`📡 Port:               ${PORT}`);
   console.log(`📥 qBittorrent:        ${QBT_URL}`);
   console.log(`🔍 Prowlarr Proxy:     ${PROWLARR_URL}`);
