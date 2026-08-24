@@ -767,7 +767,7 @@ app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => 
       'Accept-Ranges': 'bytes',
       'Content-Length': chunkSize,
       'Content-Type': contentType,
-      'Cache-Control': 'no-cache'
+      'Cache-Control': 'no-cache' 
     });
 
     const stream = fs.createReadStream(targetFilePath, { start, end });
