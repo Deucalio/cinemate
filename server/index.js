@@ -172,12 +172,19 @@ function getPrimaryVideoFile(torrent) {
 async function getOrAddWebTorrent(magnet, nameHint = '') {
   return new Promise((resolve, reject) => {
     try {
-      const existing = wtClient.get(magnet);
+      const hashMatch = magnet.match(/urn:btih:([a-zA-Z0-9]+)/i);
+      const infoHash = hashMatch ? hashMatch[1].toLowerCase() : null;
+
+      const existing = (infoHash ? wtClient.get(infoHash) : null) || wtClient.get(magnet);
       if (existing) {
         if (existing.files && existing.files.length > 0) {
           return resolve(existing);
         }
-        existing.once('ready', () => resolve(existing));
+        if (typeof existing.on === 'function') {
+          existing.on('ready', () => resolve(existing));
+        } else {
+          return resolve(existing);
+        }
         return;
       }
 
@@ -185,26 +192,27 @@ async function getOrAddWebTorrent(magnet, nameHint = '') {
         path: DOWNLOAD_DIR,
         announce: DEFAULT_TRACKERS,
         destroyStoreOnDestroy: true
+      }, (readyTorrent) => {
+        console.log(`[WebTorrent] Torrent ready: "${readyTorrent.name}" (${(readyTorrent.length / (1024 * 1024)).toFixed(1)} MB, ${readyTorrent.files.length} files)`);
+        resolve(readyTorrent);
       });
 
-      const timeout = setTimeout(() => {
-        if (!torrent.files || torrent.files.length === 0) {
+      if (typeof torrent.on === 'function') {
+        torrent.on('error', (err) => {
+          console.warn(`[WebTorrent Error]:`, err.message);
+          reject(err);
+        });
+      }
+
+      // 30s timeout fallback
+      setTimeout(() => {
+        if (torrent.files && torrent.files.length > 0) {
+          resolve(torrent);
+        } else {
           console.warn(`[WebTorrent] Metadata timeout for: ${nameHint || magnet}`);
-          resolve(torrent); // Return torrent even if still resolving metadata
+          resolve(torrent);
         }
-      }, 25000);
-
-      torrent.on('ready', () => {
-        clearTimeout(timeout);
-        console.log(`[WebTorrent] Torrent ready: "${torrent.name}" (${(torrent.length / (1024 * 1024)).toFixed(1)} MB, ${torrent.files.length} files)`);
-        resolve(torrent);
-      });
-
-      torrent.on('error', (err) => {
-        clearTimeout(timeout);
-        console.warn(`[WebTorrent Error]:`, err.message);
-        reject(err);
-      });
+      }, 30000);
 
     } catch (e) {
       reject(e);
@@ -331,12 +339,16 @@ app.get('/api/stream', checkRateLimit('stream', 20, 60000), async (req, res) => 
     // Wait if metadata is still resolving
     if (!torrent.files || torrent.files.length === 0) {
       await new Promise((resolve) => {
-        const onReady = () => {
-          torrent.off('ready', onReady);
+        if (typeof torrent.on === 'function') {
+          const onReady = () => {
+            if (typeof torrent.removeListener === 'function') torrent.removeListener('ready', onReady);
+            resolve();
+          };
+          torrent.on('ready', onReady);
+          setTimeout(resolve, 15000);
+        } else {
           resolve();
-        };
-        torrent.once('ready', onReady);
-        setTimeout(resolve, 15000); // 15s max wait
+        }
       });
     }
 
