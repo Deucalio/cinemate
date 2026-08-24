@@ -53,13 +53,27 @@ export const streamingBridge = {
   },
 
   /**
-   * Query Prowlarr / Torznab Indexer API
+   * Query Prowlarr Indexer API (via VPS Bridge proxy or direct)
    */
   async searchIndexer(query) {
-    const { baseUrl, apiKey } = this.getProwlarrConfig();
-    const endpoint = `${baseUrl}/api/v1/search?query=${encodeURIComponent(query)}&limit=15`;
+    const serverUrl = this.getStreamServerUrl();
+    const proxyEndpoint = `${serverUrl}/api/search?query=${encodeURIComponent(query)}&limit=20`;
 
     try {
+      // 1. Try via VPS bridge proxy (handles loopback & API key automatically)
+      const proxyRes = await fetch(proxyEndpoint);
+      if (proxyRes.ok) {
+        const results = await proxyRes.json();
+        return this.parseAndRankReleases(results);
+      }
+    } catch (e) {
+      // Fall through to direct
+    }
+
+    // 2. Fallback to direct Prowlarr URL
+    try {
+      const { baseUrl, apiKey } = this.getProwlarrConfig();
+      const endpoint = `${baseUrl}/api/v1/search?query=${encodeURIComponent(query)}&limit=15`;
       const response = await fetch(endpoint, {
         headers: {
           'X-Api-Key': apiKey,
@@ -67,16 +81,15 @@ export const streamingBridge = {
         }
       });
 
-      if (!response.ok) {
-        throw new Error(`Indexer error ${response.status}: ${response.statusText}`);
+      if (response.ok) {
+        const results = await response.json();
+        return this.parseAndRankReleases(results);
       }
-
-      const results = await response.json();
-      return this.parseAndRankReleases(results);
     } catch (err) {
-      console.warn(`Indexer search unavailable for "${query}":`, err.message);
-      return [];
+      console.warn(`Indexer search failed for "${query}":`, err.message);
     }
+
+    return [];
   },
 
   /**
