@@ -32,9 +32,13 @@ export class PlayerModalManager {
     const episode = options.episode || 1;
     const existingProgress = store.getMovieProgress(movie.id);
 
+    // Accurate runtime calculation from TMDB
+    const runtimeMinutes = movie.runtime || (movie.episode_run_time && movie.episode_run_time[0]) || (isTV ? 55 : 120);
+    this.totalRuntimeSeconds = runtimeMinutes * 60;
+
     // Initial starting time
     this.currentTime = (existingProgress && existingProgress.currentTime) ? existingProgress.currentTime : 0;
-    this.duration = (existingProgress && existingProgress.duration) ? existingProgress.duration : 7200;
+    this.duration = this.totalRuntimeSeconds;
 
     const modal = document.createElement('div');
     modal.className = 'player-modal-backdrop animate-fade-in';
@@ -401,7 +405,11 @@ export class PlayerModalManager {
 
     // Video metadata & timeupdate
     video.addEventListener('loadedmetadata', () => {
-      this.duration = video.duration || this.duration;
+      if (video.duration && isFinite(video.duration) && video.duration > 300) {
+        this.duration = video.duration;
+      } else {
+        this.duration = this.totalRuntimeSeconds || 3300;
+      }
       if (this.currentTime > 0) {
         video.currentTime = this.currentTime;
       }
@@ -640,12 +648,14 @@ export class PlayerModalManager {
   _updateBufferedRange() {
     const bufferedEl = this.modal ? this.modal.querySelector('.player-timeline-buffered') : null;
     const video = this.videoElement;
-    if (!bufferedEl || !video || !video.duration) return;
+    if (!bufferedEl || !video) return;
+
+    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
 
     if (video.buffered && video.buffered.length > 0) {
       const bufferedEnd = video.buffered.end(video.buffered.length - 1);
-      const percent = (bufferedEnd / video.duration) * 100;
-      bufferedEl.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+      const percent = Math.min(100, Math.max(0, (bufferedEnd / totalDur) * 100));
+      bufferedEl.style.width = `${percent}%`;
     }
   }
 
@@ -679,24 +689,31 @@ export class PlayerModalManager {
     if (!timeline) return;
     const rect = timeline.getBoundingClientRect();
     const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    this.videoElement.currentTime = pos * (this.videoElement.duration || this.duration);
+    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    this.videoElement.currentTime = pos * totalDur;
   }
 
   _updateProgressBar() {
-    const progressFill = this.modal.querySelector('#player-timeline-progress');
-    const progressHandle = this.modal.querySelector('#player-timeline-handle');
+    const progressFill = this.modal ? this.modal.querySelector('#player-timeline-progress') : null;
+    const progressHandle = this.modal ? this.modal.querySelector('#player-timeline-handle') : null;
     if (!progressFill || !progressHandle) return;
 
-    const percent = ((this.videoElement.currentTime / (this.videoElement.duration || this.duration)) * 100) || 0;
+    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    const current = this.videoElement ? this.videoElement.currentTime : 0;
+    const percent = Math.min(100, Math.max(0, (current / totalDur) * 100));
+
     progressFill.style.width = `${percent}%`;
     progressHandle.style.left = `${percent}%`;
   }
 
   _updateTimeDisplay() {
-    const curEl = this.modal.querySelector('#player-current-time');
-    const durEl = this.modal.querySelector('#player-total-duration');
-    if (curEl) curEl.textContent = this._formatTime(this.videoElement.currentTime);
-    if (durEl) durEl.textContent = this._formatTime(this.videoElement.duration || this.duration);
+    const curEl = this.modal ? this.modal.querySelector('#player-current-time') : null;
+    const durEl = this.modal ? this.modal.querySelector('#player-total-duration') : null;
+    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    const current = this.videoElement ? this.videoElement.currentTime : 0;
+
+    if (curEl) curEl.textContent = this._formatTime(current);
+    if (durEl) durEl.textContent = this._formatTime(totalDur);
   }
 
   _updateVolIcon(vol) {
