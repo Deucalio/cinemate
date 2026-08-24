@@ -1,76 +1,205 @@
 # CineStream Pro (CineMate) — Production Technical Architecture & Specification
 
 > **Next-Generation Cinema Discovery & Piece-Aware Distributed Media Streaming Engine**  
-> Built with vanilla JavaScript, modern CSS design tokens, TMDB metadata, Prowlarr Torznab indexer aggregation, and native qBittorrent HTTP 206 piece-aware streaming.
+> Built with vanilla JavaScript, modern CSS design tokens, TMDB metadata, Prowlarr Torznab indexer aggregation, native qBittorrent HTTP 206 piece-aware streaming, and a PostgreSQL database powered by Prisma ORM.
 
 ---
 
 ## 1. Executive Architecture Overview
 
-CineStream Pro bridges a cinematic web client with an on-demand, piece-aware BitTorrent streaming daemon. Rather than waiting for full multi-gigabyte media downloads, the bridge maps HTTP byte-range requests directly to BitTorrent piece indices, dynamically prioritizes required chunks from the swarm, verifies piece readiness on disk, and pipes continuous media streams to the browser.
+CineStream Pro bridges a cinematic web client with an on-demand, piece-aware BitTorrent streaming daemon and a persistent PostgreSQL database. Rather than waiting for full multi-gigabyte media downloads, the bridge maps HTTP byte-range requests directly to BitTorrent piece indices, dynamically prioritizes required chunks from the swarm, verifies piece readiness on disk, and pipes continuous media streams to the browser while synchronizing user accounts, watch progress, and social reviews.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                                CLIENT BROWSER (PORT 3000)                              │
 │                                                                                        │
 │   ┌─────────────────────┐    ┌─────────────────────┐    ┌──────────────────────────┐   │
-│   │   Discover / Home   │    │  Movie & TV Modals  │    │  Cinema Theater Player   │   │
-│   │   Trending, Genres  │    │  Trailers & Reviews │    │  Timeline, Buffering HUD │   │
+│   │   Discover / Home   │    │  User Auth & Modals │    │  Cinema Theater Player   │   │
+│   │   Trending, Genres  │    │  Diary & Reviews    │    │  Timeline, Buffering HUD │   │
 │   └──────────┬──────────┘    └──────────┬──────────┘    └────────────┬─────────────┘   │
 └──────────────┼──────────────────────────┼────────────────────────────┼─────────────────┘
                │                          │                            │
                ▼                          ▼                            ▼
-      ┌─────────────────┐        ┌─────────────────┐          ┌──────────────────────────┐
-      │    TMDB API     │        │  LocalStorage   │          │   VPS Bridge (:8888)     │
-      │  v3 / Discover  │        │  State & Diary  │          │   Rate Limit + Piece Map │
-      └─────────────────┘        └─────────────────┘          └────────────┬─────────────┘
-                                                                           │
-                                      ┌────────────────────────────────────┴──────────────────────────┐
-                                      │                                                               │
-                                      ▼                                                               ▼
-                         ┌─────────────────────────┐                                     ┌─────────────────────────┐
-                         │     Prowlarr :9696      │                                     │   qBittorrent :18080    │
-                         │ Torznab Community Feeds │                                     │  Sequential C++ Engine  │
-                         │ (Loopback Protected)    │                                     │ (Loopback Protected)    │
-                         └─────────────────────────┘                                     └────────────┬────────────┘
-                                                                                                      │ (Piece Verification)
-                                                                                                      ▼
-                                                                                         ┌─────────────────────────┐
-                                                                                         │  HTTP 206 Piece Stream  │
-                                                                                         │  Heartbeat Auto-GC      │
-                                                                                         └─────────────────────────┘
+      ┌─────────────────┐        ┌───────────────────────────────────────────────────────┐
+      │    TMDB API     │        │              VPS BACKEND BRIDGE (:8888)               │
+      │  v3 / Discover  │        │       Express + Prisma ORM + Piece-Aware Engine       │
+      └─────────────────┘        └────────────┬─────────────────────────────┬────────────┘
+                                              │                             │
+                               ┌──────────────┴──────────────┐              │
+                               ▼                             ▼              ▼
+                  ┌─────────────────────────┐   ┌────────────────────────┐  │
+                  │     PostgreSQL :5432    │   │     Prowlarr :9696     │  │
+                  │   Prisma Managed DB     │   │ Torznab Community Feeds│  │
+                  │  Users, Progress, Lists │   │ (Loopback Protected)   │  │
+                  └─────────────────────────┘   └────────────────────────┘  │
+                                                                            │
+                                                                            ▼
+                                                               ┌─────────────────────────┐
+                                                               │   qBittorrent :18080    │
+                                                               │  Sequential C++ Engine  │
+                                                               └────────────┬────────────┘
+                                                                            │ (Piece Verification)
+                                                                            ▼
+                                                               ┌─────────────────────────┐
+                                                               │  HTTP 206 Piece Stream  │
+                                                               │  Heartbeat Auto-GC      │
+                                                               └─────────────────────────┘
 ```
 
 ---
 
-## 2. Core Feature Inventory
+## 2. Database Schema & User Account Architecture (Prisma + PostgreSQL)
 
-### 🎬 1. Cinematic Frontend & User Experience
-- **Dynamic Hero Spotlight:** High-impact backdrop billboard with automated rotation, video trailer previews, instant playback, and watchlist integration.
-- **Categorized Carousels:** Trending Movies, Popular TV Shows, Top Rated, Action, Sci-Fi, Drama, and Documentaries powered by TMDB.
-- **Deep Discovery View:** Multi-parameter catalog exploration with custom sorting (Popularity, Rating, Release Date), genre multi-select, release year filters, and minimum rating sliders.
-- **Letterboxd-Style Social Features:**
-  - **Watch Diary:** Log viewings with specific watch dates, personal rewatch counters, and custom notes.
-  - **Star Rating & In-Depth Reviews:** Rate on a 5-star scale (with half-stars) and write long-form reviews stored locally.
-  - **Custom Curated Lists:** Create named public/private watchlists with custom descriptions and drag-and-drop item management.
-  - **Profile & Analytics:** Visual charts of total movies watched, hours logged, favorite genre breakdown, and top-rated titles.
+The system utilizes PostgreSQL via **Prisma ORM** for persistent data, enforcing relational integrity, foreign key cascading, and type-safe transactions.
 
-### 📡 2. Media Bridge & Indexer Search
-- **Community Indexer Aggregation (Prowlarr Proxy):**
-  - Queries Torznab feeds via Prowlarr on the VPS loopback (`http://127.0.0.1:9696`), bypassing browser CORS and eliminating SSH tunnel requirements.
-  - Parses releases for resolution tags (`4K UHD`, `1080p`, `720p`), audio profiles (`Dolby Atmos`, `5.1 DTS`), video codecs (`HEVC`, `x264`), file sizes, and active seeder counts.
-  - Intelligently ranks releases with the highest health and seeder availability at the top.
+### Database Models ([server/prisma/schema.prisma](file:///d:/vscode/netflix/server/prisma/schema.prisma))
 
-### 🍿 3. Cinema Theater Player
-- **HTML5 Streaming Video Player:**
-  - Fullscreen toggle, timeline scrubber with progress and buffered ranges, 10s skip/rewind shortcuts, volume slider with mute toggle, and playback speed control (0.5x to 2x).
-  - **Live Buffering & Swarm HUD:** Visual overlay providing feedback during connection, peer discovery, piece availability polling, and stream buffering.
-  - **Interactive Stream Sources Drawer:** Browse available releases or paste custom `magnet:?xt=` links directly inside the player.
-  - **Seamless Resume Playback:** Remembers your exact timestamp and progress across sessions.
+```prisma
+model User {
+  id           String            @id @default(uuid())
+  username     String            @unique
+  email        String            @unique
+  passwordHash String            @map("password_hash")
+  avatarUrl    String?           @map("avatar_url")
+  role         String            @default("user")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+
+  watchProgress WatchProgress[]
+  reviews       Review[]
+  userLists     UserList[]
+  sessions      PlaybackSession[]
+
+  @@map("users")
+}
+
+model WatchProgress {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  mediaId     String   @map("media_id") // e.g. "movie_123" or "tv_456_s01e02"
+  mediaType   String   @default("movie") @map("media_type")
+  title       String
+  posterPath  String?  @map("poster_path")
+  season      Int?
+  episode     Int?
+  currentTime Float    @map("current_time") // Seconds
+  duration    Float    // Total seconds
+  isCompleted Boolean  @default(false) @map("is_completed")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, mediaId])
+  @@index([userId])
+  @@map("watch_progress")
+}
+
+model Review {
+  id           String    @id @default(uuid())
+  userId       String    @map("user_id")
+  mediaId      String    @map("media_id")
+  mediaType    String    @default("movie") @map("media_type")
+  title        String
+  posterPath   String?   @map("poster_path")
+  rating       Float     // 0.5 to 5.0 scale
+  reviewText   String?   @map("review_text") @db.Text
+  watchedDate  DateTime? @map("watched_date")
+  rewatchCount Int       @default(0) @map("rewatch_count")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, mediaId])
+  @@index([userId])
+  @@map("reviews")
+}
+
+model UserList {
+  id          String     @id @default(uuid())
+  userId      String     @map("user_id")
+  name        String
+  description String?    @db.Text
+  isPrivate   Boolean    @default(false) @map("is_private")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  user  User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items ListItem[]
+
+  @@index([userId])
+  @@map("user_lists")
+}
+
+model ListItem {
+  id         String   @id @default(uuid())
+  listId     String   @map("list_id")
+  mediaId    String   @map("media_id")
+  mediaType  String   @default("movie") @map("media_type")
+  title      String
+  posterPath String?  @map("poster_path")
+  addedAt    DateTime @default(now()) @map("added_at")
+
+  list UserList @relation(fields: [listId], references: [id], onDelete: Cascade)
+
+  @@unique([listId, mediaId])
+  @@index([listId])
+  @@map("list_items")
+}
+
+model PlaybackSession {
+  id            String   @id @default(uuid())
+  userId        String?  @map("user_id")
+  sessionId     String   @unique @map("session_id")
+  torrentHash   String   @map("torrent_hash")
+  torrentName   String?  @map("torrent_name")
+  clientIp      String?  @map("client_ip")
+  lastHeartbeat DateTime @default(now()) @map("last_heartbeat")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([torrentHash])
+  @@index([sessionId])
+  @@map("playback_sessions")
+}
+```
 
 ---
 
-## 3. The Piece-Aware Streaming Engine
+## 3. Complete REST API Specifications
+
+### 🔐 Authentication (`/api/auth`)
+| Method | Endpoint | Description | Auth Required |
+|---|---|---|---|
+| `POST` | `/api/auth/register` | Register a new user (`username`, `email`, `password`) | No |
+| `POST` | `/api/auth/login` | Login with username/email & password, returns JWT | No |
+| `GET` | `/api/auth/me` | Fetch authenticated user profile & count metrics | Yes (`Bearer <JWT>`) |
+
+### 📊 User Data & Sync (`/api/user`)
+| Method | Endpoint | Description | Auth Required |
+|---|---|---|---|
+| `GET` | `/api/user/progress` | Fetch user's cross-device watch history & resume timestamps | Yes |
+| `POST` | `/api/user/progress` | Upsert playback timestamp, duration, and completion status | Yes |
+| `GET` | `/api/user/reviews` | Fetch personal watch diary & Letterboxd-style ratings | Yes |
+| `POST` | `/api/user/reviews` | Add or update star rating, watch date, and review text | Yes |
+| `GET` | `/api/user/lists` | Fetch custom curated watchlists with included items | Yes |
+| `POST` | `/api/user/lists` | Create a new named custom collection (public or private) | Yes |
+| `POST` | `/api/user/lists/:id/items` | Add title to a specific user collection | Yes |
+
+### 📡 Streaming, Telemetry & Maintenance
+| Method | Endpoint | Description | Auth Required |
+|---|---|---|---|
+| `GET` | `/api/stream` | Piece-aware HTTP 206 Partial Content video streaming | Optional / Session |
+| `POST` | `/api/stream/session/heartbeat` | 10-second player heartbeat to maintain `ACTIVE` state | No |
+| `GET` | `/api/search` | Rate-limited (30/min) Prowlarr Torznab proxy search | No |
+| `GET` | `/api/status` | List active downloads, speeds, and state from qBittorrent | No |
+| `POST` | `/api/cleanup` | Trigger manual disk garbage collection | Yes (`X-Admin-Token`) |
+| `GET` | `/health` | System health, RAM, Load Avg, Disk Usage & Bandwidth | No |
+
+---
+
+## 4. The Piece-Aware Streaming Engine
 
 A standard `fs.createReadStream()` call on an in-progress torrent file does not guarantee byte availability, because torrent clients pre-allocate sparse file boundaries on disk. CineStream Pro implements a **Byte-Range to Torrent-Piece Mapper & Availability Layer**:
 
@@ -103,7 +232,7 @@ When a user scrubs from `00:03:00` to `01:25:00`, the browser requests a new byt
 
 ---
 
-## 4. Defensive Security & Torrent Sanitization
+## 5. Defensive Security & Torrent Sanitization
 
 CineStream adheres to strict defensive security practices when processing third-party torrent swarms:
 
@@ -126,20 +255,11 @@ Torrent Contents (Untrusted Swarm Data)
    └── 5. Safe Candidate Selected for Streaming
 ```
 
-### Zero-Trust Internal Service Isolation
-- **Strict Loopback Binding:** qBittorrent (`127.0.0.1:18080`) and Prowlarr (`127.0.0.1:9696`) are bound exclusively to the VPS loopback interface.
-- **Zero Credential Leakage:** Prowlarr API keys and qBittorrent admin passwords are stored in server-side `.env` files and never sent to or accessible by client browsers.
-
-### API Rate Limiting & Admin Authorization
-- **Search Rate Limiting:** Enforces a maximum of 30 search requests per minute per IP.
-- **Stream Rate Limiting:** Enforces a maximum of 10 new stream initializations per minute per IP to prevent swarm flooding.
-- **Admin Maintenance Token:** The `/api/cleanup` maintenance endpoint requires a valid `X-Admin-Token` header, preventing unauthorized callers from purging cached content.
-
 ---
 
-## 5. Playback Session Architecture & Lifecycle
+## 6. Playback Session Architecture & Lifecycle
 
-Browsers generate dozens of short-lived HTTP connections during single-stream playback (range chunking, pre-fetching, paused sockets). Relying solely on `req.on('close')` creates false disconnects. CineStream Pro separates **TCP connection state** from **Playback Session State**:
+Browsers generate dozens of short-lived HTTP connections during single-stream playback. CineStream Pro separates **TCP connection state** from **Playback Session State**:
 
 ```
                   ┌─────────────────────────────────────────────────────────┐
@@ -177,82 +297,16 @@ Browsers generate dozens of short-lived HTTP connections during single-stream pl
 
 ---
 
-## 6. Host Impact, Resource Bottlenecks & Telemetry
+## 7. Multi-Tier VPS Disk Protection & Quota System
 
-While the Node.js Express process uses minimal CPU for I/O piping, multi-stream torrent acquisition creates real load on **Disk I/O** and **Network Bandwidth**:
+To prevent disk starvation on production VPS hosts shared with other services:
 
-```
-RESOURCE BOTTLENECK PROFILE (5 Concurrent Torrents)
-
-CPU Load      ██░░░░░░░░  (Low-Moderate, mostly libtorrent encryption/hashing)
-System RAM    ███░░░░░░░  (Controlled by PM2 & qBittorrent cache limits)
-Disk I/O      ████████░░  (High during simultaneous writes & HTTP reads)
-Network RX/TX ██████████  (High bandwidth consumption during active grabs)
-```
-
-### Live Host Telemetry in `/health`:
-The `/health` endpoint exposes real-time host metrics:
-```json
-{
-  "status": "online",
-  "service": "CineStream Torrent Bridge (Protected & Piece-Aware)",
-  "hostTelemetry": {
-    "loadAverage": [0.42, 0.38, 0.35],
-    "ramTotalMb": 7964,
-    "ramFreeMb": 5120,
-    "diskUsagePercent": "22%",
-    "diskFreeGb": "314.5 GB",
-    "dlSpeed": "10.05 MB/s",
-    "upSpeed": "0.45 MB/s"
-  },
-  "limits": {
-    "maxActiveTorrents": 5,
-    "maxConcurrentStreams": 15,
-    "maxDiskUsagePercent": "85%",
-    "idleCleanupMinutes": 15
-  }
-}
-```
-
-### Multi-Tier VPS Disk Protection
 | Threshold | Trigger Condition | System Action |
 |---|---|---|
 | **Normal Operation** | Disk Usage < 80% | Standard sequential streaming, 15-minute idle Auto-GC. |
 | **Soft Cap** | Disk Usage ≥ 85% | Rejects new incoming torrent stream additions (`507 Insufficient Storage`). Existing active streams continue uninterrupted. |
 | **Aggressive GC** | Disk Usage ≥ 88% | Auto-GC immediately purges all idle torrents regardless of the 15-minute timer. |
 | **Emergency Halt** | Disk Usage ≥ 95% | Automatically pauses all background downloading daemons to protect host database and OS services. |
-
----
-
-## 7. Container Compatibility & Future Transcoding Roadmap
-
-### Phase 1: Native In-Browser Playback (Current)
-HTML5 `<video>` decodes standard web-friendly containers:
-- **MP4 (H.264 + AAC):** 🟢 100% Universal native support across all browsers.
-- **WebM (VP8/VP9 + Opus):** 🟢 Native in Chrome, Edge, and Firefox.
-- **MP4 (HEVC / H.265):** 🟡 Native on Safari & modern Chrome/Edge with hardware acceleration.
-
-### Phase 2: Transcoding Escape Hatch (Future Roadmap)
-For unsupported formats (e.g. MKV with DTS audio or 10-bit HEVC on legacy browsers), a future phase will introduce an asynchronous FFmpeg worker pipeline:
-
-```
-Torrent Media Source
-        │
-        ▼
-ffprobe inspection
-        │
-        ├── Is Browser Compatible? (MP4 / H.264 / AAC)
-        │         │
-        │        YES ──> Direct HTTP 206 Stream (Phase 1)
-        │
-        └── NO (MKV / DTS / TrueHD / HEVC)
-                  │
-                  ▼
-              FFmpeg Worker
-                  │
-                  ▼
-          HLS / CMAF Packaging ──> Hls.js Adaptive Player
-```
 
 ---
 
@@ -272,7 +326,7 @@ npm run dev
 http://localhost:3000/#home
 ```
 
-### VPS Production Bridge (Ubuntu 22.04 LTS)
+### VPS Production Setup (Ubuntu 22.04 LTS + PostgreSQL)
 ```bash
 # 1. Connect to VPS
 ssh rdpuser@<VPS_IP>
@@ -280,10 +334,48 @@ ssh rdpuser@<VPS_IP>
 # 2. Navigate to project root & pull latest code
 cd /opt/cinemate
 sudo git pull
+sudo chown -R $USER:$USER /opt/cinemate
 
-# 3. Restart PM2 background daemon
+# 3. Install backend dependencies & sync Prisma database
+cd /opt/cinemate/server
+npm install
+npx prisma db push
+
+# 4. Restart PM2 background daemon
 sudo pm2 restart cinestream-bridge
 
-# 4. Verify health & security telemetry
+# 5. Verify health & telemetry
 curl http://localhost:8888/health
+```
+
+Health endpoint response:
+```json
+{
+  "status": "online",
+  "service": "CineStream Torrent Bridge (Protected & Piece-Aware)",
+  "security": {
+    "rateLimitingActive": true,
+    "pathTraversalGuards": true,
+    "adminAuthEnabled": true
+  },
+  "qBittorrentConnected": true,
+  "activeTorrentsCount": 1,
+  "activePlaybackSessions": 1,
+  "hostTelemetry": {
+    "loadAverage": [0.35, 0.40, 0.38],
+    "ramTotalMb": 7964,
+    "ramFreeMb": 4890,
+    "diskUsagePercent": "22%",
+    "diskFreeGb": "314.5 GB",
+    "dlSpeed": "10.05 MB/s",
+    "upSpeed": "0.45 MB/s"
+  },
+  "limits": {
+    "maxActiveTorrents": 5,
+    "maxConcurrentStreams": 15,
+    "maxDiskUsagePercent": "85%",
+    "idleCleanupMinutes": 15
+  },
+  "uptime": 240.5
+}
 ```
