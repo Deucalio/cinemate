@@ -61,7 +61,14 @@ app.use(cors({
   exposedHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length', 'Content-Type', 'X-Piece-Available', 'X-Piece-Index']
 }));
 
+import authRouter from './routes/auth.js';
+import userDataRouter from './routes/userData.js';
+
 app.use(express.json());
+
+// ----------------- ROUTE MOUNTS -----------------
+app.use('/api/auth', authRouter);
+app.use('/api/user', userDataRouter);
 
 // ----------------- RATE LIMITING MIDDLEWARE -----------------
 

@@ -1,0 +1,119 @@
+// CineStream Pro — Prisma Schema for PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String            @id @default(uuid())
+  username     String            @unique
+  email        String            @unique
+  passwordHash String            @map("password_hash")
+  avatarUrl    String?           @map("avatar_url")
+  role         String            @default("user")
+  createdAt    DateTime          @default(now()) @map("created_at")
+  updatedAt    DateTime          @updatedAt @map("updated_at")
+
+  watchProgress WatchProgress[]
+  reviews       Review[]
+  userLists     UserList[]
+  sessions      PlaybackSession[]
+
+  @@map("users")
+}
+
+model WatchProgress {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  mediaId     String   @map("media_id") // e.g. "movie_123" or "tv_456_s01e02"
+  mediaType   String   @default("movie") @map("media_type") // "movie" | "tv"
+  title       String
+  posterPath  String?  @map("poster_path")
+  season      Int?
+  episode     Int?
+  currentTime Float    @map("current_time") // Seconds
+  duration    Float    // Total seconds
+  isCompleted Boolean  @default(false) @map("is_completed")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, mediaId])
+  @@index([userId])
+  @@map("watch_progress")
+}
+
+model Review {
+  id           String    @id @default(uuid())
+  userId       String    @map("user_id")
+  mediaId      String    @map("media_id")
+  mediaType    String    @default("movie") @map("media_type")
+  title        String
+  posterPath   String?   @map("poster_path")
+  rating       Float     // 0.5 to 5.0 scale
+  reviewText   String?   @map("review_text") @db.Text
+  watchedDate  DateTime? @map("watched_date")
+  rewatchCount Int       @default(0) @map("rewatch_count")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, mediaId])
+  @@index([userId])
+  @@map("reviews")
+}
+
+model UserList {
+  id          String     @id @default(uuid())
+  userId      String     @map("user_id")
+  name        String
+  description String?    @db.Text
+  isPrivate   Boolean    @default(false) @map("is_private")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+
+  user  User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items ListItem[]
+
+  @@index([userId])
+  @@map("user_lists")
+}
+
+model ListItem {
+  id         String   @id @default(uuid())
+  listId     String   @map("list_id")
+  mediaId    String   @map("media_id")
+  mediaType  String   @default("movie") @map("media_type")
+  title      String
+  posterPath String?  @map("poster_path")
+  addedAt    DateTime @default(now()) @map("added_at")
+
+  list UserList @relation(fields: [listId], references: [id], onDelete: Cascade)
+
+  @@unique([listId, mediaId])
+  @@index([listId])
+  @@map("list_items")
+}
+
+model PlaybackSession {
+  id            String   @id @default(uuid())
+  userId        String?  @map("user_id")
+  sessionId     String   @unique @map("session_id")
+  torrentHash   String   @map("torrent_hash")
+  torrentName   String?  @map("torrent_name")
+  clientIp      String?  @map("client_ip")
+  lastHeartbeat DateTime @default(now()) @map("last_heartbeat")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([torrentHash])
+  @@index([sessionId])
+  @@map("playback_sessions")
+}
