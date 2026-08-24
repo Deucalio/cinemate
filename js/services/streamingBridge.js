@@ -118,8 +118,13 @@ export const streamingBridge = {
 
       // Detect features
       const isHDR = /hdr|dolby|vision|dv/i.test(rawTitle);
-      const isAtmos = /atmos|dts|5\.1|7\.1/i.test(rawTitle);
+      const isEAC3 = /ddp|dd\+|eac3|ac3|atmos/i.test(rawTitle);
+      const isDTS = /dts/i.test(rawTitle);
+      const isAAC = /aac|mp3|stereo|2\.0/i.test(rawTitle) || !isEAC3;
+      const audioBadge = isEAC3 ? 'Dolby 5.1/Atmos' : (isDTS ? 'DTS 5.1' : 'AAC Stereo ✓');
+      const isAtmos = isEAC3 || isDTS;
       const codec = /hevc|x265|h265/i.test(rawTitle) ? 'HEVC' : (/x264|h264/i.test(rawTitle) ? 'H.264' : 'Web');
+      const isUniversal = isAAC && (codec === 'H.264' || /\.mp4/i.test(rawTitle));
 
       return {
         title: rawTitle,
@@ -131,16 +136,24 @@ export const streamingBridge = {
         resolution,
         isHDR,
         isAtmos,
+        isAAC,
+        audioBadge,
         codec,
+        isUniversal,
         indexer: indexerName,
         publishDate: item.publishDate
       };
     });
 
-    // Filter items with magnet and sort by seeders descending
+    // Filter items with magnet and sort by compatibility & seeders descending
     return parsed
       .filter(item => Boolean(item.magnet))
-      .sort((a, b) => (b.seeders || 0) - (a.seeders || 0));
+      .sort((a, b) => {
+        // Prioritize universal browser playback if seeders are comparable
+        if (a.isUniversal && !b.isUniversal && (a.seeders >= 5)) return -1;
+        if (!a.isUniversal && b.isUniversal && (b.seeders >= 5)) return 1;
+        return (b.seeders || 0) - (a.seeders || 0);
+      });
   },
 
   /**

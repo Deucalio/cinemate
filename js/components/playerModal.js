@@ -552,8 +552,9 @@ export class PlayerModalManager {
                 <div class="source-badge-row">
                   <span class="source-pill pill-${rel.resolution.replace(/\s+/g, '').toLowerCase()}">${rel.resolution}</span>
                   ${rel.isHDR ? `<span class="source-pill pill-hdr">HDR</span>` : ''}
-                  ${rel.isAtmos ? `<span class="source-pill pill-audio">5.1 ATMOS</span>` : ''}
+                  <span class="source-pill pill-audio">${rel.audioBadge || (rel.isAtmos ? '5.1 ATMOS' : 'Stereo')}</span>
                   <span class="source-pill pill-codec">${rel.codec}</span>
+                  ${rel.isUniversal ? `<span class="source-pill" style="background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34,197,94,0.4);">⭐ Web Audio (AAC)</span>` : ''}
                   <span class="source-indexer-tag">${_escape(rel.indexer)}</span>
                 </div>
                 <h4 class="source-release-title" title="${_escape(rel.title)}">${_escape(rel.title)}</h4>
@@ -668,12 +669,28 @@ export class PlayerModalManager {
   }
 
   _play() {
+    this.videoElement.muted = false;
+    this.videoElement.volume = 1.0;
+    this._updateVolIcon(1.0);
+
+    const volSlider = this.modal ? this.modal.querySelector('#ctrl-vol-slider') : null;
+    if (volSlider) volSlider.value = 1.0;
+
     this.videoElement.play().then(() => {
       this.isPlaying = true;
-      const icon = this.modal.querySelector('#ctrl-play-icon');
+      const icon = this.modal ? this.modal.querySelector('#ctrl-play-icon') : null;
       if (icon) icon.textContent = '❚❚';
     }).catch(() => {
-      this.isPlaying = false;
+      // Browser autoplay restriction fallback: start muted then unmute on user interaction
+      this.videoElement.muted = true;
+      this.videoElement.play().then(() => {
+        this.isPlaying = true;
+        const icon = this.modal ? this.modal.querySelector('#ctrl-play-icon') : null;
+        if (icon) icon.textContent = '❚❚';
+        toast.info('Click anywhere on the video or press Space to unmute audio!', '🔊');
+      }).catch(() => {
+        this.isPlaying = false;
+      });
     });
   }
 
