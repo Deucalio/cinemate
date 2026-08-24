@@ -86,6 +86,38 @@ setInterval(() => {
 
 // ----------------- ROUTES -----------------
 
+function getOrCreateTorrent(torrentId, callback) {
+  let torrent = client.get(torrentId);
+
+  if (torrent) {
+    if (torrent.ready) {
+      return callback(null, torrent);
+    }
+    torrent.on('ready', () => callback(null, torrent));
+    torrent.on('error', (err) => callback(err));
+    return;
+  }
+
+  try {
+    torrent = client.add(torrentId, { destroyStoreOnDestroy: true }, (t) => {
+      callback(null, t);
+    });
+
+    torrent.on('error', (err) => {
+      console.error('[Torrent Error]:', err.message);
+    });
+  } catch (err) {
+    // If already added
+    const fallback = client.get(torrentId);
+    if (fallback) {
+      if (fallback.ready) return callback(null, fallback);
+      fallback.on('ready', () => callback(null, fallback));
+      return;
+    }
+    callback(err);
+  }
+}
+
 /**
  * Health check endpoint
  */
@@ -103,7 +135,6 @@ app.get('/health', (req, res) => {
 
 /**
  * Torrent Info Endpoint
- * Retrieves metadata, files list, and seeders count without full download
  */
 app.get('/api/torrent-info', (req, res) => {
   const torrentId = req.query.magnet || req.query.link;
@@ -111,26 +142,11 @@ app.get('/api/torrent-info', (req, res) => {
     return res.status(400).json({ error: 'Missing magnet or link query parameter' });
   }
 
-  let existing = client.get(torrentId);
-  if (existing && existing.ready) {
-    trackTorrentActivity(existing.infoHash);
-    return res.json({
-      name: existing.name,
-      infoHash: existing.infoHash,
-      totalLength: existing.length,
-      numPeers: existing.numPeers,
-      progress: existing.progress,
-      downloadSpeed: existing.downloadSpeed,
-      files: existing.files.map((f, idx) => ({
-        index: idx,
-        name: f.name,
-        length: f.length,
-        path: f.path
-      }))
-    });
-  }
+  getOrCreateTorrent(torrentId, (err, torrent) => {
+    if (err || !torrent) {
+      return res.status(500).json({ error: err ? err.message : 'Could not resolve torrent' });
+    }
 
-  client.add(torrentId, { destroyStoreOnDestroy: true }, (torrent) => {
     trackTorrentActivity(torrent.infoHash);
     res.json({
       name: torrent.name,
@@ -139,7 +155,7 @@ app.get('/api/torrent-info', (req, res) => {
       numPeers: torrent.numPeers,
       progress: torrent.progress,
       downloadSpeed: torrent.downloadSpeed,
-      files: torrent.files.map((f, idx) => ({
+      files: (torrent.files || []).map((f, idx) => ({
         index: idx,
         name: f.name,
         length: f.length,
@@ -161,7 +177,11 @@ app.get('/api/stream', (req, res) => {
     return res.status(400).send('Missing magnet or link query parameter');
   }
 
-  const handleTorrentStream = (torrent) => {
+  getOrCreateTorrent(torrentId, (err, torrent) => {
+    if (err || !torrent) {
+      return res.status(500).send(err ? err.message : 'Failed to load torrent');
+    }
+
     trackTorrentActivity(torrent.infoHash);
 
     // Select target video file
@@ -216,20 +236,7 @@ app.get('/api/stream', (req, res) => {
     req.on('close', () => {
       stream.destroy();
     });
-  };
-
-  const existing = client.get(torrentId);
-  if (existing) {
-    if (existing.ready) {
-      handleTorrentStream(existing);
-    } else {
-      existing.once('ready', () => handleTorrentStream(existing));
-    }
-  } else {
-    client.add(torrentId, { destroyStoreOnDestroy: true }, (torrent) => {
-      handleTorrentStream(torrent);
-    });
-  }
+  });
 });
 
 // Start Server
