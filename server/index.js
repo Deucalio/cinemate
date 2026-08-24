@@ -59,18 +59,111 @@ wtClient.on('error', (err) => {
   console.warn('[WebTorrent Engine Warning]:', err.message);
 });
 
-// Top Tier High-Speed BitTorrent Trackers
+// Top Tier High-Speed BitTorrent Trackers (Auto-injected into bare magnets)
 const DEFAULT_TRACKERS = [
   'udp://tracker.opentrackr.org:1337/announce',
   'udp://open.tracker.cl:1337/announce',
-  'udp://9.rarbg.to:2920/announce',
+  'udp://open.demonii.com:1337/announce',
   'udp://tracker.openbittorrent.com:6969/announce',
   'udp://tracker.torrent.eu.org:451/announce',
   'udp://explodie.org:6969/announce',
   'udp://open.stealth.si:80/announce',
   'udp://p4p.arenabg.com:1337/announce',
-  'http://tracker.openbittorrent.com:80/announce'
+  'http://tracker.openbittorrent.com:80/announce',
+  'udp://tracker.moeking.me:6969/announce',
+  'udp://9.rarbg.to:2920/announce',
+  'udp://tracker.dler.org:6969/announce'
 ];
+
+/**
+ * Injects public trackers into bare magnet links to prevent DHT delay
+ */
+function enrichMagnetWithTrackers(magnet) {
+  if (!magnet || !magnet.startsWith('magnet:')) return magnet;
+  let enriched = magnet;
+  for (const tr of DEFAULT_TRACKERS) {
+    if (!enriched.includes(encodeURIComponent(tr)) && !enriched.includes(tr)) {
+      enriched += `&tr=${encodeURIComponent(tr)}`;
+    }
+  }
+  return enriched;
+}
+
+// ----------------- QBITTORRENT METADATA ACCELERATOR -----------------
+
+class QBittorrentClient {
+  constructor(baseUrl, username, password) {
+    this.baseUrl = baseUrl.replace(/\/$/, '');
+    this.username = username;
+    this.password = password;
+    this.cookie = null;
+  }
+
+  async login() {
+    try {
+      const params = new URLSearchParams();
+      params.append('username', this.username);
+      params.append('password', this.password);
+      const res = await fetch(`${this.baseUrl}/api/v2/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+      });
+      const setCookie = res.headers.get('set-cookie');
+      if (setCookie) {
+        this.cookie = setCookie.split(';')[0];
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  async fetchWithAuth(url, options = {}) {
+    if (!this.cookie) await this.login();
+    const headers = options.headers || {};
+    if (this.cookie) headers['Cookie'] = this.cookie;
+    let res = await fetch(url, { ...options, headers });
+    if (res.status === 403 || res.status === 401) {
+      await this.login();
+      if (this.cookie) headers['Cookie'] = this.cookie;
+      res = await fetch(url, { ...options, headers });
+    }
+    return res;
+  }
+
+  async addTorrent(magnet) {
+    try {
+      await this.login();
+      const formData = new URLSearchParams();
+      formData.append('urls', magnet);
+      formData.append('sequentialDownload', 'true');
+      formData.append('firstLastPiecePrio', 'true');
+      await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/add`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: formData.toString()
+      });
+    } catch {}
+  }
+
+  async exportTorrent(hash) {
+    try {
+      await this.login();
+      const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/export?hash=${hash}`);
+      if (res.ok) {
+        const ab = await res.arrayBuffer();
+        if (ab.byteLength > 100) {
+          return Buffer.from(ab);
+        }
+      }
+    } catch {}
+    return null;
+  }
+}
+
+const qbt = new QBittorrentClient(QBT_URL, QBT_USER, QBT_PASS);
 
 // ----------------- SYSTEM STATE & SESSION REGISTRY -----------------
 
@@ -167,12 +260,13 @@ function getPrimaryVideoFile(torrent) {
 }
 
 /**
- * Get or add torrent into WebTorrent engine with retry & tracker injection
+ * Get or add torrent into WebTorrent engine with instant tracker injection + qBittorrent accelerator
  */
-async function getOrAddWebTorrent(magnet, nameHint = '') {
-  if (!magnet) return null;
+async function getOrAddWebTorrent(rawMagnet, nameHint = '') {
+  if (!rawMagnet) return null;
+  const magnet = enrichMagnetWithTrackers(rawMagnet);
 
-  return new Promise((resolve) => {
+  return new Promise(async (resolve) => {
     try {
       const hashMatch = magnet.match(/urn:btih:([a-zA-Z0-9]+)/i);
       const infoHash = hashMatch ? hashMatch[1].toLowerCase() : null;
@@ -180,15 +274,15 @@ async function getOrAddWebTorrent(magnet, nameHint = '') {
       // 1. Check if torrent is already active in client
       let torrent = (infoHash ? wtClient.get(infoHash) : null) || wtClient.get(magnet);
 
-      if (torrent) {
-        if (torrent.files && torrent.files.length > 0) {
-          return resolve(torrent);
-        }
-        if (torrent.ready) {
-          return resolve(torrent);
-        }
-      } else {
-        // 2. Add to WebTorrent
+      if (torrent && (torrent.ready || (torrent.files && torrent.files.length > 0))) {
+        return resolve(torrent);
+      }
+
+      // 2. Parallel qBittorrent accelerator (adds to libtorrent C++ swarm in parallel)
+      qbt.addTorrent(magnet).catch(() => {});
+
+      // 3. Add to WebTorrent with enriched trackers
+      if (!torrent) {
         try {
           torrent = wtClient.add(magnet, {
             path: DOWNLOAD_DIR,
@@ -200,15 +294,13 @@ async function getOrAddWebTorrent(magnet, nameHint = '') {
         }
       }
 
-      if (!torrent) {
-        return resolve(null);
-      }
+      if (!torrent) return resolve(null);
 
       if (torrent.ready || (torrent.files && torrent.files.length > 0)) {
         return resolve(torrent);
       }
 
-      // 3. Wait for 'ready' event
+      // 4. Wait for 'ready' event
       let resolved = false;
       const onReady = () => {
         if (!resolved) {
@@ -222,7 +314,38 @@ async function getOrAddWebTorrent(magnet, nameHint = '') {
         torrent.on('ready', onReady);
       }
 
-      // 20s timeout fallback
+      // 5. Fast-poll qBittorrent for instant .torrent metadata export
+      if (infoHash) {
+        (async () => {
+          for (let i = 0; i < 8; i++) {
+            if (resolved) break;
+            await new Promise(r => setTimeout(r, 1200));
+            if (resolved) break;
+
+            const torrentBuf = await qbt.exportTorrent(infoHash);
+            if (torrentBuf && torrentBuf.length > 0 && !resolved) {
+              try {
+                const fromBuf = wtClient.add(torrentBuf, { path: DOWNLOAD_DIR });
+                if (fromBuf.ready || (fromBuf.files && fromBuf.files.length > 0)) {
+                  resolved = true;
+                  console.log(`[qBt Accelerator] Injected torrent metadata for: "${fromBuf.name}"`);
+                  return resolve(fromBuf);
+                }
+                fromBuf.on('ready', () => {
+                  if (!resolved) {
+                    resolved = true;
+                    console.log(`[qBt Accelerator] Injected torrent metadata for: "${fromBuf.name}"`);
+                    resolve(fromBuf);
+                  }
+                });
+              } catch {}
+              break;
+            }
+          }
+        })();
+      }
+
+      // 6. 15s timeout fallback
       setTimeout(() => {
         if (!resolved) {
           resolved = true;
@@ -233,7 +356,7 @@ async function getOrAddWebTorrent(magnet, nameHint = '') {
             resolve(torrent);
           }
         }
-      }, 20000);
+      }, 15000);
 
     } catch (e) {
       console.warn('[WebTorrent getOrAdd Error]:', e.message);
