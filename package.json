@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "npx -y serve . -l 3000",
     "start": "npx -y serve . -l 3000",
+    "stream-server": "node server/index.js",
     "serve": "python -m http.server 3000"
   },
   "keywords": ["netflix", "letterboxd", "tmdb", "streaming", "cinema", "diary"],

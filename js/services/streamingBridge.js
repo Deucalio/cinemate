@@ -1,0 +1,160 @@
+/**
+ * Streaming Bridge & Prowlarr / Torznab Search Service
+ * Connects CineStream to local/VPS torrent streaming backend and indexer search API
+ */
+
+import { store } from '../state/store.js';
+
+export const streamingBridge = {
+  /**
+   * Get configured Streaming Bridge URL (Local or VPS)
+   */
+  getStreamServerUrl() {
+    return localStorage.getItem('cinestream_stream_server_url') || 'http://77.37.74.7:8888';
+  },
+
+  setStreamServerUrl(url) {
+    localStorage.setItem('cinestream_stream_server_url', url.replace(/\/$/, ''));
+  },
+
+  /**
+   * Get configured Prowlarr / Torznab API URL & Key
+   */
+  getProwlarrConfig() {
+    return {
+      baseUrl: localStorage.getItem('cinestream_prowlarr_url') || 'http://localhost:9696',
+      apiKey: localStorage.getItem('cinestream_prowlarr_key') || '5a197b3359f247e8a69c7866650058e4'
+    };
+  },
+
+  setProwlarrConfig({ baseUrl, apiKey }) {
+    if (baseUrl) localStorage.setItem('cinestream_prowlarr_url', baseUrl.replace(/\/$/, ''));
+    if (apiKey) localStorage.setItem('cinestream_prowlarr_key', apiKey.trim());
+  },
+
+  /**
+   * Search available torrent stream sources for a Movie
+   */
+  async searchMovieStreams(movieTitle, year = '') {
+    const cleanTitle = movieTitle.replace(/[:\-]/g, ' ').replace(/\s+/g, ' ').trim();
+    const query = year ? `${cleanTitle} ${year}` : cleanTitle;
+    return this.searchIndexer(query);
+  },
+
+  /**
+   * Search available torrent stream sources for a TV Series Episode
+   */
+  async searchTVStreams(tvTitle, seasonNumber = 1, episodeNumber = 1) {
+    const cleanTitle = tvTitle.replace(/[:\-]/g, ' ').replace(/\s+/g, ' ').trim();
+    const s = seasonNumber.toString().padStart(2, '0');
+    const e = episodeNumber.toString().padStart(2, '0');
+    const query = `${cleanTitle} S${s}E${e}`;
+    return this.searchIndexer(query);
+  },
+
+  /**
+   * Query Prowlarr / Torznab Indexer API
+   */
+  async searchIndexer(query) {
+    const { baseUrl, apiKey } = this.getProwlarrConfig();
+    const endpoint = `${baseUrl}/api/v1/search?query=${encodeURIComponent(query)}&limit=15`;
+
+    try {
+      const response = await fetch(endpoint, {
+        headers: {
+          'X-Api-Key': apiKey,
+          'Accept': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Indexer error ${response.status}: ${response.statusText}`);
+      }
+
+      const results = await response.json();
+      return this.parseAndRankReleases(results);
+    } catch (err) {
+      console.warn(`Indexer search unavailable for "${query}":`, err.message);
+      return [];
+    }
+  },
+
+  /**
+   * Parse raw indexer releases into structured stream items with quality tags and seed count
+   */
+  parseAndRankReleases(rawReleases) {
+    if (!Array.isArray(rawReleases)) return [];
+
+    const parsed = rawReleases.map(item => {
+      const rawTitle = item.title || item.fileName || 'Unknown Release';
+      const magnetUrl = item.guid && item.guid.startsWith('magnet:') ? item.guid : (item.magnetUrl || item.downloadUrl);
+      const sizeBytes = item.size || 0;
+      const sizeFormatted = sizeBytes > 1073741824
+        ? `${(sizeBytes / 1073741824).toFixed(2)} GB`
+        : `${(sizeBytes / 1048576).toFixed(0)} MB`;
+      const seeders = item.seeders || 0;
+      const leechers = item.leechers || 0;
+      const indexerName = item.indexer || 'Indexer';
+
+      // Detect resolution
+      let resolution = '1080p';
+      if (/2160p|4k|uhd/i.test(rawTitle)) resolution = '4K UHD';
+      else if (/1080p|fhd/i.test(rawTitle)) resolution = '1080p';
+      else if (/720p|hd/i.test(rawTitle)) resolution = '720p';
+      else if (/480p|sd/i.test(rawTitle)) resolution = '480p';
+
+      // Detect features
+      const isHDR = /hdr|dolby|vision|dv/i.test(rawTitle);
+      const isAtmos = /atmos|dts|5\.1|7\.1/i.test(rawTitle);
+      const codec = /hevc|x265|h265/i.test(rawTitle) ? 'HEVC' : (/x264|h264/i.test(rawTitle) ? 'H.264' : 'Web');
+
+      return {
+        title: rawTitle,
+        magnet: magnetUrl,
+        infoHash: item.infoHash,
+        size: sizeFormatted,
+        seeders,
+        leechers,
+        resolution,
+        isHDR,
+        isAtmos,
+        codec,
+        indexer: indexerName,
+        publishDate: item.publishDate
+      };
+    });
+
+    // Filter items with magnet and sort by seeders descending
+    return parsed
+      .filter(item => Boolean(item.magnet))
+      .sort((a, b) => (b.seeders || 0) - (a.seeders || 0));
+  },
+
+  /**
+   * Construct HTTP Stream URL for HTML5 <video>
+   */
+  getStreamUrl(magnetOrLink, fileIndex = null) {
+    const serverUrl = this.getStreamServerUrl();
+    let url = `${serverUrl}/api/stream?magnet=${encodeURIComponent(magnetOrLink)}`;
+    if (fileIndex !== null) {
+      url += `&fileIndex=${fileIndex}`;
+    }
+    return url;
+  },
+
+  /**
+   * Check if Streaming Server is reachable
+   */
+  async checkServerHealth() {
+    const serverUrl = this.getStreamServerUrl();
+    try {
+      const res = await fetch(`${serverUrl}/health`, { signal: AbortSignal.timeout(2500) });
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+};
