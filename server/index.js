@@ -1,14 +1,14 @@
 /**
  * CineStream Pro — High-Performance Streaming Bridge
  * Powered by qBittorrent (127.0.0.1:18080) & Prowlarr (127.0.0.1:9696)
- * Direct disk sequential streaming with HTTP 206 Range-Request seeking & FFmpeg fMP4 remuxing
+ * Direct disk sequential streaming with HTTP 206 Range-Request seeking
+ * Automated 15-Minute Idle Garbage Collection & Bandwidth Saver
  */
 
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
-import { spawn } from 'child_process';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -24,14 +24,12 @@ const QBT_PASS = process.env.QBT_PASS || 'adminadmin';
 const PROWLARR_URL = process.env.PROWLARR_URL || 'http://127.0.0.1:9696';
 const PROWLARR_KEY = process.env.PROWLARR_KEY || '5a197b3359f247e8a69c7866650058e4';
 
-// Common download directories to search
-const SEARCH_DIRS = [
-  '/var/lib/stream/incoming',
-  '/var/lib/stream/incoming/tv-stream',
-  '/tmp/cinestream-media',
-  '/home/rdpuser/Downloads',
-  '/tmp'
-];
+// Idle Garbage Collection configuration
+const IDLE_TTL_MINUTES = parseInt(process.env.IDLE_TTL_MINUTES || '15', 10);
+const IDLE_TTL_MS = IDLE_TTL_MINUTES * 60 * 1000;
+
+// In-memory active streaming session tracking: infoHash -> { viewers, lastActive, name }
+const activeStreams = new Map();
 
 // Enable CORS
 app.use(cors({
@@ -124,6 +122,40 @@ class QBittorrentClient {
     return await res.json();
   }
 
+  async pauseTorrents(hashes) {
+    if (!hashes || hashes.length === 0) return;
+    const formData = new URLSearchParams();
+    formData.append('hashes', Array.isArray(hashes) ? hashes.join('|') : hashes);
+    await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/pause`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formData.toString()
+    });
+  }
+
+  async resumeTorrents(hashes) {
+    if (!hashes || hashes.length === 0) return;
+    const formData = new URLSearchParams();
+    formData.append('hashes', Array.isArray(hashes) ? hashes.join('|') : hashes);
+    await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formData.toString()
+    });
+  }
+
+  async deleteTorrent(hash, deleteFiles = true) {
+    const formData = new URLSearchParams();
+    formData.append('hashes', hash);
+    formData.append('deleteFiles', deleteFiles ? 'true' : 'false');
+    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formData.toString()
+    });
+    return res.ok;
+  }
+
   async findTorrent(infoHash, nameHint = '', magnet = '') {
     const list = await this.getAllTorrents();
     if (!Array.isArray(list) || list.length === 0) return null;
@@ -168,6 +200,38 @@ class QBittorrentClient {
 }
 
 const qbt = new QBittorrentClient(QBT_URL, QBT_USER, QBT_PASS);
+
+// ----------------- AUTOMATED 15-MINUTE GARBAGE COLLECTOR -----------------
+
+setInterval(async () => {
+  try {
+    const isLogged = await qbt.login();
+    if (!isLogged) return;
+
+    const allTorrents = await qbt.getAllTorrents();
+    if (!Array.isArray(allTorrents) || allTorrents.length === 0) return;
+
+    const now = Date.now();
+
+    for (const t of allTorrents) {
+      const hash = t.hash.toLowerCase();
+      const session = activeStreams.get(hash);
+      const viewers = session ? session.viewers : 0;
+      
+      // Calculate last activity timestamp
+      let lastActive = session ? session.lastActive : (t.last_activity ? t.last_activity * 1000 : now - IDLE_TTL_MS);
+
+      // If nobody is watching and idle time exceeds 15 minutes -> Wipe from disk
+      if (viewers === 0 && (now - lastActive) >= IDLE_TTL_MS) {
+        console.log(`[🧹 Auto-GC] Deleting idle torrent & wiping disk files: "${t.name}" (Idle > ${IDLE_TTL_MINUTES} mins)`);
+        await qbt.deleteTorrent(t.hash, true);
+        activeStreams.delete(hash);
+      }
+    }
+  } catch (err) {
+    console.warn(`[Auto-GC Warning]:`, err.message);
+  }
+}, 60000); // Check every 60 seconds
 
 // ----------------- HELPER: RECURSIVE MEDIA FILE FINDER -----------------
 
@@ -228,11 +292,18 @@ app.get('/health', async (req, res) => {
     }
   } catch {}
 
+  const activeViewerSummary = {};
+  for (const [hash, s] of activeStreams.entries()) {
+    activeViewerSummary[s.name || hash] = `${s.viewers} active viewer(s)`;
+  }
+
   res.json({
     status: 'online',
     service: 'CineStream Torrent Bridge (qBittorrent & Prowlarr)',
     qBittorrentConnected: qbtStatus,
     activeTorrentsCount: torrentsCount,
+    idleCleanupTtlMinutes: IDLE_TTL_MINUTES,
+    activeStreams: activeViewerSummary,
     qbtEndpoint: QBT_URL,
     prowlarrEndpoint: PROWLARR_URL,
     uptime: process.uptime()
@@ -284,6 +355,31 @@ app.get('/api/status', async (req, res) => {
 });
 
 /**
+ * Manual Disk Cleanup Endpoint
+ */
+app.post('/api/cleanup', async (req, res) => {
+  try {
+    await qbt.login();
+    const list = await qbt.getAllTorrents();
+    let cleaned = 0;
+
+    for (const t of list) {
+      const hash = t.hash.toLowerCase();
+      const s = activeStreams.get(hash);
+      if (!s || s.viewers === 0) {
+        await qbt.deleteTorrent(t.hash, true);
+        activeStreams.delete(hash);
+        cleaned++;
+      }
+    }
+
+    res.json({ success: true, cleanedTorrents: cleaned });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * Streaming Endpoint: Connects to qBittorrent & streams file via HTTP 206 Partial Content
  */
 app.get('/api/stream', async (req, res) => {
@@ -326,10 +422,25 @@ app.get('/api/stream', async (req, res) => {
       return res.status(503).send('Buffering metadata and initial chunks from BitTorrent swarm... Please retry in a moment.');
     }
 
-    console.log(`[Stream] Matched Torrent: ${torrentInfo ? torrentInfo.name : 'Unknown'}`);
+    const matchedHash = (torrentInfo ? torrentInfo.hash : (infoHash || 'unknown')).toLowerCase();
+    const torrentName = torrentInfo ? torrentInfo.name : (nameHint || 'Media Stream');
+
+    // 3. Track active viewer & ensure torrent is actively resumed
+    if (!activeStreams.has(matchedHash)) {
+      activeStreams.set(matchedHash, { viewers: 0, lastActive: Date.now(), name: torrentName });
+    }
+    const session = activeStreams.get(matchedHash);
+    session.viewers++;
+    session.lastActive = Date.now();
+    session.name = torrentName;
+
+    // Resume torrent in case it was paused
+    qbt.resumeTorrents([matchedHash]).catch(() => {});
+
+    console.log(`[Stream] Matched Torrent: "${torrentName}" | Active Viewers: ${session.viewers}`);
     console.log(`[Stream] Serving video file: ${targetFilePath}`);
 
-    // 3. Serve file via HTTP Range (206 Partial Content)
+    // 4. Serve file via HTTP Range (206 Partial Content)
     const stat = fs.statSync(targetFilePath);
     const fileSize = stat.size;
     const range = req.headers.range;
@@ -363,8 +474,26 @@ app.get('/api/stream', async (req, res) => {
     const stream = fs.createReadStream(targetFilePath, { start, end });
     stream.pipe(res);
 
+    // 5. When viewer disconnects / closes player tab
     req.on('close', () => {
       stream.destroy();
+      if (activeStreams.has(matchedHash)) {
+        const s = activeStreams.get(matchedHash);
+        s.viewers = Math.max(0, s.viewers - 1);
+        s.lastActive = Date.now();
+        console.log(`[Stream Disconnect] Viewer disconnected from "${torrentName}". Remaining viewers: ${s.viewers}`);
+
+        // If no active viewers remain, pause download after 30s to conserve VPS bandwidth
+        if (s.viewers === 0) {
+          setTimeout(async () => {
+            const current = activeStreams.get(matchedHash);
+            if (current && current.viewers === 0) {
+              await qbt.pauseTorrents([matchedHash]);
+              console.log(`[Bandwidth Saver] Paused download for idle torrent: "${torrentName}"`);
+            }
+          }, 30000);
+        }
+      }
     });
 
   } catch (err) {
@@ -382,6 +511,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📡 Port:               ${PORT}`);
   console.log(`📥 qBittorrent:        ${QBT_URL}`);
   console.log(`🔍 Prowlarr Proxy:     ${PROWLARR_URL}`);
+  console.log(`🧹 Auto-GC Idle TTL:   ${IDLE_TTL_MINUTES} minutes`);
   console.log(`🩺 Health check:       http://localhost:${PORT}/health`);
   console.log(`====================================================`);
 });
