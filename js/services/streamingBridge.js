@@ -146,9 +146,12 @@ export const streamingBridge = {
   /**
    * Construct HTTP Stream URL for HTML5 <video>
    */
-  getStreamUrl(magnetOrLink, fileIndex = null) {
+  getStreamUrl(magnetOrLink, releaseTitle = '', fileIndex = null) {
     const serverUrl = this.getStreamServerUrl();
     let url = `${serverUrl}/api/stream?magnet=${encodeURIComponent(magnetOrLink)}`;
+    if (releaseTitle) {
+      url += `&title=${encodeURIComponent(releaseTitle)}`;
+    }
     if (fileIndex !== null) {
       url += `&fileIndex=${fileIndex}`;
     }

@@ -590,7 +590,7 @@ export class PlayerModalManager {
    * Switch player source to Torrent HTTP Stream via the Bridge
    */
   streamMagnet(magnetLink, releaseTitle = 'Torrent Stream') {
-    const streamUrl = streamingBridge.getStreamUrl(magnetLink);
+    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle);
     const sourceBadge = this.modal.querySelector('#player-active-source-badge');
 
     toast.info(`Connecting to torrent stream via bridge...`, '🧲');

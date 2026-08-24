@@ -124,10 +124,11 @@ class QBittorrentClient {
     return await res.json();
   }
 
-  async findTorrent(infoHash, nameHint = '') {
+  async findTorrent(infoHash, nameHint = '', magnet = '') {
     const list = await this.getAllTorrents();
     if (!Array.isArray(list) || list.length === 0) return null;
 
+    // 1. Try exact infoHash match (case-insensitive)
     if (infoHash) {
       const match = list.find(t =>
         t.hash.toLowerCase() === infoHash.toLowerCase() ||
@@ -136,14 +137,33 @@ class QBittorrentClient {
       if (match) return match;
     }
 
-    if (nameHint) {
-      const hintClean = nameHint.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const matchName = list.find(t => t.name && t.name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(hintClean));
-      if (matchName) return matchName;
+    // 2. Try match from magnet dn parameter
+    const dnMatch = magnet ? magnet.match(/[?&]dn=([^&]+)/i) : null;
+    const dnName = dnMatch ? decodeURIComponent(dnMatch[1]).toLowerCase() : '';
+
+    // 3. Try name match from title or dnName
+    const searchTarget = (nameHint || dnName).toLowerCase();
+    if (searchTarget) {
+      const keywords = searchTarget.split(/[\s.\-_]+/).filter(w => w.length > 2);
+      let bestMatch = null;
+      let maxScore = 0;
+
+      for (const t of list) {
+        const tName = (t.name || '').toLowerCase();
+        let score = 0;
+        for (const kw of keywords) {
+          if (tName.includes(kw)) score++;
+        }
+        if (score > maxScore && score >= 2) {
+          maxScore = score;
+          bestMatch = t;
+        }
+      }
+
+      if (bestMatch) return bestMatch;
     }
 
-    // Return the latest active downloading or seeding torrent
-    return list.find(t => t.state === 'downloading' || t.state === 'stalledDL' || t.state === 'seeding') || list[0];
+    return null;
   }
 }
 
@@ -280,28 +300,25 @@ app.get('/api/stream', async (req, res) => {
     // 1. Add to qBittorrent with sequential priority
     await qbt.addTorrent(magnet);
 
-    // 2. Poll for torrent metadata & file path
+    // 2. Poll for torrent metadata & file path (strictly for this specific torrent)
     let torrentInfo = null;
     let targetFilePath = null;
 
-    for (let i = 0; i < 15; i++) {
-      torrentInfo = await qbt.findTorrent(infoHash, nameHint);
-      if (torrentInfo && torrentInfo.content_path) {
-        targetFilePath = findMediaFileRecursively(torrentInfo.content_path);
+    for (let i = 0; i < 20; i++) {
+      torrentInfo = await qbt.findTorrent(infoHash, nameHint, magnet);
+      if (torrentInfo) {
+        if (torrentInfo.content_path) {
+          targetFilePath = findMediaFileRecursively(torrentInfo.content_path);
+        }
+        if (!targetFilePath && torrentInfo.save_path && torrentInfo.name) {
+          targetFilePath = findMediaFileRecursively(path.join(torrentInfo.save_path, torrentInfo.name));
+        }
+
         if (targetFilePath && fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size > 512 * 1024) {
           break;
         }
       }
 
-      // Check common search directories
-      for (const d of SEARCH_DIRS) {
-        targetFilePath = findMediaFileRecursively(d);
-        if (targetFilePath && fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size > 512 * 1024) {
-          break;
-        }
-      }
-
-      if (targetFilePath) break;
       await new Promise(r => setTimeout(r, 1000));
     }
 
@@ -309,6 +326,7 @@ app.get('/api/stream', async (req, res) => {
       return res.status(503).send('Buffering metadata and initial chunks from BitTorrent swarm... Please retry in a moment.');
     }
 
+    console.log(`[Stream] Matched Torrent: ${torrentInfo ? torrentInfo.name : 'Unknown'}`);
     console.log(`[Stream] Serving video file: ${targetFilePath}`);
 
     // 3. Serve file via HTTP Range (206 Partial Content)
