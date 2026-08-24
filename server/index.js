@@ -85,21 +85,17 @@ setInterval(() => {
 }, 300000); // Check every 5 minutes
 
 async function getOrCreateTorrent(torrentId) {
-  let torrent = client.get(torrentId);
-  if (torrent) {
-    if (torrent.ready) return torrent;
-    return new Promise((resolve, reject) => {
-      torrent.once('ready', () => resolve(torrent));
-      torrent.once('error', (err) => reject(err));
-    });
+  let existing = client.get(torrentId);
+  if (existing) {
+    return existing;
   }
 
   try {
-    torrent = await client.add(torrentId, { destroyStoreOnDestroy: true });
+    const torrent = await client.add(torrentId, { destroyStoreOnDestroy: true });
     return torrent;
   } catch (err) {
-    const existing = client.get(torrentId);
-    if (existing) return existing;
+    const fallback = client.get(torrentId);
+    if (fallback) return fallback;
     throw err;
   }
 }
