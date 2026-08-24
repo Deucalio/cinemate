@@ -711,21 +711,10 @@ export class PlayerModalManager {
     const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
     const clamped = Math.max(0, Math.min(totalDur, targetSeconds));
 
-    if (this.currentMagnet) {
-      this.currentStartSec = clamped;
-      const newUrl = streamingBridge.getStreamUrl(
-        this.currentMagnet,
-        this.currentStreamTitle,
-        this.sessionId,
-        null,
-        clamped
-      );
-      this._showBufferingHUD('Seeking to ' + this._formatTime(clamped) + '...', 'Transcoding and fast-forwarding stream');
-      this.videoElement.src = newUrl;
-      this.videoElement.load();
-      this._play();
-    } else if (this.videoElement) {
+    if (this.videoElement) {
       this.videoElement.currentTime = clamped;
+      this._updateProgressBar();
+      this._updateTimeDisplay();
     }
   }
 
