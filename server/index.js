@@ -84,37 +84,23 @@ setInterval(() => {
   }
 }, 300000); // Check every 5 minutes
 
-// ----------------- ROUTES -----------------
-
-function getOrCreateTorrent(torrentId, callback) {
+async function getOrCreateTorrent(torrentId) {
   let torrent = client.get(torrentId);
-
   if (torrent) {
-    if (torrent.ready) {
-      return callback(null, torrent);
-    }
-    torrent.on('ready', () => callback(null, torrent));
-    torrent.on('error', (err) => callback(err));
-    return;
+    if (torrent.ready) return torrent;
+    return new Promise((resolve, reject) => {
+      torrent.once('ready', () => resolve(torrent));
+      torrent.once('error', (err) => reject(err));
+    });
   }
 
   try {
-    torrent = client.add(torrentId, { destroyStoreOnDestroy: true }, (t) => {
-      callback(null, t);
-    });
-
-    torrent.on('error', (err) => {
-      console.error('[Torrent Error]:', err.message);
-    });
+    torrent = await client.add(torrentId, { destroyStoreOnDestroy: true });
+    return torrent;
   } catch (err) {
-    // If already added
-    const fallback = client.get(torrentId);
-    if (fallback) {
-      if (fallback.ready) return callback(null, fallback);
-      fallback.on('ready', () => callback(null, fallback));
-      return;
-    }
-    callback(err);
+    const existing = client.get(torrentId);
+    if (existing) return existing;
+    throw err;
   }
 }
 
@@ -136,18 +122,16 @@ app.get('/health', (req, res) => {
 /**
  * Torrent Info Endpoint
  */
-app.get('/api/torrent-info', (req, res) => {
-  const torrentId = req.query.magnet || req.query.link;
-  if (!torrentId) {
-    return res.status(400).json({ error: 'Missing magnet or link query parameter' });
-  }
-
-  getOrCreateTorrent(torrentId, (err, torrent) => {
-    if (err || !torrent) {
-      return res.status(500).json({ error: err ? err.message : 'Could not resolve torrent' });
+app.get('/api/torrent-info', async (req, res) => {
+  try {
+    const torrentId = req.query.magnet || req.query.link;
+    if (!torrentId) {
+      return res.status(400).json({ error: 'Missing magnet or link query parameter' });
     }
 
+    const torrent = await getOrCreateTorrent(torrentId);
     trackTorrentActivity(torrent.infoHash);
+
     res.json({
       name: torrent.name,
       infoHash: torrent.infoHash,
@@ -162,26 +146,25 @@ app.get('/api/torrent-info', (req, res) => {
         path: f.path
       }))
     });
-  });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Could not resolve torrent' });
+  }
 });
 
 /**
  * HTTP Range-Request Video Streaming Endpoint
  * Pipes the chosen video file directly to the client with sequential piece priority
  */
-app.get('/api/stream', (req, res) => {
-  const torrentId = req.query.magnet || req.query.link;
-  const fileIndex = req.query.fileIndex !== undefined ? parseInt(req.query.fileIndex, 10) : null;
+app.get('/api/stream', async (req, res) => {
+  try {
+    const torrentId = req.query.magnet || req.query.link;
+    const fileIndex = req.query.fileIndex !== undefined ? parseInt(req.query.fileIndex, 10) : null;
 
-  if (!torrentId) {
-    return res.status(400).send('Missing magnet or link query parameter');
-  }
-
-  getOrCreateTorrent(torrentId, (err, torrent) => {
-    if (err || !torrent) {
-      return res.status(500).send(err ? err.message : 'Failed to load torrent');
+    if (!torrentId) {
+      return res.status(400).send('Missing magnet or link query parameter');
     }
 
+    const torrent = await getOrCreateTorrent(torrentId);
     trackTorrentActivity(torrent.infoHash);
 
     // Select target video file
@@ -236,7 +219,12 @@ app.get('/api/stream', (req, res) => {
     req.on('close', () => {
       stream.destroy();
     });
-  });
+  } catch (err) {
+    console.error('[Stream Error]:', err.message);
+    if (!res.headersSent) {
+      res.status(500).send(err.message || 'Stream error');
+    }
+  }
 });
 
 // Start Server
