@@ -87,6 +87,18 @@ export class PlayerModalManager {
           <span class="splash-icon">▶</span>
         </div>
 
+        <!-- Live Buffering & Swarm Connection HUD -->
+        <div class="player-buffering-hud" id="player-buffering-hud" style="display:none;">
+          <div class="buffering-spinner-ring"></div>
+          <div class="buffering-text-wrap">
+            <h3 class="buffering-title" id="buffering-title">Connecting to Swarm...</h3>
+            <p class="buffering-subtext" id="buffering-subtext">Requesting sequential download pieces via VPS qBittorrent bridge...</p>
+            <div class="buffering-progress-bar-wrap">
+              <div class="buffering-progress-bar-fill"></div>
+            </div>
+          </div>
+        </div>
+
         <!-- Torrent Sources Drawer / Modal -->
         <div class="player-sources-overlay" id="player-sources-overlay" style="display:none;">
           <div class="player-sources-dialog animate-scale-in">
@@ -396,6 +408,32 @@ export class PlayerModalManager {
       this._updateTimeDisplay();
     });
 
+    video.addEventListener('waiting', () => {
+      this._showBufferingHUD('Buffering Stream...', 'Receiving next sequential chunks from seeders via qBittorrent...');
+    });
+
+    video.addEventListener('playing', () => {
+      this._hideBufferingHUD();
+    });
+
+    video.addEventListener('canplay', () => {
+      this._hideBufferingHUD();
+    });
+
+    video.addEventListener('progress', () => {
+      this._updateBufferedRange();
+    });
+
+    video.addEventListener('error', () => {
+      this._showBufferingHUD('Connecting to Stream Source...', 'qBittorrent is acquiring initial pieces from swarm. Buffering stream...');
+      setTimeout(() => {
+        if (this.videoElement && this.videoElement.paused) {
+          this.videoElement.load();
+          this._play();
+        }
+      }, 3500);
+    });
+
     video.addEventListener('timeupdate', () => {
       this.currentTime = video.currentTime;
       this._updateProgressBar();
@@ -556,6 +594,7 @@ export class PlayerModalManager {
     const sourceBadge = this.modal.querySelector('#player-active-source-badge');
 
     toast.info(`Connecting to torrent stream via bridge...`, '🧲');
+    this._showBufferingHUD('Connecting to qBittorrent...', `Streaming "${releaseTitle.substring(0, 35)}..." via VPS Bridge`);
 
     if (sourceBadge) {
       sourceBadge.textContent = `🟢 TORRENT: ${releaseTitle.substring(0, 30)}...`;
@@ -566,6 +605,33 @@ export class PlayerModalManager {
     this.videoElement.src = streamUrl;
     this.videoElement.load();
     this._play();
+  }
+
+  _showBufferingHUD(title = 'Connecting to Swarm...', subtext = 'Requesting sequential download pieces via VPS qBittorrent bridge...') {
+    const hud = this.modal ? this.modal.querySelector('#player-buffering-hud') : null;
+    if (!hud) return;
+    const titleEl = hud.querySelector('#buffering-title');
+    const subEl = hud.querySelector('#buffering-subtext');
+    if (titleEl) titleEl.textContent = title;
+    if (subEl) subEl.textContent = subtext;
+    hud.style.display = 'flex';
+  }
+
+  _hideBufferingHUD() {
+    const hud = this.modal ? this.modal.querySelector('#player-buffering-hud') : null;
+    if (hud) hud.style.display = 'none';
+  }
+
+  _updateBufferedRange() {
+    const bufferedEl = this.modal ? this.modal.querySelector('.player-timeline-buffered') : null;
+    const video = this.videoElement;
+    if (!bufferedEl || !video || !video.duration) return;
+
+    if (video.buffered && video.buffered.length > 0) {
+      const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+      const percent = (bufferedEnd / video.duration) * 100;
+      bufferedEl.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+    }
   }
 
   _togglePlay() {
