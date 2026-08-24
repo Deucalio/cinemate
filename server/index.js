@@ -667,42 +667,11 @@ app.get('/api/stream', checkRateLimit('stream', 25, 60000), async (req, res) => 
       startByte = Math.min(fileSize - (1024 * 1024), Math.floor((startSec / estimatedDuration) * fileSize));
     }
 
-    // 6. Direct HTTP 206 Mode vs Real-Time FFmpeg AAC Remuxer
-    if (isDirect) {
-      const range = req.headers.range;
-      let start = startByte;
-      let end = fileSize - 1;
+    // 6. Select Streaming Mode: Direct HTTP 206 Byte-Range (Default) vs FFmpeg AAC Remuxer (?remux=1)
+    const isRemux = req.query.remux === '1' || req.query.remux === 'true';
 
-      if (range) {
-        const parts = range.replace(/bytes=/, '').split('-');
-        start = parseInt(parts[0], 10);
-        end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      }
-
-      const ext = path.extname(targetFilePath).toLowerCase();
-      const contentType = ext === '.webm' ? 'video/webm' : (ext === '.mkv' ? 'video/x-matroska' : 'video/mp4');
-      const chunkSize = (end - start) + 1;
-
-      res.writeHead(range ? 206 : 200, {
-        ...(range ? { 'Content-Range': `bytes ${start}-${end}/${fileSize}` } : {}),
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
-        'Content-Type': contentType,
-        'Cache-Control': 'no-cache'
-      });
-
-      const verifiedStream = createPieceAwareTorrentStream(targetFilePath, matchedHash, start, end, pieceSize);
-      verifiedStream.pipe(res);
-
-      req.on('close', () => {
-        verifiedStream.destroy();
-        playbackSessions.delete(sessionId);
-        scheduleTorrentCleanup(matchedHash, torrentName);
-      });
-
-    } else {
-      // Real-Time FFmpeg AAC Remuxer (Fragmented MP4 for universal browser audio)
-      console.log(`[Piece-Aware Audio Remuxer] Converting audio to AAC stereo for: "${torrentName}" (Start: ${startSec}s, Offset: ${startByte}b)`);
+    if (isRemux) {
+      console.log(`[FFmpeg Remuxer Stream] AAC Stereo conversion for: "${torrentName}" (Start: ${startSec}s, Offset: ${startByte}b)`);
 
       const verifiedStream = createPieceAwareTorrentStream(targetFilePath, matchedHash, startByte, fileSize - 1, pieceSize);
 
@@ -710,11 +679,11 @@ app.get('/api/stream', checkRateLimit('stream', 25, 60000), async (req, res) => 
         '-hide_banner',
         '-loglevel', 'error',
         '-i', 'pipe:0',
-        '-c:v', 'copy',                   // Untouched video copy (0% CPU load)
-        '-c:a', 'aac',                    // Transcode EAC3/DTS/AC3 to universal AAC
+        '-c:v', 'copy',
+        '-c:a', 'aac',
         '-b:a', '192k',
-        '-ac', '2',                       // Stereo 2-channel sound for all browsers
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof', // Progressive fMP4
+        '-ac', '2',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
         '-f', 'mp4',
         'pipe:1'
       ];
@@ -751,6 +720,64 @@ app.get('/api/stream', checkRateLimit('stream', 25, 60000), async (req, res) => 
 
       req.on('close', cleanup);
       res.on('finish', cleanup);
+
+    } else {
+      // Direct HTTP 206 Byte-Range Streaming (Instant HTML5 <video> hardware playback)
+      const range = req.headers.range;
+      const ext = path.extname(targetFilePath).toLowerCase();
+      const contentType = ext === '.webm' ? 'video/webm' : (ext === '.mkv' ? 'video/x-matroska' : 'video/mp4');
+
+      if (range) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        let start = parseInt(parts[0], 10);
+        let end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+        if (isNaN(start)) start = 0;
+        if (isNaN(end) || end >= fileSize) end = fileSize - 1;
+        if (start > end) start = 0;
+
+        const chunkSize = (end - start) + 1;
+
+        console.log(`[HTTP 206 Partial Stream] Range: bytes ${start}-${end}/${fileSize} (${(chunkSize / (1024 * 1024)).toFixed(2)} MB) for "${torrentName}"`);
+
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunkSize,
+          'Content-Type': contentType,
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-cache'
+        });
+
+        const fileStream = fs.createReadStream(targetFilePath, { start, end });
+        fileStream.pipe(res);
+
+        req.on('close', () => {
+          fileStream.destroy();
+          playbackSessions.delete(sessionId);
+          scheduleTorrentCleanup(matchedHash, torrentName);
+        });
+
+      } else {
+        console.log(`[HTTP 200 Stream] Full video stream for "${torrentName}" (${(fileSize / (1024 * 1024)).toFixed(1)} MB)`);
+
+        res.writeHead(200, {
+          'Content-Length': fileSize,
+          'Content-Type': contentType,
+          'Accept-Ranges': 'bytes',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-cache'
+        });
+
+        const fileStream = fs.createReadStream(targetFilePath);
+        fileStream.pipe(res);
+
+        req.on('close', () => {
+          fileStream.destroy();
+          playbackSessions.delete(sessionId);
+          scheduleTorrentCleanup(matchedHash, torrentName);
+        });
+      }
     }
 
   } catch (err) {

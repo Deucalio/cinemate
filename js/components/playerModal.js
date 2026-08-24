@@ -645,9 +645,24 @@ export class PlayerModalManager {
       this._hideBufferingHUD();
       this.videoElement.removeEventListener('playing', onPlaying);
       this.videoElement.removeEventListener('canplay', onPlaying);
+      this.videoElement.removeEventListener('timeupdate', onPlaying);
     };
     this.videoElement.addEventListener('playing', onPlaying);
     this.videoElement.addEventListener('canplay', onPlaying);
+    this.videoElement.addEventListener('timeupdate', onPlaying);
+
+    // Auto-fallback to FFmpeg AAC Remuxer if browser decoder cannot parse audio/container
+    const onError = () => {
+      this.videoElement.removeEventListener('error', onError);
+      if (!streamUrl.includes('remux=1')) {
+        console.log('[Player] Direct decode issue, switching to Real-Time FFmpeg AAC Remuxer...');
+        this._showBufferingHUD('Remuxing Audio Track...', 'Converting Dolby/DTS audio to Universal AAC Stereo for browser playback...');
+        this.videoElement.src = `${streamUrl}&remux=1`;
+        this.videoElement.load();
+        this._play();
+      }
+    };
+    this.videoElement.addEventListener('error', onError, { once: true });
   }
 
   _showBufferingHUD(title = 'Connecting to Swarm...', subtext = 'Requesting sequential download pieces via VPS qBittorrent bridge...') {
