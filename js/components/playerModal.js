@@ -598,19 +598,22 @@ export class PlayerModalManager {
   /**
    * Switch player source to Torrent HTTP Stream via the Bridge
    */
-  streamMagnet(magnetLink, releaseTitle = 'Torrent Stream') {
+  streamMagnet(magnetLink, releaseTitle = 'Torrent Stream', startSec = 0) {
     if (!this.sessionId) {
       this.sessionId = `sess_${Math.random().toString(36).substring(2, 9)}_${Date.now()}`;
     }
 
     const hashMatch = magnetLink.match(/urn:btih:([a-zA-Z0-9]+)/i);
     this.currentInfoHash = hashMatch ? hashMatch[1].toLowerCase() : 'custom';
+    this.currentMagnet = magnetLink;
+    this.currentStreamTitle = releaseTitle;
+    this.currentStartSec = startSec;
 
-    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle, this.sessionId);
+    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle, this.sessionId, null, startSec);
     const sourceBadge = this.modal.querySelector('#player-active-source-badge');
 
     toast.info(`Connecting to torrent stream via bridge...`, '🧲');
-    this._showBufferingHUD('Connecting to qBittorrent...', `Streaming "${releaseTitle.substring(0, 35)}..." via VPS Bridge`);
+    this._showBufferingHUD('Connecting to Stream...', `Streaming "${releaseTitle.substring(0, 35)}..." with Universal AAC Audio`);
 
     if (sourceBadge) {
       sourceBadge.textContent = `🟢 TORRENT: ${releaseTitle.substring(0, 30)}...`;
@@ -621,11 +624,10 @@ export class PlayerModalManager {
     if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
     this._heartbeatTimer = setInterval(() => {
       if (this.currentInfoHash && this.modal && !this.videoElement.paused) {
-        streamingBridge.sendHeartbeat(this.sessionId, this.currentInfoHash, this.videoElement.currentTime);
+        streamingBridge.sendHeartbeat(this.sessionId, this.currentInfoHash, this.videoElement.currentTime + (this.currentStartSec || 0));
       }
     }, 10000);
 
-    this.currentStreamTitle = releaseTitle;
     this.videoElement.src = streamUrl;
     this.videoElement.load();
     this._play();

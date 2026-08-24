@@ -16,6 +16,7 @@ import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { spawn } from 'child_process';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -438,7 +439,14 @@ setInterval(async () => {
         if (s.infoHash.toLowerCase() === hash && (now - s.lastSeen) < 15000) activeSessionsCount++;
       }
 
-      const entry = torrentRegistry.get(hash) || { refCount: 0, lastActive: now };
+      let entry = torrentRegistry.get(hash);
+      if (!entry) {
+        // If not in registry, use torrent added timestamp or default to expired
+        const addedMs = (t.added_on && t.added_on > 0) ? (t.added_on * 1000) : (now - 120000);
+        entry = { refCount: 0, lastActive: addedMs };
+        torrentRegistry.set(hash, entry);
+      }
+
       const isStreaming = entry.refCount > 0 || activeSessionsCount > 0;
 
       if (!isStreaming) {
@@ -748,25 +756,65 @@ app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => 
     const pieceSize = torrentInfo ? (torrentInfo.piece_size || 2 * 1024 * 1024) : 2 * 1024 * 1024;
     await prioritizeByteRange(matchedHash, start, end, pieceSize, 0, 4000);
 
-    // 7. Stream File with HTTP 206 Partial Content
-    const chunkSize = (end - start) + 1;
+    // 7. Universal Audio Delivery (AAC Stereo Transmux for Dolby/EAC3/DTS vs Direct HTTP 206)
     const ext = path.extname(targetFilePath).toLowerCase();
-    const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
+    const isEAC3orDTS = /ddp|dd\+|eac3|ac3|atmos|dts/i.test(targetFilePath) || /ddp|dd\+|eac3|ac3|atmos|dts/i.test(nameHint);
+    const startSec = req.query.startSec ? parseFloat(req.query.startSec) : 0;
 
-    res.writeHead(range ? 206 : 200, {
-      ...(range ? { 'Content-Range': `bytes ${start}-${end}/${fileSize}` } : {}),
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunkSize,
-      'Content-Type': contentType,
-      'Cache-Control': 'no-cache'
-    });
+    let activeProcess = null;
+    let fileStream = null;
 
-    const stream = fs.createReadStream(targetFilePath, { start, end });
-    stream.pipe(res);
+    if (isEAC3orDTS || ext === '.mkv') {
+      console.log(`[Audio Remuxer] Converting audio to AAC stereo for universal browser sound: "${torrentName}" (Start: ${startSec}s)`);
+
+      res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'none',
+        'Cache-Control': 'no-cache'
+      });
+
+      const ffmpegArgs = [
+        '-hide_banner',
+        '-loglevel', 'error',
+        ...(startSec > 0 ? ['-ss', `${startSec}`] : []),
+        '-i', targetFilePath,
+        '-c:v', 'copy',                    // 0% CPU passthrough video!
+        '-c:a', 'aac',                     // Convert non-browser audio to universal AAC
+        '-b:a', '192k',
+        '-ac', '2',                        // 2-channel stereo for browser playback
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'mp4',
+        'pipe:1'
+      ];
+
+      const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+      activeProcess = ffmpeg;
+      ffmpeg.stdout.pipe(res);
+
+      ffmpeg.stderr.on('data', () => {});
+      ffmpeg.on('error', (e) => console.warn('[FFmpeg Audio Error]:', e.message));
+    } else {
+      const chunkSize = (end - start) + 1;
+      const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
+
+      res.writeHead(range ? 206 : 200, {
+        ...(range ? { 'Content-Range': `bytes ${start}-${end}/${fileSize}` } : {}),
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunkSize,
+        'Content-Type': contentType,
+        'Cache-Control': 'no-cache'
+      });
+
+      fileStream = fs.createReadStream(targetFilePath, { start, end });
+      fileStream.pipe(res);
+    }
 
     // 8. Stream Close Handler
     req.on('close', () => {
-      stream.destroy();
+      if (fileStream) fileStream.destroy();
+      if (activeProcess) {
+        try { activeProcess.kill('SIGKILL'); } catch {}
+      }
       playbackSessions.delete(sessionId);
       regEntry.refCount = Math.max(0, regEntry.refCount - 1);
       regEntry.lastActive = Date.now();

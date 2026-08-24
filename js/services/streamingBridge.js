@@ -159,7 +159,7 @@ export const streamingBridge = {
   /**
    * Construct HTTP Stream URL for HTML5 <video>
    */
-  getStreamUrl(magnetOrLink, releaseTitle = '', sessionId = null, fileIndex = null) {
+  getStreamUrl(magnetOrLink, releaseTitle = '', sessionId = null, fileIndex = null, startSec = 0) {
     const serverUrl = this.getStreamServerUrl();
     let url = `${serverUrl}/api/stream?magnet=${encodeURIComponent(magnetOrLink)}`;
     if (releaseTitle) {
@@ -170,6 +170,9 @@ export const streamingBridge = {
     }
     if (fileIndex !== null) {
       url += `&fileIndex=${fileIndex}`;
+    }
+    if (startSec > 0) {
+      url += `&startSec=${Math.floor(startSec)}`;
     }
     return url;
   },
