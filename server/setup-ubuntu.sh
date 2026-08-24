@@ -16,8 +16,10 @@ echo "📦 Updating apt packages..."
 apt-get update -y
 apt-get install -y curl git build-essential ufw
 
-# 2. Install Node.js 20 LTS
-echo "📦 Installing Node.js 20 LTS..."
+# 2. Clean old conflicting node packages & install Node.js 20 LTS
+echo "📦 Cleaning legacy node packages & installing Node.js 20 LTS..."
+apt-get remove -y libnode-dev libnode72 nodejs || true
+apt-get autoremove -y || true
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y nodejs
 
