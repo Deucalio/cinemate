@@ -38,6 +38,7 @@ const PROWLARR_KEY = process.env.PROWLARR_KEY || '5a197b3359f247e8a69c7866650058
 // Resource, Concurrency & Quota Limits
 const MAX_ACTIVE_TORRENTS = parseInt(process.env.MAX_ACTIVE_TORRENTS || '5', 10);
 const MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_CONCURRENT_STREAMS || '15', 10);
+const DISK_MAX_USAGE_PCT = parseInt(process.env.DISK_MAX_USAGE_PCT || '85', 10);
 const IDLE_TTL_MINUTES = parseInt(process.env.IDLE_TTL_MINUTES || '1', 10); // 1 minute auto-delete
 const IDLE_TTL_MS = IDLE_TTL_MINUTES * 60 * 1000;
 const HEARTBEAT_TIMEOUT_MS = 30 * 1000; // 30s without heartbeat = IDLE
