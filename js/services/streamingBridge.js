@@ -146,16 +146,34 @@ export const streamingBridge = {
   /**
    * Construct HTTP Stream URL for HTML5 <video>
    */
-  getStreamUrl(magnetOrLink, releaseTitle = '', fileIndex = null) {
+  getStreamUrl(magnetOrLink, releaseTitle = '', sessionId = null, fileIndex = null) {
     const serverUrl = this.getStreamServerUrl();
     let url = `${serverUrl}/api/stream?magnet=${encodeURIComponent(magnetOrLink)}`;
     if (releaseTitle) {
       url += `&title=${encodeURIComponent(releaseTitle)}`;
     }
+    if (sessionId) {
+      url += `&sessionId=${encodeURIComponent(sessionId)}`;
+    }
     if (fileIndex !== null) {
       url += `&fileIndex=${fileIndex}`;
     }
     return url;
+  },
+
+  /**
+   * Send Playback Session Heartbeat (Every 10s while player is active)
+   */
+  async sendHeartbeat(sessionId, infoHash, currentTime = 0) {
+    if (!sessionId || !infoHash) return;
+    const serverUrl = this.getStreamServerUrl();
+    try {
+      await fetch(`${serverUrl}/api/stream/session/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, infoHash, currentTime })
+      });
+    } catch {}
   },
 
   /**

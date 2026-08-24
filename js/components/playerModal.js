@@ -590,7 +590,14 @@ export class PlayerModalManager {
    * Switch player source to Torrent HTTP Stream via the Bridge
    */
   streamMagnet(magnetLink, releaseTitle = 'Torrent Stream') {
-    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle);
+    if (!this.sessionId) {
+      this.sessionId = `sess_${Math.random().toString(36).substring(2, 9)}_${Date.now()}`;
+    }
+
+    const hashMatch = magnetLink.match(/urn:btih:([a-zA-Z0-9]+)/i);
+    this.currentInfoHash = hashMatch ? hashMatch[1].toLowerCase() : 'custom';
+
+    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle, this.sessionId);
     const sourceBadge = this.modal.querySelector('#player-active-source-badge');
 
     toast.info(`Connecting to torrent stream via bridge...`, '🧲');
@@ -600,6 +607,14 @@ export class PlayerModalManager {
       sourceBadge.textContent = `🟢 TORRENT: ${releaseTitle.substring(0, 30)}...`;
       sourceBadge.style.display = 'inline-block';
     }
+
+    // Start 10s playback session heartbeat
+    if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
+    this._heartbeatTimer = setInterval(() => {
+      if (this.currentInfoHash && this.modal && !this.videoElement.paused) {
+        streamingBridge.sendHeartbeat(this.sessionId, this.currentInfoHash, this.videoElement.currentTime);
+      }
+    }, 10000);
 
     this.currentStreamTitle = releaseTitle;
     this.videoElement.src = streamUrl;
@@ -701,6 +716,10 @@ export class PlayerModalManager {
   }
 
   close() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
     if (this.progressTimer) {
       clearInterval(this.progressTimer);
       this.progressTimer = null;
