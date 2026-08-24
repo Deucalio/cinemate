@@ -715,7 +715,28 @@ export class PlayerModalManager {
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   }
 
+  _sendLeaveBeacon() {
+    if (this.sessionId && this.currentInfoHash) {
+      const serverUrl = streamingBridge.getStreamServerUrl();
+      const payload = JSON.stringify({ sessionId: this.sessionId, infoHash: this.currentInfoHash });
+      try {
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon(`${serverUrl}/api/stream/session/leave`, payload);
+        } else {
+          fetch(`${serverUrl}/api/stream/session/leave`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: payload,
+            keepalive: true
+          }).catch(() => {});
+        }
+      } catch {}
+    }
+  }
+
   close() {
+    this._sendLeaveBeacon();
+
     if (this._heartbeatTimer) {
       clearInterval(this._heartbeatTimer);
       this._heartbeatTimer = null;

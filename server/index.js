@@ -16,6 +16,7 @@ import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { spawn } from 'child_process';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -550,6 +551,25 @@ app.post('/api/stream/session/heartbeat', (req, res) => {
 });
 
 /**
+ * Playback Session Leave Endpoint (Immediate Pause Trigger)
+ */
+app.post('/api/stream/session/leave', async (req, res) => {
+  const { sessionId, infoHash } = req.body || {};
+  if (sessionId) {
+    playbackSessions.delete(sessionId);
+  }
+  if (infoHash) {
+    const hash = infoHash.toLowerCase();
+    const reg = torrentRegistry.get(hash);
+    if (reg) reg.refCount = Math.max(0, reg.refCount - 1);
+
+    await qbt.pauseTorrents([hash]).catch(() => {});
+    console.log(`[Bandwidth Saver] Viewer left session: ${sessionId}. Paused torrent: ${hash}`);
+  }
+  res.json({ status: 'left' });
+});
+
+/**
  * Proxy Prowlarr Search (Rate Limited to 30 req/min per IP)
  */
 app.get('/api/search', checkRateLimit('search', 30, 60000), async (req, res) => {
@@ -725,40 +745,90 @@ app.get('/api/stream', checkRateLimit('stream', 10, 60000), async (req, res) => 
       return res.status(503).send('Buffering requested video piece range from swarm. Retrying...');
     }
 
-    // 7. Stream File with HTTP 206 Partial Content
+    // 7. Adaptive Media Delivery (Direct HTTP 206 vs FFmpeg Remux for MKV/HEVC)
     const chunkSize = (end - start) + 1;
     const ext = path.extname(targetFilePath).toLowerCase();
-    const contentType = ext === '.mp4' ? 'video/mp4' : (ext === '.webm' ? 'video/webm' : 'video/mp4');
+    const isMKV = ext === '.mkv';
+    const isHEVC = /hevc|x265|h265/i.test(targetFilePath) || /hevc|x265|h265/i.test(nameHint);
 
-    res.writeHead(range ? 206 : 200, {
-      ...(range ? { 'Content-Range': `bytes ${start}-${end}/${fileSize}` } : {}),
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunkSize,
-      'Content-Type': contentType,
-      'Cache-Control': 'no-cache',
-      'X-Piece-Available': isPieceReady ? '1' : '0'
-    });
+    let activeChildProcess = null;
+    let fileStream = null;
 
-    const stream = fs.createReadStream(targetFilePath, { start, end });
-    stream.pipe(res);
+    if (isMKV || isHEVC) {
+      console.log(`[Stream Transmux] Non-native container/codec detected (${ext}, HEVC: ${isHEVC}). Streaming via FFmpeg fMP4 remux.`);
+      
+      res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'none',
+        'Cache-Control': 'no-cache',
+        'X-Piece-Available': isPieceReady ? '1' : '0'
+      });
 
-    // 8. Stream Close Handler
+      const vCodec = isHEVC
+        ? ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '22']
+        : ['-c:v', 'copy'];
+
+      const ffmpeg = spawn('ffmpeg', [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-i', targetFilePath,
+        ...vCodec,
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'mp4',
+        'pipe:1'
+      ]);
+
+      activeChildProcess = ffmpeg;
+      ffmpeg.stdout.pipe(res);
+
+      ffmpeg.stderr.on('data', (d) => {
+        // Suppress benign warnings
+      });
+
+      ffmpeg.on('error', (err) => {
+        console.warn(`[FFmpeg Error]:`, err.message);
+      });
+    } else {
+      const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
+      res.writeHead(range ? 206 : 200, {
+        ...(range ? { 'Content-Range': `bytes ${start}-${end}/${fileSize}` } : {}),
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunkSize,
+        'Content-Type': contentType,
+        'Cache-Control': 'no-cache',
+        'X-Piece-Available': isPieceReady ? '1' : '0'
+      });
+
+      fileStream = fs.createReadStream(targetFilePath, { start, end });
+      fileStream.pipe(res);
+    }
+
+    // 8. Stream Close Handler (Instant Pause & Session Cleanup)
     req.on('close', () => {
-      stream.destroy();
+      if (fileStream) fileStream.destroy();
+      if (activeChildProcess) {
+        try { activeChildProcess.kill('SIGKILL'); } catch {}
+      }
+
+      playbackSessions.delete(sessionId);
       regEntry.refCount = Math.max(0, regEntry.refCount - 1);
       regEntry.lastActive = Date.now();
 
-      setTimeout(async () => {
-        let activeHeartbeats = 0;
-        for (const s of playbackSessions.values()) {
-          if (s.infoHash.toLowerCase() === matchedHash) activeHeartbeats++;
+      // Check if any fresh sessions exist (< 15s)
+      const now = Date.now();
+      let activeFreshCount = 0;
+      for (const s of playbackSessions.values()) {
+        if (s.infoHash.toLowerCase() === matchedHash && (now - s.lastSeen) < 15000) {
+          activeFreshCount++;
         }
+      }
 
-        if (regEntry.refCount === 0 && activeHeartbeats === 0) {
-          await qbt.pauseTorrents([matchedHash]);
-          console.log(`[Bandwidth Saver] Paused idle torrent: "${torrentName}"`);
-        }
-      }, 30000);
+      if (regEntry.refCount === 0 && activeFreshCount === 0) {
+        qbt.pauseTorrents([matchedHash]).catch(() => {});
+        console.log(`[Bandwidth Saver] Stream closed. Immediately paused download for: "${torrentName}"`);
+      }
     });
 
   } catch (err) {
