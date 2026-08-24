@@ -170,52 +170,74 @@ function getPrimaryVideoFile(torrent) {
  * Get or add torrent into WebTorrent engine with retry & tracker injection
  */
 async function getOrAddWebTorrent(magnet, nameHint = '') {
-  return new Promise((resolve, reject) => {
+  if (!magnet) return null;
+
+  return new Promise((resolve) => {
     try {
       const hashMatch = magnet.match(/urn:btih:([a-zA-Z0-9]+)/i);
       const infoHash = hashMatch ? hashMatch[1].toLowerCase() : null;
 
-      const existing = (infoHash ? wtClient.get(infoHash) : null) || wtClient.get(magnet);
-      if (existing) {
-        if (existing.files && existing.files.length > 0) {
-          return resolve(existing);
+      // 1. Check if torrent is already active in client
+      let torrent = (infoHash ? wtClient.get(infoHash) : null) || wtClient.get(magnet);
+
+      if (torrent) {
+        if (torrent.files && torrent.files.length > 0) {
+          return resolve(torrent);
         }
-        if (typeof existing.on === 'function') {
-          existing.on('ready', () => resolve(existing));
-        } else {
-          return resolve(existing);
+        if (torrent.ready) {
+          return resolve(torrent);
         }
-        return;
+      } else {
+        // 2. Add to WebTorrent
+        try {
+          torrent = wtClient.add(magnet, {
+            path: DOWNLOAD_DIR,
+            announce: DEFAULT_TRACKERS,
+            destroyStoreOnDestroy: true
+          });
+        } catch (addErr) {
+          torrent = (infoHash ? wtClient.get(infoHash) : null) || wtClient.get(magnet);
+        }
       }
 
-      const torrent = wtClient.add(magnet, {
-        path: DOWNLOAD_DIR,
-        announce: DEFAULT_TRACKERS,
-        destroyStoreOnDestroy: true
-      }, (readyTorrent) => {
-        console.log(`[WebTorrent] Torrent ready: "${readyTorrent.name}" (${(readyTorrent.length / (1024 * 1024)).toFixed(1)} MB, ${readyTorrent.files.length} files)`);
-        resolve(readyTorrent);
-      });
+      if (!torrent) {
+        return resolve(null);
+      }
+
+      if (torrent.ready || (torrent.files && torrent.files.length > 0)) {
+        return resolve(torrent);
+      }
+
+      // 3. Wait for 'ready' event
+      let resolved = false;
+      const onReady = () => {
+        if (!resolved) {
+          resolved = true;
+          console.log(`[WebTorrent] Torrent ready: "${torrent.name}" (${(torrent.length / (1024 * 1024)).toFixed(1)} MB)`);
+          resolve(torrent);
+        }
+      };
 
       if (typeof torrent.on === 'function') {
-        torrent.on('error', (err) => {
-          console.warn(`[WebTorrent Error]:`, err.message);
-          reject(err);
-        });
+        torrent.on('ready', onReady);
       }
 
-      // 30s timeout fallback
+      // 20s timeout fallback
       setTimeout(() => {
-        if (torrent.files && torrent.files.length > 0) {
-          resolve(torrent);
-        } else {
-          console.warn(`[WebTorrent] Metadata timeout for: ${nameHint || magnet}`);
-          resolve(torrent);
+        if (!resolved) {
+          resolved = true;
+          if (torrent.files && torrent.files.length > 0) {
+            resolve(torrent);
+          } else {
+            console.warn(`[WebTorrent] Buffering metadata for: "${nameHint || infoHash || 'torrent'}"`);
+            resolve(torrent);
+          }
         }
-      }, 30000);
+      }, 20000);
 
     } catch (e) {
-      reject(e);
+      console.warn('[WebTorrent getOrAdd Error]:', e.message);
+      resolve(null);
     }
   });
 }
@@ -336,20 +358,8 @@ app.get('/api/stream', checkRateLimit('stream', 20, 60000), async (req, res) => 
     console.log(`[Stream Request] Connecting swarm for: "${nameHint || 'Torrent'}" (Start: ${startSec}s, Direct: ${isDirect})`);
     const torrent = await getOrAddWebTorrent(magnet, nameHint);
 
-    // Wait if metadata is still resolving
-    if (!torrent.files || torrent.files.length === 0) {
-      await new Promise((resolve) => {
-        if (typeof torrent.on === 'function') {
-          const onReady = () => {
-            if (typeof torrent.removeListener === 'function') torrent.removeListener('ready', onReady);
-            resolve();
-          };
-          torrent.on('ready', onReady);
-          setTimeout(resolve, 15000);
-        } else {
-          resolve();
-        }
-      });
+    if (!torrent) {
+      return res.status(503).send('Buffering metadata from BitTorrent swarm... Please retry in a moment.');
     }
 
     const file = getPrimaryVideoFile(torrent);
