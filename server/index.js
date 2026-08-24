@@ -37,10 +37,9 @@ const PROWLARR_KEY = process.env.PROWLARR_KEY || '5a197b3359f247e8a69c7866650058
 // Resource, Concurrency & Quota Limits
 const MAX_ACTIVE_TORRENTS = parseInt(process.env.MAX_ACTIVE_TORRENTS || '5', 10);
 const MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_CONCURRENT_STREAMS || '15', 10);
-const DISK_MAX_USAGE_PCT = parseInt(process.env.DISK_MAX_USAGE_PCT || '85', 10);
-const IDLE_TTL_MINUTES = parseInt(process.env.IDLE_TTL_MINUTES || '15', 10);
+const IDLE_TTL_MINUTES = parseInt(process.env.IDLE_TTL_MINUTES || '1', 10); // 1 minute auto-delete
 const IDLE_TTL_MS = IDLE_TTL_MINUTES * 60 * 1000;
-const HEARTBEAT_TIMEOUT_MS = 45 * 1000; // 45s without heartbeat = IDLE
+const HEARTBEAT_TIMEOUT_MS = 30 * 1000; // 30s without heartbeat = IDLE
 
 // ----------------- SYSTEM STATE & SESSION REGISTRY -----------------
 
@@ -418,7 +417,7 @@ function getDiskUsageStats(targetDir = '/') {
   return { usedPct: 30, totalGb: '100.0', freeGb: '70.0' };
 }
 
-// ----------------- AUTOMATED 15-MINUTE GARBAGE COLLECTOR -----------------
+// ----------------- AUTOMATED 1-MINUTE GARBAGE COLLECTOR -----------------
 
 setInterval(async () => {
   try {
@@ -443,12 +442,12 @@ setInterval(async () => {
       const isStreaming = entry.refCount > 0 || activeSessionsCount > 0;
 
       if (!isStreaming) {
-        const isIdleExpired = (now - entry.lastActive) >= IDLE_TTL_MS;
+        const isIdleExpired = (now - entry.lastActive) >= IDLE_TTL_MS; // 1 minute
         const isEmergencyDiskPressure = diskStats.usedPct >= 88;
 
         if (isIdleExpired || isEmergencyDiskPressure) {
           if (entry.refCount === 0) {
-            console.log(`[🧹 Auto-GC] Safely deleting idle torrent & files: "${t.name}" (Reason: ${isEmergencyDiskPressure ? 'Disk Pressure' : '15m Idle'})`);
+            console.log(`[🧹 Auto-GC 1m] Safely deleting idle torrent & disk files: "${t.name}" (Reason: ${isEmergencyDiskPressure ? 'Disk Pressure' : '1m Idle'})`);
             await qbt.deleteTorrent(t.hash, true);
             torrentRegistry.delete(hash);
           }
@@ -458,7 +457,7 @@ setInterval(async () => {
   } catch (err) {
     console.warn(`[Auto-GC Warning]:`, err.message);
   }
-}, 60000);
+}, 15000);
 
 // ----------------- ROUTES -----------------
 
@@ -540,7 +539,7 @@ app.post('/api/stream/session/heartbeat', (req, res) => {
 });
 
 /**
- * Playback Session Leave Endpoint (Immediate Pause Trigger)
+ * Playback Session Leave Endpoint (Immediate Pause Trigger & 1m Auto-Delete Timer)
  */
 app.post('/api/stream/session/leave', async (req, res) => {
   const { sessionId, infoHash } = req.body || {};
@@ -550,10 +549,30 @@ app.post('/api/stream/session/leave', async (req, res) => {
   if (infoHash) {
     const hash = infoHash.toLowerCase();
     const reg = torrentRegistry.get(hash);
-    if (reg) reg.refCount = Math.max(0, reg.refCount - 1);
+    if (reg) {
+      reg.refCount = Math.max(0, reg.refCount - 1);
+      reg.lastActive = Date.now();
+    }
 
+    // 1. Pause downloading immediately
     await qbt.pauseTorrents([hash]).catch(() => {});
     console.log(`[Bandwidth Saver] Viewer left session: ${sessionId}. Paused torrent: ${hash}`);
+
+    // 2. Schedule 1-minute auto-deletion check
+    setTimeout(async () => {
+      const currentReg = torrentRegistry.get(hash);
+      const now = Date.now();
+      let activeFresh = 0;
+      for (const s of playbackSessions.values()) {
+        if (s.infoHash === hash && (now - s.lastSeen) < 15000) activeFresh++;
+      }
+
+      if ((!currentReg || currentReg.refCount === 0) && activeFresh === 0) {
+        console.log(`[🧹 Auto-Delete 1m] Deleting idle torrent & disk files: ${hash}`);
+        await qbt.deleteTorrent(hash, true).catch(() => {});
+        torrentRegistry.delete(hash);
+      }
+    }, 60000);
   }
   res.json({ status: 'left' });
 });
@@ -764,6 +783,22 @@ app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => 
       if (regEntry.refCount === 0 && activeFreshCount === 0) {
         qbt.pauseTorrents([matchedHash]).catch(() => {});
         console.log(`[Bandwidth Saver] Stream closed. Immediately paused download for: "${torrentName}"`);
+
+        // Schedule 1-minute auto-deletion check
+        setTimeout(async () => {
+          const currentReg = torrentRegistry.get(matchedHash);
+          const checkTime = Date.now();
+          let freshCount = 0;
+          for (const s of playbackSessions.values()) {
+            if (s.infoHash === matchedHash && (checkTime - s.lastSeen) < 15000) freshCount++;
+          }
+
+          if ((!currentReg || currentReg.refCount === 0) && freshCount === 0) {
+            console.log(`[🧹 Auto-Delete 1m] Deleting idle torrent & disk files for: "${torrentName}"`);
+            await qbt.deleteTorrent(matchedHash, true).catch(() => {});
+            torrentRegistry.delete(matchedHash);
+          }
+        }, 60000);
       }
     });
 
