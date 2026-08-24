@@ -597,8 +597,7 @@ export class PlayerModalManager {
 
   /**
    * Switch player source to Torrent HTTP Stream via the Bridge
-   * Uses Hls.js progressive segmented streaming (HLS) for instant playback + universal AAC audio
-   * Falls back to native HTTP 206 streaming for Safari/iOS which supports HLS natively
+   * Progressive WebTorrent engine with real-time FFmpeg AAC remuxing
    */
   streamMagnet(magnetLink, releaseTitle = 'Torrent Stream', startSec = 0) {
     if (!this.sessionId) {
@@ -611,10 +610,11 @@ export class PlayerModalManager {
     this.currentStreamTitle = releaseTitle;
     this.currentStartSec = startSec;
 
+    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle, this.sessionId, null, startSec);
     const sourceBadge = this.modal.querySelector('#player-active-source-badge');
 
     toast.info(`Connecting to torrent stream via bridge...`, '🧲');
-    this._showBufferingHUD('Connecting to Stream...', `Streaming "${releaseTitle.substring(0, 35)}..." with Universal AAC Audio`);
+    this._showBufferingHUD('Connecting to BitTorrent Swarm...', `Buffering pieces for "${releaseTitle.substring(0, 32)}..." with Universal AAC Audio`);
 
     if (sourceBadge) {
       sourceBadge.textContent = `🟢 TORRENT: ${releaseTitle.substring(0, 30)}...`;
@@ -629,89 +629,25 @@ export class PlayerModalManager {
       }
     }, 10000);
 
-    // Destroy previous HLS instance if any
+    // Destroy HLS instance if leftover
     if (this._hlsInstance) {
-      this._hlsInstance.destroy();
+      try { this._hlsInstance.destroy(); } catch {}
       this._hlsInstance = null;
     }
 
-    // Build HLS URL with duration hint for accurate seeking
-    const durationSec = this.totalRuntimeSeconds || this.duration || 0;
-    const hlsUrl = streamingBridge.getHlsUrl(magnetLink, releaseTitle, this.sessionId, durationSec);
-
-    // Use Hls.js for progressive HLS streaming (Chrome, Firefox, Edge)
-    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-      console.log('[Player] Using Hls.js engine for progressive streaming');
-      const hls = new Hls({
-        maxBufferLength: 30,        // Buffer 30s ahead
-        maxMaxBufferLength: 120,    // Up to 120s max
-        startPosition: startSec,
-        liveSyncDurationCount: 3,
-        enableWorker: true,
-        lowLatencyMode: false,
-      });
-
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(this.videoElement);
-
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        console.log('[HLS] Manifest parsed, starting playback');
-        this._hideBufferingHUD();
-        this._play();
-      });
-
-      hls.on(Hls.Events.ERROR, (event, data) => {
-        console.warn('[HLS Error]:', data.type, data.details);
-        if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              console.warn('[HLS] Network error, retrying...');
-              this._showBufferingHUD('Buffering...', 'Waiting for torrent pieces to download...');
-              setTimeout(() => hls.startLoad(), 3000);
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              console.warn('[HLS] Media error, recovering...');
-              hls.recoverMediaError();
-              break;
-            default:
-              console.error('[HLS] Fatal error, falling back to direct stream');
-              hls.destroy();
-              this._hlsInstance = null;
-              // Fallback to direct HTTP 206 stream
-              this._directStreamFallback(magnetLink, releaseTitle, startSec);
-              break;
-          }
-        }
-      });
-
-      hls.on(Hls.Events.FRAG_BUFFERED, () => {
-        this._hideBufferingHUD();
-        this._updateBufferedRange();
-      });
-
-      this._hlsInstance = hls;
-
-    } else if (this.videoElement.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari/iOS — native HLS support
-      console.log('[Player] Using native HLS (Safari/iOS)');
-      this.videoElement.src = hlsUrl;
-      this.videoElement.load();
-      this._play();
-    } else {
-      // Final fallback: direct HTTP 206 byte-range stream
-      console.log('[Player] Fallback to direct HTTP 206 stream');
-      this._directStreamFallback(magnetLink, releaseTitle, startSec);
-    }
-  }
-
-  /**
-   * Direct HTTP 206 byte-range fallback (used when HLS is unavailable)
-   */
-  _directStreamFallback(magnetLink, releaseTitle, startSec) {
-    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle, this.sessionId, null, startSec);
+    // Set video source
     this.videoElement.src = streamUrl;
     this.videoElement.load();
     this._play();
+
+    // Listen for playback start to dismiss buffering HUD
+    const onPlaying = () => {
+      this._hideBufferingHUD();
+      this.videoElement.removeEventListener('playing', onPlaying);
+      this.videoElement.removeEventListener('canplay', onPlaying);
+    };
+    this.videoElement.addEventListener('playing', onPlaying);
+    this.videoElement.addEventListener('canplay', onPlaying);
   }
 
   _showBufferingHUD(title = 'Connecting to Swarm...', subtext = 'Requesting sequential download pieces via VPS qBittorrent bridge...') {
@@ -793,7 +729,25 @@ export class PlayerModalManager {
     const clamped = Math.max(0, Math.min(totalDur, targetSeconds));
 
     if (this.videoElement) {
-      this.videoElement.currentTime = clamped;
+      let isBuffered = false;
+      const buf = this.videoElement.buffered;
+      if (buf) {
+        for (let i = 0; i < buf.length; i++) {
+          if (clamped >= buf.start(i) && clamped <= buf.end(i)) {
+            isBuffered = true;
+            break;
+          }
+        }
+      }
+
+      if (isBuffered) {
+        this.videoElement.currentTime = clamped;
+      } else if (this.currentMagnet) {
+        this.streamMagnet(this.currentMagnet, this.currentStreamTitle, clamped);
+      } else {
+        this.videoElement.currentTime = clamped;
+      }
+
       this._updateProgressBar();
       this._updateTimeDisplay();
     }
