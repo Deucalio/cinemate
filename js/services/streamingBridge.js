@@ -178,6 +178,25 @@ export const streamingBridge = {
   },
 
   /**
+   * Construct HLS Master Playlist URL for Hls.js progressive streaming
+   * This route generates .m3u8 with segments that FFmpeg-remux to AAC on-the-fly
+   */
+  getHlsUrl(magnetOrLink, releaseTitle = '', sessionId = null, durationSec = 0) {
+    const serverUrl = this.getStreamServerUrl();
+    let url = `${serverUrl}/api/stream/hls/master.m3u8?magnet=${encodeURIComponent(magnetOrLink)}`;
+    if (releaseTitle) {
+      url += `&title=${encodeURIComponent(releaseTitle)}`;
+    }
+    if (sessionId) {
+      url += `&sessionId=${encodeURIComponent(sessionId)}`;
+    }
+    if (durationSec > 0) {
+      url += `&duration=${Math.floor(durationSec)}`;
+    }
+    return url;
+  },
+
+  /**
    * Send Playback Session Heartbeat (Every 10s while player is active)
    */
   async sendHeartbeat(sessionId, infoHash, currentTime = 0) {

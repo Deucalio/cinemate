@@ -597,6 +597,8 @@ export class PlayerModalManager {
 
   /**
    * Switch player source to Torrent HTTP Stream via the Bridge
+   * Uses Hls.js progressive segmented streaming (HLS) for instant playback + universal AAC audio
+   * Falls back to native HTTP 206 streaming for Safari/iOS which supports HLS natively
    */
   streamMagnet(magnetLink, releaseTitle = 'Torrent Stream', startSec = 0) {
     if (!this.sessionId) {
@@ -609,7 +611,6 @@ export class PlayerModalManager {
     this.currentStreamTitle = releaseTitle;
     this.currentStartSec = startSec;
 
-    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle, this.sessionId, null, startSec);
     const sourceBadge = this.modal.querySelector('#player-active-source-badge');
 
     toast.info(`Connecting to torrent stream via bridge...`, '🧲');
@@ -628,6 +629,86 @@ export class PlayerModalManager {
       }
     }, 10000);
 
+    // Destroy previous HLS instance if any
+    if (this._hlsInstance) {
+      this._hlsInstance.destroy();
+      this._hlsInstance = null;
+    }
+
+    // Build HLS URL with duration hint for accurate seeking
+    const durationSec = this.totalRuntimeSeconds || this.duration || 0;
+    const hlsUrl = streamingBridge.getHlsUrl(magnetLink, releaseTitle, this.sessionId, durationSec);
+
+    // Use Hls.js for progressive HLS streaming (Chrome, Firefox, Edge)
+    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+      console.log('[Player] Using Hls.js engine for progressive streaming');
+      const hls = new Hls({
+        maxBufferLength: 30,        // Buffer 30s ahead
+        maxMaxBufferLength: 120,    // Up to 120s max
+        startPosition: startSec,
+        liveSyncDurationCount: 3,
+        enableWorker: true,
+        lowLatencyMode: false,
+      });
+
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(this.videoElement);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        console.log('[HLS] Manifest parsed, starting playback');
+        this._hideBufferingHUD();
+        this._play();
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        console.warn('[HLS Error]:', data.type, data.details);
+        if (data.fatal) {
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              console.warn('[HLS] Network error, retrying...');
+              this._showBufferingHUD('Buffering...', 'Waiting for torrent pieces to download...');
+              setTimeout(() => hls.startLoad(), 3000);
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              console.warn('[HLS] Media error, recovering...');
+              hls.recoverMediaError();
+              break;
+            default:
+              console.error('[HLS] Fatal error, falling back to direct stream');
+              hls.destroy();
+              this._hlsInstance = null;
+              // Fallback to direct HTTP 206 stream
+              this._directStreamFallback(magnetLink, releaseTitle, startSec);
+              break;
+          }
+        }
+      });
+
+      hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        this._hideBufferingHUD();
+        this._updateBufferedRange();
+      });
+
+      this._hlsInstance = hls;
+
+    } else if (this.videoElement.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari/iOS — native HLS support
+      console.log('[Player] Using native HLS (Safari/iOS)');
+      this.videoElement.src = hlsUrl;
+      this.videoElement.load();
+      this._play();
+    } else {
+      // Final fallback: direct HTTP 206 byte-range stream
+      console.log('[Player] Fallback to direct HTTP 206 stream');
+      this._directStreamFallback(magnetLink, releaseTitle, startSec);
+    }
+  }
+
+  /**
+   * Direct HTTP 206 byte-range fallback (used when HLS is unavailable)
+   */
+  _directStreamFallback(magnetLink, releaseTitle, startSec) {
+    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle, this.sessionId, null, startSec);
     this.videoElement.src = streamUrl;
     this.videoElement.load();
     this._play();
@@ -788,6 +869,12 @@ export class PlayerModalManager {
 
   close() {
     this._sendLeaveBeacon();
+
+    // Destroy Hls.js instance
+    if (this._hlsInstance) {
+      this._hlsInstance.destroy();
+      this._hlsInstance = null;
+    }
 
     if (this._heartbeatTimer) {
       clearInterval(this._heartbeatTimer);

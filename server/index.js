@@ -663,87 +663,120 @@ app.post('/api/cleanup', async (req, res) => {
 });
 
 /**
- * Fast C++ qBittorrent HTTP 206 Partial Content Stream Endpoint with On-Demand Range Seeking
+ * Shared: Resolve magnet to torrent file on disk.
+ * Returns { targetFilePath, torrentInfo, matchedHash, torrentName } or null.
+ */
+async function resolveTorrentFile(magnet, nameHint) {
+  const infoHash = qbt.extractInfoHash(magnet);
+
+  await qbt.addTorrent(magnet);
+
+  let torrentInfo = null;
+  let targetFilePath = null;
+
+  for (let i = 0; i < 25; i++) {
+    torrentInfo = await qbt.findTorrent(infoHash, nameHint, magnet);
+    if (torrentInfo) {
+      if (torrentInfo.content_path) {
+        targetFilePath = findSafeMediaFileCandidate(torrentInfo.content_path);
+      }
+      if (!targetFilePath && torrentInfo.save_path && torrentInfo.name) {
+        targetFilePath = findSafeMediaFileCandidate(path.join(torrentInfo.save_path, torrentInfo.name));
+      }
+      if (targetFilePath && fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size >= MIN_MEDIA_FILE_BYTES) {
+        break;
+      }
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  if (!targetFilePath || !fs.existsSync(targetFilePath)) return null;
+
+  const matchedHash = (torrentInfo ? torrentInfo.hash : (infoHash || 'unknown')).toLowerCase();
+  const torrentName = torrentInfo ? torrentInfo.name : (nameHint || 'Media Stream');
+
+  // Register and resume
+  if (!torrentRegistry.has(matchedHash)) {
+    torrentRegistry.set(matchedHash, {
+      hash: matchedHash,
+      name: torrentName,
+      refCount: 0,
+      lastActive: Date.now()
+    });
+  }
+  const regEntry = torrentRegistry.get(matchedHash);
+  regEntry.refCount++;
+  regEntry.lastActive = Date.now();
+  qbt.resumeTorrents([matchedHash]).catch(() => {});
+
+  return { targetFilePath, torrentInfo, matchedHash, torrentName, regEntry };
+}
+
+/**
+ * Decrement ref count and schedule 1-minute auto-deletion
+ */
+function scheduleCleanup(matchedHash, torrentName, regEntry) {
+  regEntry.refCount = Math.max(0, regEntry.refCount - 1);
+  regEntry.lastActive = Date.now();
+
+  const now = Date.now();
+  let activeFreshCount = 0;
+  for (const s of playbackSessions.values()) {
+    if (s.infoHash.toLowerCase() === matchedHash && (now - s.lastSeen) < 15000) {
+      activeFreshCount++;
+    }
+  }
+
+  if (regEntry.refCount === 0 && activeFreshCount === 0) {
+    qbt.pauseTorrents([matchedHash]).catch(() => {});
+    console.log(`[Bandwidth Saver] Stream closed. Paused: "${torrentName}"`);
+
+    setTimeout(async () => {
+      const currentReg = torrentRegistry.get(matchedHash);
+      const checkTime = Date.now();
+      let freshCount = 0;
+      for (const s of playbackSessions.values()) {
+        if (s.infoHash === matchedHash && (checkTime - s.lastSeen) < 15000) freshCount++;
+      }
+      if ((!currentReg || currentReg.refCount === 0) && freshCount === 0) {
+        console.log(`[🧹 Auto-Delete 1m] Deleting idle torrent & disk files for: "${torrentName}"`);
+        await qbt.deleteTorrent(matchedHash, true).catch(() => {});
+        torrentRegistry.delete(matchedHash);
+      }
+    }, 60000);
+  }
+}
+
+/**
+ * Direct HTTP 206 Byte-Range Streaming (for native AAC/MP4 files)
  */
 app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => {
   const magnet = req.query.magnet || req.query.link;
   const nameHint = req.query.title || '';
   const sessionId = req.headers['x-session-id'] || req.query.sessionId || `sess_${Date.now()}`;
 
-  if (!magnet) {
-    return res.status(400).send('Missing magnet link parameter');
-  }
+  if (!magnet) return res.status(400).send('Missing magnet link parameter');
 
-  // 1. Check VPS Disk Quota Safeguard
   const diskStats = getDiskUsageStats();
   if (diskStats.usedPct >= DISK_MAX_USAGE_PCT) {
-    return res.status(507).send(`VPS Disk Usage is at ${diskStats.usedPct}%. New streams temporarily throttled.`);
+    return res.status(507).send(`VPS Disk full (${diskStats.usedPct}%)`);
   }
 
-  const infoHash = qbt.extractInfoHash(magnet);
-
   try {
-    // 2. Add to qBittorrent
-    await qbt.addTorrent(magnet);
-
-    // 3. Poll for torrent metadata & verified safe media candidate
-    let torrentInfo = null;
-    let targetFilePath = null;
-
-    for (let i = 0; i < 20; i++) {
-      torrentInfo = await qbt.findTorrent(infoHash, nameHint, magnet);
-      if (torrentInfo) {
-        if (torrentInfo.content_path) {
-          targetFilePath = findSafeMediaFileCandidate(torrentInfo.content_path);
-        }
-        if (!targetFilePath && torrentInfo.save_path && torrentInfo.name) {
-          targetFilePath = findSafeMediaFileCandidate(path.join(torrentInfo.save_path, torrentInfo.name));
-        }
-
-        if (targetFilePath && fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size >= MIN_MEDIA_FILE_BYTES) {
-          break;
-        }
-      }
-      await new Promise(r => setTimeout(r, 1000));
+    const resolved = await resolveTorrentFile(magnet, nameHint);
+    if (!resolved) {
+      return res.status(503).send('Buffering metadata... Retry in a few seconds.');
     }
 
-    if (!targetFilePath || !fs.existsSync(targetFilePath)) {
-      return res.status(503).send('Buffering metadata from BitTorrent swarm... Please wait a few seconds and retry.');
-    }
-
-    const matchedHash = (torrentInfo ? torrentInfo.hash : (infoHash || 'unknown')).toLowerCase();
-    const torrentName = torrentInfo ? torrentInfo.name : (nameHint || 'Media Stream');
-
-    // 4. Update Torrent Registry & Playback Session
-    if (!torrentRegistry.has(matchedHash)) {
-      torrentRegistry.set(matchedHash, {
-        hash: matchedHash,
-        name: torrentName,
-        refCount: 0,
-        lastActive: Date.now()
-      });
-    }
-
-    const regEntry = torrentRegistry.get(matchedHash);
-    regEntry.refCount++;
-    regEntry.lastActive = Date.now();
+    const { targetFilePath, torrentInfo, matchedHash, torrentName, regEntry } = resolved;
 
     playbackSessions.set(sessionId, {
-      id: sessionId,
-      infoHash: matchedHash,
-      lastSeen: Date.now(),
-      currentTime: 0,
-      ip: req.ip
+      id: sessionId, infoHash: matchedHash, lastSeen: Date.now(), currentTime: 0, ip: req.ip
     });
 
-    // Make sure torrent is active
-    qbt.resumeTorrents([matchedHash]).catch(() => {});
-
-    // 5. Calculate File & Range Parameters
     const stat = fs.statSync(targetFilePath);
     const fileSize = stat.size;
     const range = req.headers.range;
-
     let start = 0;
     let end = fileSize - 1;
 
@@ -753,11 +786,9 @@ app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => 
       end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
     }
 
-    // 6. On-Demand Piece Prioritization for Range / Seek Offset
     const pieceSize = torrentInfo ? (torrentInfo.piece_size || 2 * 1024 * 1024) : 2 * 1024 * 1024;
     await prioritizeByteRange(matchedHash, start, end, pieceSize, 0, 4000);
 
-    // 7. Direct HTTP 206 Partial Content Streaming
     const ext = path.extname(targetFilePath).toLowerCase();
     const chunkSize = (end - start) + 1;
     const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
@@ -767,62 +798,186 @@ app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => 
       'Accept-Ranges': 'bytes',
       'Content-Length': chunkSize,
       'Content-Type': contentType,
-      'Cache-Control': 'no-cache' 
+      'Cache-Control': 'no-cache'
     });
 
     const stream = fs.createReadStream(targetFilePath, { start, end });
     stream.pipe(res);
 
-    // 8. Stream Close Handler
     req.on('close', () => {
       stream.destroy();
       playbackSessions.delete(sessionId);
-      regEntry.refCount = Math.max(0, regEntry.refCount - 1);
-      regEntry.lastActive = Date.now();
-
-      // Check if any fresh sessions exist (< 15s)
-      const now = Date.now();
-      let activeFreshCount = 0;
-      for (const s of playbackSessions.values()) {
-        if (s.infoHash.toLowerCase() === matchedHash && (now - s.lastSeen) < 15000) {
-          activeFreshCount++;
-        }
-      }
-
-      if (regEntry.refCount === 0 && activeFreshCount === 0) {
-        qbt.pauseTorrents([matchedHash]).catch(() => {});
-        console.log(`[Bandwidth Saver] Stream closed. Immediately paused download for: "${torrentName}"`);
-
-        // Schedule 1-minute auto-deletion check
-        setTimeout(async () => {
-          const currentReg = torrentRegistry.get(matchedHash);
-          const checkTime = Date.now();
-          let freshCount = 0;
-          for (const s of playbackSessions.values()) {
-            if (s.infoHash === matchedHash && (checkTime - s.lastSeen) < 15000) freshCount++;
-          }
-
-          if ((!currentReg || currentReg.refCount === 0) && freshCount === 0) {
-            console.log(`[🧹 Auto-Delete 1m] Deleting idle torrent & disk files for: "${torrentName}"`);
-            await qbt.deleteTorrent(matchedHash, true).catch(() => {});
-            torrentRegistry.delete(matchedHash);
-          }
-        }, 60000);
-      }
+      scheduleCleanup(matchedHash, torrentName, regEntry);
     });
 
   } catch (err) {
     console.error('[Stream Handler Error]:', err);
-    if (!res.headersSent) {
-      res.status(500).send(`Streaming bridge error: ${err.message}`);
+    if (!res.headersSent) res.status(500).send(`Streaming bridge error: ${err.message}`);
+  }
+});
+
+/**
+ * HLS Master Playlist Endpoint — Generates m3u8 for Hls.js progressive streaming
+ * This enables instant playback at 0% download with universal AAC audio.
+ */
+app.get('/api/stream/hls/master.m3u8', async (req, res) => {
+  const magnet = req.query.magnet || req.query.link;
+  const nameHint = req.query.title || '';
+  const sessionId = req.query.sessionId || `sess_${Date.now()}`;
+
+  if (!magnet) return res.status(400).send('Missing magnet');
+
+  try {
+    const resolved = await resolveTorrentFile(magnet, nameHint);
+    if (!resolved) {
+      return res.status(503).send('Buffering metadata... Retry in a few seconds.');
     }
+
+    const { targetFilePath, matchedHash, torrentName, regEntry } = resolved;
+
+    playbackSessions.set(sessionId, {
+      id: sessionId, infoHash: matchedHash, lastSeen: Date.now(), currentTime: 0, ip: req.ip
+    });
+
+    // Use TMDB runtime hint or estimate from file size
+    const durationHint = req.query.duration ? parseInt(req.query.duration, 10) : 0;
+    let totalDuration = durationHint;
+
+    if (!totalDuration || totalDuration < 60) {
+      // Estimate: ~150KB/s average bitrate for 1080p h264
+      const stat = fs.statSync(targetFilePath);
+      totalDuration = Math.max(300, Math.floor(stat.size / 500000));
+    }
+
+    const segmentDuration = 4; // 4-second segments for responsive seeking
+    const segmentCount = Math.ceil(totalDuration / segmentDuration);
+
+    // Build m3u8 playlist
+    let playlist = '#EXTM3U\n';
+    playlist += '#EXT-X-VERSION:3\n';
+    playlist += `#EXT-X-TARGETDURATION:${segmentDuration}\n`;
+    playlist += '#EXT-X-MEDIA-SEQUENCE:0\n';
+    playlist += '#EXT-X-PLAYLIST-TYPE:EVENT\n';
+
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+
+    for (let i = 0; i < segmentCount; i++) {
+      const segDur = Math.min(segmentDuration, totalDuration - (i * segmentDuration));
+      playlist += `#EXTINF:${segDur.toFixed(3)},\n`;
+      playlist += `${baseUrl}/api/stream/hls/segment/${i}?magnet=${encodeURIComponent(magnet)}&title=${encodeURIComponent(nameHint)}&sessionId=${encodeURIComponent(sessionId)}&segDur=${segmentDuration}\n`;
+    }
+
+    playlist += '#EXT-X-ENDLIST\n';
+
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(playlist);
+
+  } catch (err) {
+    console.error('[HLS Master Error]:', err);
+    if (!res.headersSent) res.status(500).send(`HLS error: ${err.message}`);
+  }
+});
+
+/**
+ * HLS Segment Endpoint — On-demand 4-second MPEG-TS segment with video copy + AAC audio
+ * Each segment is generated independently by FFmpeg, enabling instant 0% playback.
+ */
+app.get('/api/stream/hls/segment/:index', async (req, res) => {
+  const segIndex = parseInt(req.params.index, 10);
+  const magnet = req.query.magnet || req.query.link;
+  const nameHint = req.query.title || '';
+  const sessionId = req.query.sessionId || `sess_${Date.now()}`;
+  const segDur = parseInt(req.query.segDur || '4', 10);
+
+  if (!magnet || isNaN(segIndex)) {
+    return res.status(400).send('Missing magnet or segment index');
+  }
+
+  try {
+    const resolved = await resolveTorrentFile(magnet, nameHint);
+    if (!resolved) {
+      return res.status(503).send('Buffering...');
+    }
+
+    const { targetFilePath, torrentInfo, matchedHash, torrentName, regEntry } = resolved;
+
+    // Update session
+    if (playbackSessions.has(sessionId)) {
+      playbackSessions.get(sessionId).lastSeen = Date.now();
+    }
+
+    const startSec = segIndex * segDur;
+
+    // Prioritize pieces at this timestamp
+    const stat = fs.statSync(targetFilePath);
+    const fileSize = stat.size;
+    const pieceSize = torrentInfo ? (torrentInfo.piece_size || 2 * 1024 * 1024) : 2 * 1024 * 1024;
+
+    // Estimate byte offset from timestamp (rough: assume uniform bitrate)
+    const estimatedTotalDuration = Math.max(300, fileSize / 500000);
+    const startByte = Math.floor((startSec / estimatedTotalDuration) * fileSize);
+    const endByte = Math.min(fileSize - 1, startByte + 20 * 1024 * 1024);
+
+    await prioritizeByteRange(matchedHash, startByte, endByte, pieceSize, 0, 5000);
+
+    // Generate segment with FFmpeg
+    const ffmpegArgs = [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-ss', `${startSec}`,
+      '-t', `${segDur}`,
+      '-i', targetFilePath,
+      '-c:v', 'copy',           // Video passthrough (0% CPU)
+      '-c:a', 'aac',            // Transcode audio to universal AAC
+      '-b:a', '192k',
+      '-ac', '2',               // Stereo for browser compatibility
+      '-f', 'mpegts',           // MPEG-TS container for HLS
+      'pipe:1'
+    ];
+
+    console.log(`[HLS Segment] #${segIndex} @ ${startSec}s for "${torrentName}"`);
+
+    res.setHeader('Content-Type', 'video/MP2T');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+    ffmpeg.stdout.pipe(res);
+
+    ffmpeg.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) console.warn(`[HLS FFmpeg Seg#${segIndex}]:`, msg);
+    });
+
+    ffmpeg.on('error', (e) => {
+      console.warn(`[HLS FFmpeg Error Seg#${segIndex}]:`, e.message);
+      if (!res.headersSent) res.status(500).end();
+    });
+
+    ffmpeg.on('close', (code) => {
+      if (code !== 0 && !res.headersSent) {
+        res.status(500).end();
+      }
+    });
+
+    req.on('close', () => {
+      try { ffmpeg.kill('SIGKILL'); } catch {}
+    });
+
+  } catch (err) {
+    console.error(`[HLS Segment Error #${segIndex}]:`, err);
+    if (!res.headersSent) res.status(500).send(`Segment error: ${err.message}`);
   }
 });
 
 // Start Server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
-  console.log(`🎬 CineStream High-Speed Streaming Bridge (qBittorrent + HTTP 206)`);
+  console.log(`🎬 CineStream Dual-Engine Streaming Bridge`);
+  console.log(`   Engine 1: Native HTTP 206 (AAC/MP4 sources)`);
+  console.log(`   Engine 2: HLS + Hls.js (Dolby/EAC3/MKV → AAC)`);
   console.log(`📡 Port:               ${PORT}`);
   console.log(`📥 qBittorrent:        ${QBT_URL}`);
   console.log(`🔍 Prowlarr Proxy:     ${PROWLARR_URL}`);
