@@ -131,10 +131,15 @@ export class DetailModalManager {
               <span class="btn-text">Stream / Play</span>
             </button>
 
+            <button class="btn btn-secondary" id="btn-detail-sources" title="Find Torrent Streams via Prowlarr">
+              <span class="btn-icon">📡</span>
+              <span class="btn-text">Torrent Sources</span>
+            </button>
+
             ${trailer ? `
-              <button class="btn btn-secondary" id="btn-watch-trailer">
+              <button class="btn btn-glass" id="btn-watch-trailer">
                 <span class="btn-icon">🎬</span>
-                <span class="btn-text">Watch Trailer</span>
+                <span class="btn-text">Trailer</span>
               </button>
             ` : ''}
 
@@ -380,12 +385,21 @@ export class DetailModalManager {
 
     const title = details.title || details.name;
 
+    const sourcesDetailBtn = dialog.querySelector('#btn-detail-sources');
+
     closeBtn.addEventListener('click', () => this.close());
 
     playBtn.addEventListener('click', () => {
       this.close();
-      window.app.openPlayer(details);
+      window.app.openPlayer(details, { openSources: true });
     });
+
+    if (sourcesDetailBtn) {
+      sourcesDetailBtn.addEventListener('click', () => {
+        this.close();
+        window.app.openPlayer(details, { openSources: true });
+      });
+    }
 
     if (trailerBtn && trailer) {
       trailerBtn.addEventListener('click', () => {

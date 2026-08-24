@@ -237,6 +237,15 @@ export class PlayerModalManager {
       toast.info(`Resuming "${title}" from ${this._formatTime(this.currentTime)}`);
     }
 
+    // Auto open sources drawer if requested or by default
+    if (options.openSources !== false) {
+      const sourcesOverlay = this.modal.querySelector('#player-sources-overlay');
+      if (sourcesOverlay) {
+        sourcesOverlay.style.display = 'flex';
+        this._loadTorrentSources(isTV, title, year, season, episode);
+      }
+    }
+
     // Auto play
     this._play();
   }

@@ -85,6 +85,13 @@
   border-radius: var(--radius-sm);
 }
 
+.player-top-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  z-index: 30;
+}
+
 .player-quality-pill {
   font-size: 0.8rem;
   font-weight: 800;
