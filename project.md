@@ -377,5 +377,35 @@ Health endpoint response:
     "idleCleanupMinutes": 15
   },
   "uptime": 240.5
-}
-```
+## 9. Known Issues & Handoff for Future AI Agents
+
+### ⚠️ Progressive Streaming & Audio Playback Issue
+
+#### 1. Symptoms & Observed Behavior
+- **Torrent Downloads Successfully:** qBittorrent on the VPS (`localhost:18080`) connects to the BitTorrent swarm, adds torrents sequentially, and downloads data to disk (e.g. 4.6% -> 100% complete at 4+ MB/s).
+- **Player Remains in Buffering State:** In the browser client (`playerModal.js`), the custom `<video>` player stays stuck displaying:
+  > *"Buffering Stream... Receiving next sequential chunks from seeders via qBittorrent..."*
+  Playback does not begin, and audio/video frames are not rendered.
+
+#### 2. Root Cause Analysis
+- **A. MP4 `moov` Atom Position & Sparse Disk Pre-allocation:**
+  - Standard `.mp4` release files often contain the `moov` index metadata at the very end of the file.
+  - When qBittorrent downloads on Linux, it allocates the full file size on disk. The non-downloaded regions contain sparse zero-bytes (`0x00`).
+  - When the browser or FFmpeg attempts to read `Range` bytes or pipes data sequentially before the `moov` atom is downloaded or when seeking past downloaded pieces, the demuxer encounters zero-bytes or non-seekable streams and stalls indefinitely.
+- **B. Browser Audio Incompatibility (E-AC-3 / DTS / TrueHD):**
+  - Most torrent releases (especially 1080p/4K WEB-DLs like *Lanterns*, *Interstellar*, *Dune*) use **Dolby Digital Plus (E-AC-3)**, **DTS-HD**, or **AC-3 5.1**.
+  - Modern web browsers (Google Chrome, Mozilla Firefox, Microsoft Edge) **do not have native decoders for E-AC-3 or DTS** inside standard HTML5 `<video>` elements, leading to silent playback or fatal decoding errors.
+  - Audio must be transcoded on-the-fly to **stereo AAC (`-c:a aac -b:a 192k -ac 2`)** without re-encoding video (`-c:v copy`).
+- **C. WebTorrent vs. Native qBittorrent Swarm Discovery:**
+  - Pure JavaScript WebTorrent in Node.js faces UDP DHT / NAT traversal limitations on certain VPS providers, causing metadata lookup timeouts.
+  - qBittorrent (C++ libtorrent) connects to peers instantly, but requires an active bridge to stream verified pieces to the browser.
+
+#### 3. Recommended Architectural Solutions for Next Agent
+1. **HLS Multi-Segment Transcoder (`hls.js` + FFmpeg):**
+   - Use FFmpeg to generate 4-second `.ts` or `.fmp4` segments dynamically via an HTTP endpoint (`/api/stream/hls/segment_:index.ts`).
+   - Read from `targetFilePath` starting from verified downloaded offsets, transcode audio to AAC (`-c:a aac -c:v copy`), and feed `hls.js` in the frontend.
+2. **WebTorrent with Dedicated FFmpeg Transcode Worker:**
+   - Use WebTorrent to fetch piece buffers directly in memory (avoiding sparse disk zero-bytes), pipe chunk buffers into a seekable container remuxer, and output fragmented MP4 (`fMP4`) directly into `MediaSource` / `<video>`.
+3. **Frontend Diagnostics & Error Recovery:**
+   - In [playerModal.js](file:///d:/vscode/netflix/js/components/playerModal.js), ensure `<video>` error codes (`e.target.error.code` -> `MEDIA_ERR_SRC_NOT_SUPPORTED` / `MEDIA_ERR_DECODE`) surface exact debug telemetry and trigger automatic transcoding fallbacks.
+
