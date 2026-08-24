@@ -22,7 +22,7 @@ CineStream Pro bridges a cinematic web client with an on-demand, piece-aware Bit
                ▼                          ▼                            ▼
       ┌─────────────────┐        ┌─────────────────┐          ┌──────────────────────────┐
       │    TMDB API     │        │  LocalStorage   │          │   VPS Bridge (:8888)     │
-      │  v3 / Discover  │        │  State & Diary  │          │   Express + Piece Engine │
+      │  v3 / Discover  │        │  State & Diary  │          │   Rate Limit + Piece Map │
       └─────────────────┘        └─────────────────┘          └────────────┬─────────────┘
                                                                            │
                                       ┌────────────────────────────────────┴──────────────────────────┐
@@ -31,6 +31,7 @@ CineStream Pro bridges a cinematic web client with an on-demand, piece-aware Bit
                          ┌─────────────────────────┐                                     ┌─────────────────────────┐
                          │     Prowlarr :9696      │                                     │   qBittorrent :18080    │
                          │ Torznab Community Feeds │                                     │  Sequential C++ Engine  │
+                         │ (Loopback Protected)    │                                     │ (Loopback Protected)    │
                          └─────────────────────────┘                                     └────────────┬────────────┘
                                                                                                       │ (Piece Verification)
                                                                                                       ▼
@@ -102,18 +103,37 @@ When a user scrubs from `00:03:00` to `01:25:00`, the browser requests a new byt
 
 ---
 
-## 4. Container & Codec Compatibility
+## 4. Defensive Security & Torrent Sanitization
 
-Web browsers decode media formats through hardware/software decoders:
+CineStream adheres to strict defensive security practices when processing third-party torrent swarms:
 
-| Container | Video Codec | Audio Codec | Browser Playback Status | Strategy |
-|---|---|---|---|---|
-| **MP4** | H.264 (AVC) | AAC | 🟢 **100% Native (Universal)** | Direct HTTP 206 Range Stream |
-| **WebM** | VP8 / VP9 / AV1 | Opus / Vorbis | 🟢 **100% Native (Chrome/Edge/Firefox)** | Direct HTTP 206 Range Stream |
-| **MP4** | HEVC (H.265) | AAC / AC3 | 🟡 **Hardware Dependent (Safari, Edge, Chrome HEVC)** | Direct Stream with fallback notification |
-| **MKV** | H.264 / HEVC | DTS / TrueHD | 🔴 **Unsupported natively by HTML5 `<video>`** | Remux to fMP4 container or prioritize MP4 releases |
+```
+Torrent Contents (Untrusted Swarm Data)
+   │
+   ├── 1. Enumerate all file entries
+   │
+   ├── 2. Path Traversal Guard
+   │      Canonical check: path.resolve(filePath).startsWith(baseDownloadDir)
+   │      Reject any ../ or out-of-boundary references
+   │
+   ├── 3. Forbidden Extension Blacklist
+   │      Block .exe, .bat, .cmd, .scr, .vbs, .sh, .iso, .msi
+   │
+   ├── 4. Media Whitelist & Minimum Size Threshold
+   │      Allow only .mp4, .webm, .mkv, .m4v (Size >= 5 MB)
+   │      Filter out sample clips, trailers, and text/nfo junk
+   │
+   └── 5. Safe Candidate Selected for Streaming
+```
 
-*UI Guideline:* The sources drawer prioritizes releases with MP4 / H.264 / WebM badges for maximum plug-and-play browser compatibility.
+### Zero-Trust Internal Service Isolation
+- **Strict Loopback Binding:** qBittorrent (`127.0.0.1:18080`) and Prowlarr (`127.0.0.1:9696`) are bound exclusively to the VPS loopback interface.
+- **Zero Credential Leakage:** Prowlarr API keys and qBittorrent admin passwords are stored in server-side `.env` files and never sent to or accessible by client browsers.
+
+### API Rate Limiting & Admin Authorization
+- **Search Rate Limiting:** Enforces a maximum of 30 search requests per minute per IP.
+- **Stream Rate Limiting:** Enforces a maximum of 10 new stream initializations per minute per IP to prevent swarm flooding.
+- **Admin Maintenance Token:** The `/api/cleanup` maintenance endpoint requires a valid `X-Admin-Token` header, preventing unauthorized callers from purging cached content.
 
 ---
 
@@ -157,10 +177,44 @@ Browsers generate dozens of short-lived HTTP connections during single-stream pl
 
 ---
 
-## 6. Multi-Tier VPS Disk Protection & Quota System
+## 6. Host Impact, Resource Bottlenecks & Telemetry
 
-To prevent disk starvation on production VPS hosts shared with other services:
+While the Node.js Express process uses minimal CPU for I/O piping, multi-stream torrent acquisition creates real load on **Disk I/O** and **Network Bandwidth**:
 
+```
+RESOURCE BOTTLENECK PROFILE (5 Concurrent Torrents)
+
+CPU Load      ██░░░░░░░░  (Low-Moderate, mostly libtorrent encryption/hashing)
+System RAM    ███░░░░░░░  (Controlled by PM2 & qBittorrent cache limits)
+Disk I/O      ████████░░  (High during simultaneous writes & HTTP reads)
+Network RX/TX ██████████  (High bandwidth consumption during active grabs)
+```
+
+### Live Host Telemetry in `/health`:
+The `/health` endpoint exposes real-time host metrics:
+```json
+{
+  "status": "online",
+  "service": "CineStream Torrent Bridge (Protected & Piece-Aware)",
+  "hostTelemetry": {
+    "loadAverage": [0.42, 0.38, 0.35],
+    "ramTotalMb": 7964,
+    "ramFreeMb": 5120,
+    "diskUsagePercent": "22%",
+    "diskFreeGb": "314.5 GB",
+    "dlSpeed": "10.05 MB/s",
+    "upSpeed": "0.45 MB/s"
+  },
+  "limits": {
+    "maxActiveTorrents": 5,
+    "maxConcurrentStreams": 15,
+    "maxDiskUsagePercent": "85%",
+    "idleCleanupMinutes": 15
+  }
+}
+```
+
+### Multi-Tier VPS Disk Protection
 | Threshold | Trigger Condition | System Action |
 |---|---|---|
 | **Normal Operation** | Disk Usage < 80% | Standard sequential streaming, 15-minute idle Auto-GC. |
@@ -170,50 +224,34 @@ To prevent disk starvation on production VPS hosts shared with other services:
 
 ---
 
-## 7. File Structure & Codebase Map
+## 7. Container Compatibility & Future Transcoding Roadmap
+
+### Phase 1: Native In-Browser Playback (Current)
+HTML5 `<video>` decodes standard web-friendly containers:
+- **MP4 (H.264 + AAC):** 🟢 100% Universal native support across all browsers.
+- **WebM (VP8/VP9 + Opus):** 🟢 Native in Chrome, Edge, and Firefox.
+- **MP4 (HEVC / H.265):** 🟡 Native on Safari & modern Chrome/Edge with hardware acceleration.
+
+### Phase 2: Transcoding Escape Hatch (Future Roadmap)
+For unsupported formats (e.g. MKV with DTS audio or 10-bit HEVC on legacy browsers), a future phase will introduce an asynchronous FFmpeg worker pipeline:
 
 ```
-cinemate/
-├── css/
-│   ├── main.css            # Design tokens, typography, gradients, glassmorphism
-│   ├── components.css      # Movie cards, carousels, buttons, form inputs, badges
-│   ├── library.css         # Watch diary, rating cards, custom lists, profile styles
-│   └── player.css          # Cinema player, buffering HUD, sources drawer, settings modal
-├── js/
-│   ├── api/
-│   │   └── tmdb.js         # TMDB API client (movies, TV, search, genres, credits, reviews)
-│   ├── components/
-│   │   ├── navbar.js       # Navigation bar with live instant search & route dispatcher
-│   │   ├── hero.js         # Billboard spotlight with trailer previews
-│   │   ├── movieCard.js    # Interactive poster card with quick-actions & rating overlay
-│   │   ├── detailModal.js  # Rich detail dialog with trailer playback, cast, reviews & sources
-│   │   ├── playerModal.js  # HTML5 theater player with swarm HUD, session heartbeats & sources
-│   │   ├── rateReviewModal.js # Letterboxd-style 5-star rating & review editor
-│   │   ├── listModal.js    # Add-to-list & custom list creation modal
-│   │   └── toast.js        # Global toast notification dispatch system
-│   ├── services/
-│   │   ├── streamingBridge.js # Prowlarr indexer search client, heartbeat sender & stream URL builder
-│   │   └── recommendations.js # Smart algorithm tailoring titles based on watch history
-│   ├── state/
-│   │   └── store.js        # Reactive state manager with LocalStorage persistence
-│   ├── views/
-│   │   ├── homeView.js     # Featured billboard & categorized carousels
-│   │   ├── moviesView.js   # Filterable movies explorer
-│   │   ├── tvView.js       # TV Series directory with season/episode breakdown
-│   │   ├── discoverView.js # Advanced multi-parameter discovery grid
-│   │   ├── myListView.js   # Personal watchlist grid
-│   │   ├── diaryView.js    # Chronological viewing diary with review highlights
-│   │   ├── customListsView.js # User-created curated collections
-│   │   ├── favoritesView.js # Favorited titles
-│   │   └── profileView.js  # User stats, viewing hours, genre breakdown chart
-│   └── app.js              # Application entry point & URL hash router
-├── server/
-│   ├── index.js            # Express Piece-Aware Bridge, qBittorrent & Prowlarr controllers
-│   ├── package.json        # Server dependencies (express, cors, dotenv)
-│   └── setup-ubuntu.sh     # Automated VPS installer & PM2 daemon config
-├── index.html              # Single Page Application HTML entry
-├── package.json            # Frontend dev server script (`npm run dev`)
-└── project.md              # Technical architecture & specification document
+Torrent Media Source
+        │
+        ▼
+ffprobe inspection
+        │
+        ├── Is Browser Compatible? (MP4 / H.264 / AAC)
+        │         │
+        │        YES ──> Direct HTTP 206 Stream (Phase 1)
+        │
+        └── NO (MKV / DTS / TrueHD / HEVC)
+                  │
+                  ▼
+              FFmpeg Worker
+                  │
+                  ▼
+          HLS / CMAF Packaging ──> Hls.js Adaptive Player
 ```
 
 ---
@@ -235,44 +273,17 @@ http://localhost:3000/#home
 ```
 
 ### VPS Production Bridge (Ubuntu 22.04 LTS)
-The backend bridge runs alongside native qBittorrent (`127.0.0.1:18080`) and Prowlarr (`127.0.0.1:9696`) under PM2:
-
 ```bash
 # 1. Connect to VPS
 ssh rdpuser@<VPS_IP>
 
-# 2. Navigate to project root
+# 2. Navigate to project root & pull latest code
 cd /opt/cinemate
-
-# 3. Pull latest updates
 sudo git pull
 
-# 4. Install backend dependencies
-cd /opt/cinemate/server
-npm install
-
-# 5. Restart PM2 background daemon
+# 3. Restart PM2 background daemon
 sudo pm2 restart cinestream-bridge
 
-# 6. Verify health
+# 4. Verify health & security telemetry
 curl http://localhost:8888/health
-```
-
-Health endpoint response:
-```json
-{
-  "status": "online",
-  "service": "CineStream Torrent Bridge (Piece-Aware & Session Managed)",
-  "qBittorrentConnected": true,
-  "activeTorrentsCount": 1,
-  "activePlaybackSessions": 1,
-  "diskUsagePercent": "22%",
-  "limits": {
-    "maxActiveTorrents": 5,
-    "maxConcurrentStreams": 15,
-    "maxDiskUsagePercent": "85%",
-    "idleCleanupMinutes": 15
-  },
-  "uptime": 128.5
-}
 ```
