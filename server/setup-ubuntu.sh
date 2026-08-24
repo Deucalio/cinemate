@@ -36,9 +36,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 npm install
 
-# 5. Configure Firewall (Port 8888)
-echo "🛡️ Configuring UFW firewall for port 8888..."
-ufw allow 8888/tcp || true
+# 5. Configure Firewall (Port 8899)
+echo "🛡️ Configuring UFW firewall for port 8899..."
+ufw allow 8899/tcp || true
 
 # 6. Start with PM2
 echo "🚀 Starting CineStream Streaming Bridge with PM2..."
@@ -49,7 +49,7 @@ pm2 startup systemd -u root --hp /root || true
 
 echo "=============================================================================="
 echo "🎉 SUCCESS! CineStream Streaming Server is running on your VPS!"
-echo "📡 Stream Endpoint: http://$(curl -s ifconfig.me):8888/api/stream"
-echo "🩺 Health Check:    http://$(curl -s ifconfig.me):8888/health"
+echo "📡 Stream Endpoint: http://$(curl -s ifconfig.me):8899/api/stream"
+echo "🩺 Health Check:    http://$(curl -s ifconfig.me):8899/health"
 echo "📜 View logs:       pm2 logs cinestream-bridge"
 echo "=============================================================================="

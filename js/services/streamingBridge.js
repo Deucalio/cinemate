@@ -10,7 +10,11 @@ export const streamingBridge = {
    * Get configured Streaming Bridge URL (Local or VPS)
    */
   getStreamServerUrl() {
-    return localStorage.getItem('cinestream_stream_server_url') || 'http://77.37.74.7:8888';
+    const saved = localStorage.getItem('cinestream_stream_server_url');
+    if (!saved || saved.includes(':8888')) {
+      return 'http://77.37.74.7:8899';
+    }
+    return saved;
   },
 
   setStreamServerUrl(url) {

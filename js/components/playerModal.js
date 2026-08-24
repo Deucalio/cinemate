@@ -146,7 +146,7 @@ export class PlayerModalManager {
             <div class="modal-body">
               <div class="form-group">
                 <label class="form-label" for="setting-vps-url">STREAMING BRIDGE SERVER (VPS / LOCAL)</label>
-                <input type="text" id="setting-vps-url" class="form-input" placeholder="e.g. http://192.168.1.50:8888 or http://YOUR_VPS_IP:8888" value="${streamingBridge.getStreamServerUrl()}" />
+                <input type="text" id="setting-vps-url" class="form-input" placeholder="e.g. http://192.168.1.50:8899 or http://YOUR_VPS_IP:8899" value="${streamingBridge.getStreamServerUrl()}" />
                 <span class="text-muted text-sm mt-1">The Node.js streaming server (running on your Ubuntu VPS or local machine).</span>
               </div>
 

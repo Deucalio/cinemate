@@ -21,10 +21,10 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 8888;
+const PORT = process.env.PORT || 8899;
 
 // Security & Admin Credentials
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'cinestream_secure_admin_token_8888';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'cinestream_secure_admin_token_8899';
 
 // qBittorrent & Prowlarr Configurations (Optional Companion)
 const QBT_URL = process.env.QBT_URL || 'http://127.0.0.1:18080';
