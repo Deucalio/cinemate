@@ -758,6 +758,7 @@ app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => 
     await prioritizeByteRange(matchedHash, start, end, pieceSize, 0, 4000);
 
     // 7. Direct HTTP 206 Partial Content Streaming
+    const ext = path.extname(targetFilePath).toLowerCase();
     const chunkSize = (end - start) + 1;
     const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
 
