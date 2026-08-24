@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CineStream Pro — Next-Gen Cinema Streaming & Letterboxd Library</title>
+  <meta name="description" content="Experience high-definition streaming discovery combined with personal movie diary, half-star ratings, custom playlists, and Letterboxd-style tracking powered by TMDB." />
+  
+  <!-- Favicon -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>">
+
+  <!-- Google Fonts: Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+  <!-- Stylesheets -->
+  <link rel="stylesheet" href="css/main.css" />
+  <link rel="stylesheet" href="css/components.css" />
+  <link rel="stylesheet" href="css/library.css" />
+  <link rel="stylesheet" href="css/player.css" />
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Navigation Header -->
+    <header class="main-header" id="main-header"></header>
+
+    <!-- Main Dynamic View Container -->
+    <main class="app-view-container" id="app-view-container">
+      <div class="catalog-loading" style="padding: 100px; text-align: center;">
+        <div class="spinner"></div>
+        <p style="margin-top: 16px; color: var(--text-secondary);">Initializing CineStream Pro...</p>
+      </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer" style="background: var(--bg-surface); border-top: 1px solid var(--border-subtle); padding: 48px 32px 32px; margin-top: auto;">
+      <div style="max-width: var(--content-max-width); margin: 0 auto; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 32px;">
+        <div>
+          <div style="display: flex; align-items: center; gap: 8px; font-size: 1.25rem; font-weight: 900; margin-bottom: 12px;">
+            <span>🎬</span>
+            <span>CINE<span style="color: var(--accent-primary);">STREAM</span></span>
+            <span style="font-size: 0.65rem; background: var(--accent-primary); color: #fff; padding: 2px 6px; border-radius: 4px;">PRO</span>
+          </div>
+          <p style="color: var(--text-secondary); font-size: 0.9rem; max-width: 380px; line-height: 1.5;">
+            The ultimate hybrid cinema platform marrying Netflix-grade streaming discovery with Letterboxd personal library tracking, half-star reviews, and custom playlists.
+          </p>
+        </div>
+
+        <div style="display: flex; gap: 48px; flex-wrap: wrap;">
+          <div>
+            <h4 style="font-size: 0.85rem; font-weight: 800; letter-spacing: 0.5px; color: var(--text-primary); margin-bottom: 12px;">EXPLORE</h4>
+            <ul style="list-style: none; display: flex; flex-direction: column; gap: 8px; font-size: 0.88rem; color: var(--text-secondary);">
+              <li><a href="#home">Home</a></li>
+              <li><a href="#movies">Movies</a></li>
+              <li><a href="#tv">TV Series</a></li>
+              <li><a href="#discover">Discover & Filter</a></li>
+            </ul>
+          </div>
+
+          <div>
+            <h4 style="font-size: 0.85rem; font-weight: 800; letter-spacing: 0.5px; color: var(--accent-letterboxd); margin-bottom: 12px;">YOUR LIBRARY</h4>
+            <ul style="list-style: none; display: flex; flex-direction: column; gap: 8px; font-size: 0.88rem; color: var(--text-secondary);">
+              <li><a href="#library">My Library</a></li>
+              <li><a href="#watchlist">Watchlist</a></li>
+              <li><a href="#diary">Watched Diary</a></li>
+              <li><a href="#lists">Custom Collections</a></li>
+              <li><a href="#favorites">Favorites</a></li>
+              <li><a href="#profile">Profile & Stats</a></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div style="max-width: var(--content-max-width); margin: 32px auto 0; padding-top: 24px; border-top: 1px solid var(--border-subtle); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; font-size: 0.8rem; color: var(--text-muted);">
+        <p>© 2026 CineStream Pro. Film data & artwork powered by <strong style="color: var(--text-primary);">TMDB</strong>.</p>
+        <p>Built for cinema enthusiasts & curators.</p>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- JavaScript Module Bootstrap -->
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

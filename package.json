@@ -1,0 +1,14 @@
+{
+  "name": "cinestream-pro",
+  "version": "1.0.0",
+  "description": "Next-Gen Cinema Streaming & Letterboxd Personal Library Platform",
+  "type": "module",
+  "scripts": {
+    "dev": "npx -y serve . -l 3000",
+    "start": "npx -y serve . -l 3000",
+    "serve": "python -m http.server 3000"
+  },
+  "keywords": ["netflix", "letterboxd", "tmdb", "streaming", "cinema", "diary"],
+  "author": "Antigravity",
+  "license": "MIT"
+}

@@ -1,0 +1,885 @@
+/* ==========================================================================
+   CINESTREAM PRO — LETTERBOXD & PERSONAL LIBRARY STYLES
+   ========================================================================== */
+
+/* ------------------- 1. LIBRARY DASHBOARD ------------------- */
+.library-dashboard-container {
+  max-width: var(--content-max-width);
+  width: 100%;
+  margin: 0 auto;
+  padding: 32px 32px 80px;
+}
+
+.library-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 28px;
+}
+
+.library-eyebrow {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 800;
+  letter-spacing: 1px;
+  color: var(--accent-letterboxd);
+  margin-bottom: 4px;
+}
+
+.library-title {
+  font-size: 2.2rem;
+  font-weight: 900;
+}
+
+.library-header-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.library-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px;
+  margin-bottom: 36px;
+}
+
+.stat-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-md);
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  transition: all var(--trans-fast);
+}
+
+.stat-card:hover {
+  background: var(--bg-surface-raised);
+  border-color: var(--border-active);
+  transform: translateY(-2px);
+}
+
+.stat-icon {
+  font-size: 1.8rem;
+}
+
+.stat-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.stat-value {
+  font-size: 1.4rem;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.stat-label {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+.library-section {
+  margin-bottom: 40px;
+}
+
+.view-all-link {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--accent-blue);
+  transition: color var(--trans-fast);
+}
+
+.view-all-link:hover {
+  text-decoration: underline;
+}
+
+/* ------------------- 2. CUSTOM LISTS COLLAGE & GRIDS ------------------- */
+.custom-lists-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 20px;
+}
+
+.custom-lists-grid-large {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 24px;
+}
+
+.custom-list-card, .custom-list-card-large {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: all var(--trans-normal);
+}
+
+.custom-list-card:hover, .custom-list-card-large:hover {
+  background: var(--bg-surface-raised);
+  border-color: var(--border-active);
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-md);
+}
+
+/* Dynamic 2x2 Collage Cover */
+.list-card-collage-wrap, .list-collage-container {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  background: var(--bg-surface-raised);
+  overflow: hidden;
+}
+
+.list-collage-grid {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 2px;
+  background: #000;
+}
+
+.collage-cell {
+  background-size: cover;
+  background-position: center;
+  width: 100%;
+  height: 100%;
+}
+
+.list-collage-single {
+  width: 100%;
+  height: 100%;
+  background-size: cover;
+  background-position: center;
+}
+
+.list-collage-empty {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  gap: 8px;
+}
+
+.collage-empty-icon {
+  font-size: 2rem;
+}
+
+.list-visibility-tag, .list-visibility-pill {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  font-size: 0.7rem;
+  font-weight: 800;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(4px);
+  letter-spacing: 0.5px;
+}
+
+.list-visibility-pill.public { color: var(--accent-letterboxd); border: 1px solid rgba(0, 224, 84, 0.4); }
+.list-visibility-pill.unlisted { color: var(--accent-gold); }
+.list-visibility-pill.private { color: var(--text-muted); }
+
+.list-card-info, .list-card-content {
+  padding: 16px 18px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.list-card-title, .list-card-name {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin-bottom: 4px;
+  line-height: 1.25;
+}
+
+.list-card-count, .list-card-meta {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.list-card-desc {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ------------------- 3. LIST DETAIL PAGE ------------------- */
+.list-detail-page {
+  max-width: var(--content-max-width);
+  margin: 0 auto;
+  padding: 32px 32px 80px;
+}
+
+.list-detail-header {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 36px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-lg);
+  padding: 32px;
+  margin-bottom: 36px;
+}
+
+.list-detail-cover-box {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow: var(--shadow-md);
+}
+
+.list-detail-info {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.list-detail-badges {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.list-detail-title {
+  font-size: 2.2rem;
+  font-weight: 900;
+  margin-bottom: 8px;
+  line-height: 1.15;
+}
+
+.list-detail-desc {
+  font-size: 1.05rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  margin-bottom: 16px;
+}
+
+.list-detail-meta-row {
+  display: flex;
+  gap: 10px;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 24px;
+}
+
+.list-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.list-view-switcher {
+  display: flex;
+  gap: 6px;
+}
+
+.btn-toggle-view {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.btn-toggle-view.is-active {
+  background: var(--bg-surface-raised);
+  border-color: var(--accent-letterboxd);
+  color: var(--accent-letterboxd);
+}
+
+/* Ordered Movies Rows (with Position & Reordering) */
+.ordered-movies-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ordered-movie-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 18px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  transition: all var(--trans-fast);
+}
+
+.ordered-movie-row:hover {
+  background: var(--bg-surface-raised);
+  border-color: var(--border-medium);
+}
+
+.ordered-movie-pos {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 54px;
+}
+
+.pos-number {
+  font-size: 1.1rem;
+  font-weight: 900;
+  color: var(--text-muted);
+}
+
+.reorder-arrows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.btn-arrow {
+  font-size: 0.65rem;
+  padding: 1px 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  color: var(--text-secondary);
+}
+
+.btn-arrow:hover {
+  background: var(--accent-primary);
+  color: #fff;
+}
+
+.ordered-movie-thumb {
+  width: 44px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.ordered-movie-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.ordered-movie-title {
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.ordered-movie-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+
+.ordered-movie-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ------------------- 4. DIARY & WATCH HISTORY ------------------- */
+.diary-page-container {
+  max-width: var(--content-max-width);
+  margin: 0 auto;
+  padding: 32px 32px 80px;
+}
+
+.diary-summary-bar {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding: 18px 24px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-md);
+  margin-bottom: 32px;
+}
+
+.diary-summary-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.summary-num {
+  font-size: 1.5rem;
+  font-weight: 900;
+}
+
+.summary-lbl {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.diary-month-group {
+  margin-bottom: 36px;
+}
+
+.diary-month-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 2px solid var(--border-medium);
+  margin-bottom: 12px;
+}
+
+.diary-month-title {
+  font-size: 1.25rem;
+  font-weight: 800;
+  letter-spacing: 1px;
+  color: var(--text-primary);
+}
+
+.diary-month-count {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.diary-entries-table {
+  display: flex;
+  flex-direction: column;
+}
+
+.diary-table-header {
+  display: grid;
+  grid-template-columns: 80px 2.2fr 120px 80px 2fr 110px;
+  padding: 8px 16px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+}
+
+.diary-entry-row {
+  display: grid;
+  grid-template-columns: 80px 2.2fr 120px 80px 2fr 110px;
+  align-items: center;
+  padding: 12px 16px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  transition: background-color var(--trans-fast);
+}
+
+.diary-entry-row:hover {
+  background: var(--bg-surface-raised);
+}
+
+.diary-day-num {
+  font-size: 1.1rem;
+  font-weight: 800;
+  display: block;
+}
+
+.diary-day-name {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.col-film {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.diary-film-poster {
+  width: 36px;
+  height: 52px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.diary-film-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.diary-film-year {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.diary-rating-stars {
+  font-size: 1rem;
+  letter-spacing: 1px;
+}
+
+.diary-review-text {
+  font-size: 0.85rem;
+  font-style: italic;
+  color: #CBD5E1;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.col-actions {
+  display: flex;
+  gap: 4px;
+}
+
+/* Compact diary rows in library */
+.diary-compact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.diary-row-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 18px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.diary-item-thumb {
+  width: 44px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.diary-item-details {
+  flex: 1;
+}
+
+.diary-item-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.diary-item-rating-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.diary-item-review-snippet {
+  font-size: 0.85rem;
+  font-style: italic;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* ------------------- 5. PROFILE & RATING HISTOGRAM ------------------- */
+.profile-page-container {
+  max-width: var(--content-max-width);
+  margin: 0 auto;
+  padding: 32px 32px 80px;
+}
+
+.profile-header-card {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-lg);
+  padding: 32px;
+  margin-bottom: 36px;
+}
+
+.profile-large-avatar {
+  width: 110px;
+  height: 110px;
+  border-radius: var(--radius-full);
+  object-fit: cover;
+  border: 3px solid var(--accent-letterboxd);
+  box-shadow: var(--shadow-glow-green);
+}
+
+.profile-details {
+  flex: 1;
+}
+
+.profile-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.profile-name {
+  font-size: 1.8rem;
+  font-weight: 900;
+}
+
+.profile-username {
+  font-size: 1rem;
+  color: var(--text-muted);
+}
+
+.profile-bio-text {
+  font-size: 1rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin-bottom: 14px;
+  max-width: 600px;
+}
+
+.profile-meta-badges {
+  display: flex;
+  gap: 8px;
+}
+
+/* Favorite Four Pins */
+.profile-fav-four-section {
+  margin-bottom: 36px;
+}
+
+.fav-four-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 18px;
+}
+
+.fav-four-card {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-medium);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: all var(--trans-normal);
+}
+
+.fav-four-card:hover {
+  transform: translateY(-6px);
+  border-color: var(--accent-letterboxd);
+  box-shadow: var(--shadow-glow-green);
+}
+
+.fav-four-poster {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.fav-four-overlay {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(0deg, rgba(0, 0, 0, 0.9) 0%, transparent 100%);
+  padding: 12px;
+  opacity: 0;
+  transition: opacity var(--trans-fast);
+}
+
+.fav-four-card:hover .fav-four-overlay {
+  opacity: 1;
+}
+
+.fav-four-title {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.fav-four-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--border-medium);
+  color: var(--text-muted);
+  gap: 6px;
+}
+
+.empty-plus { font-size: 2rem; }
+.empty-label { font-size: 0.8rem; font-weight: 600; }
+
+/* Profile Stats & Histogram Grid */
+.profile-stats-dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 24px;
+  margin-bottom: 36px;
+}
+
+.profile-stats-col, .profile-histogram-col {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+}
+
+.subsection-heading {
+  font-size: 1.15rem;
+  font-weight: 800;
+  margin-bottom: 18px;
+}
+
+.stat-boxes-container {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.stat-box-item {
+  background: var(--bg-surface-raised);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  text-align: center;
+}
+
+.stat-box-num {
+  font-size: 1.4rem;
+  font-weight: 900;
+  display: block;
+}
+
+.stat-box-lbl {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+/* Rating Histogram (Letterboxd Style) */
+.rating-histogram-chart {
+  display: flex;
+  align-items: flex-end;
+  height: 160px;
+  gap: 8px;
+  padding-top: 20px;
+}
+
+.histogram-bar-group {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+}
+
+.histogram-bar-track {
+  width: 100%;
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 3px 3px 0 0;
+}
+
+.histogram-bar-fill {
+  width: 100%;
+  background: var(--accent-letterboxd);
+  border-radius: 3px 3px 0 0;
+  position: relative;
+  transition: height var(--trans-normal);
+}
+
+.histogram-count-val {
+  position: absolute;
+  top: -16px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.68rem;
+  color: #fff;
+  font-weight: 700;
+}
+
+.histogram-bar-label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+/* Profile Reviews */
+.profile-reviews-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.profile-review-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-md);
+  padding: 16px;
+}
+
+.review-card-top {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.profile-review-thumb {
+  width: 36px;
+  height: 52px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.profile-review-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.profile-review-stars {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+
+.review-date-muted {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.profile-review-body {
+  font-size: 0.9rem;
+  color: #CBD5E1;
+  line-height: 1.5;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+  .list-detail-header { grid-template-columns: 1fr; }
+  .list-detail-cover-box { max-width: 240px; margin: 0 auto; }
+  .profile-stats-dashboard-grid { grid-template-columns: 1fr; }
+  .fav-four-grid { grid-template-columns: repeat(2, 1fr); }
+  .diary-table-header, .diary-entry-row {
+    grid-template-columns: 60px 1.5fr 100px 70px;
+  }
+  .diary-table-header .col-review, .diary-entry-row .col-review { display: none; }
+}
+
+@media (max-width: 600px) {
+  .profile-header-card { flex-direction: column; text-align: center; }
+  .profile-title-row { justify-content: center; }
+  .stat-boxes-container { grid-template-columns: repeat(2, 1fr); }
+}
