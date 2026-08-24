@@ -121,185 +121,6 @@ function checkRateLimit(type = 'search', limit = 30, windowMs = 60000) {
   };
 }
 
-// ----------------- QBITTORRENT API CLIENT -----------------
-
-class QBittorrentClient {
-  constructor(baseUrl, username, password) {
-    this.baseUrl = baseUrl.replace(/\/$/, '');
-    this.username = username;
-    this.password = password;
-    this.cookie = null;
-  }
-
-  async login() {
-    try {
-      const params = new URLSearchParams();
-      params.append('username', this.username);
-      params.append('password', this.password);
-
-      const res = await fetch(`${this.baseUrl}/api/v2/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: params.toString()
-      });
-
-      const setCookie = res.headers.get('set-cookie');
-      if (setCookie) {
-        this.cookie = setCookie.split(';')[0];
-        return true;
-      }
-      return false;
-    } catch (err) {
-      console.warn(`[qBittorrent] Login warning:`, err.message);
-      return false;
-    }
-  }
-
-  async fetchWithAuth(url, options = {}) {
-    if (!this.cookie) {
-      await this.login();
-    }
-
-    const headers = options.headers || {};
-    if (this.cookie) {
-      headers['Cookie'] = this.cookie;
-    }
-
-    let res = await fetch(url, { ...options, headers });
-    if (res.status === 403 || res.status === 401) {
-      await this.login();
-      if (this.cookie) headers['Cookie'] = this.cookie;
-      res = await fetch(url, { ...options, headers });
-    }
-    return res;
-  }
-
-  extractInfoHash(magnet) {
-    if (!magnet) return null;
-    const match = magnet.match(/urn:btih:([a-zA-Z0-9]+)/i);
-    return match ? match[1].toLowerCase() : null;
-  }
-
-  async addTorrent(magnet) {
-    await this.login();
-
-    const formData = new URLSearchParams();
-    formData.append('urls', magnet);
-    formData.append('sequentialDownload', 'true');
-    formData.append('firstLastPiecePrio', 'true');
-
-    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/add`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formData.toString()
-    });
-
-    return res.ok;
-  }
-
-  async getAllTorrents() {
-    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/info`);
-    if (!res.ok) return [];
-    return await res.json();
-  }
-
-  async getTransferInfo() {
-    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/transfer/info`);
-    if (!res.ok) return null;
-    return await res.json();
-  }
-
-  async getPieceStates(hash) {
-    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/pieceStates?hash=${hash}`);
-    if (!res.ok) return [];
-    return await res.json();
-  }
-
-  async setPiecePriority(hash, pieceIndices, priority = 7) {
-    if (!pieceIndices || pieceIndices.length === 0) return;
-    const params = new URLSearchParams();
-    params.append('hash', hash);
-    params.append('pieces', pieceIndices.join('|'));
-    params.append('priority', priority.toString());
-
-    await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/piecePriority?${params.toString()}`);
-  }
-
-  async pauseTorrents(hashes) {
-    if (!hashes || hashes.length === 0) return;
-    const formData = new URLSearchParams();
-    formData.append('hashes', Array.isArray(hashes) ? hashes.join('|') : hashes);
-    await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/pause`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formData.toString()
-    });
-  }
-
-  async resumeTorrents(hashes) {
-    if (!hashes || hashes.length === 0) return;
-    const formData = new URLSearchParams();
-    formData.append('hashes', Array.isArray(hashes) ? hashes.join('|') : hashes);
-    await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/resume`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formData.toString()
-    });
-  }
-
-  async deleteTorrent(hash, deleteFiles = true) {
-    const formData = new URLSearchParams();
-    formData.append('hashes', hash);
-    formData.append('deleteFiles', deleteFiles ? 'true' : 'false');
-    const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/delete`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: formData.toString()
-    });
-    return res.ok;
-  }
-
-  async findTorrent(infoHash, nameHint = '', magnet = '') {
-    const list = await this.getAllTorrents();
-    if (!Array.isArray(list) || list.length === 0) return null;
-
-    if (infoHash) {
-      const match = list.find(t =>
-        t.hash.toLowerCase() === infoHash.toLowerCase() ||
-        (t.magnet_uri && t.magnet_uri.toLowerCase().includes(infoHash.toLowerCase()))
-      );
-      if (match) return match;
-    }
-
-    const dnMatch = magnet ? magnet.match(/[?&]dn=([^&]+)/i) : null;
-    const dnName = dnMatch ? decodeURIComponent(dnMatch[1]).toLowerCase() : '';
-    const searchTarget = (nameHint || dnName).toLowerCase();
-
-    if (searchTarget) {
-      const keywords = searchTarget.split(/[\s.\-_]+/).filter(w => w.length > 2);
-      let bestMatch = null;
-      let maxScore = 0;
-
-      for (const t of list) {
-        const tName = (t.name || '').toLowerCase();
-        let score = 0;
-        for (const kw of keywords) {
-          if (tName.includes(kw)) score++;
-        }
-        if (score > maxScore && score >= 2) {
-          maxScore = score;
-          bestMatch = t;
-        }
-      }
-      if (bestMatch) return bestMatch;
-    }
-
-    return null;
-  }
-}
-
-const qbt = new QBittorrentClient(QBT_URL, QBT_USER, QBT_PASS);
-
 // ----------------- DEFENSIVE MEDIA FILE DISCOVERY & PATH SANITIZATION -----------------
 
 const ALLOWED_MEDIA_EXTS = new Set(['.mp4', '.mkv', '.webm', '.m4v', '.avi']);
@@ -307,172 +128,46 @@ const FORBIDDEN_EXTS = new Set(['.exe', '.bat', '.scr', '.vbs', '.cmd', '.ps1', 
 const MIN_MEDIA_FILE_BYTES = 5 * 1024 * 1024; // 5 MB minimum to ignore junk / samples
 
 /**
- * Safely resolves and selects the valid media file candidate with path traversal protection
+ * Get disk usage statistics
  */
-function findSafeMediaFileCandidate(targetPath, baseAllowedDir = null) {
-  if (!targetPath) return null;
-
-  const resolvedTarget = path.resolve(targetPath);
-
-  // Path traversal check
-  if (baseAllowedDir) {
-    const resolvedBase = path.resolve(baseAllowedDir);
-    if (!resolvedTarget.startsWith(resolvedBase)) {
-      console.warn(`[Security Alert] Blocked potential path traversal attempt: ${targetPath}`);
-      return null;
-    }
-  }
-
-  if (!fs.existsSync(resolvedTarget)) return null;
-
+function getDiskUsageStats(targetDir = '/tmp/cinestream-media') {
   try {
-    const stat = fs.statSync(resolvedTarget);
-    if (!stat.isDirectory()) {
-      const ext = path.extname(resolvedTarget).toLowerCase();
-      if (FORBIDDEN_EXTS.has(ext)) return null;
-      return ALLOWED_MEDIA_EXTS.has(ext) && stat.size >= MIN_MEDIA_FILE_BYTES ? resolvedTarget : null;
-    }
-
-    let largestMediaFile = null;
-    let maxBytes = 0;
-
-    function scanDir(currentDir) {
-      const entries = fs.readdirSync(currentDir);
-      for (const entry of entries) {
-        // Prevent path traversal within subdirectories
-        const fullPath = path.resolve(currentDir, entry);
-        if (!fullPath.startsWith(resolvedTarget)) continue;
-
-        try {
-          const s = fs.statSync(fullPath);
-          if (s.isDirectory()) {
-            scanDir(fullPath);
-          } else {
-            const ext = path.extname(entry).toLowerCase();
-            const lowerName = entry.toLowerCase();
-
-            // Ignore executable / dangerous files
-            if (FORBIDDEN_EXTS.has(ext)) continue;
-
-            // Ignore tiny sample clips or featurettes if main movie exists
-            const isSample = lowerName.includes('sample') || lowerName.includes('trailer') || lowerName.includes('featurette');
-
-            if (ALLOWED_MEDIA_EXTS.has(ext) && s.size >= MIN_MEDIA_FILE_BYTES) {
-              // Favor full movie files over samples
-              if (!isSample && s.size > maxBytes) {
-                maxBytes = s.size;
-                largestMediaFile = fullPath;
-              } else if (isSample && !largestMediaFile) {
-                largestMediaFile = fullPath;
-              }
-            }
-          }
-        } catch {}
-      }
-    }
-
-    scanDir(resolvedTarget);
-    return largestMediaFile;
-  } catch {
-    return null;
-  }
-}
-
-// ----------------- PIECE AVAILABILITY VERIFIER & WAITER -----------------
-
-/**
- * Maps requested byte range to torrent piece IDs and waits until available
- */
-async function waitForByteRangeAvailability(hash, startByte, endByte, pieceSize, firstPieceIndex = 0, maxWaitMs = 10000) {
-  if (!pieceSize || pieceSize <= 0) return true;
-
-  const startPiece = firstPieceIndex + Math.floor(startByte / pieceSize);
-  const endPiece = firstPieceIndex + Math.floor(endByte / pieceSize);
-
-  // Lookahead buffer (prioritize requested + 6 consecutive pieces)
-  const lookaheadPieces = [];
-  for (let p = startPiece; p <= endPiece + 6; p++) {
-    lookaheadPieces.push(p);
-  }
-
-  // 1. Immediately request maximal priority (7) for required pieces
-  await qbt.setPiecePriority(hash, lookaheadPieces, 7).catch(() => {});
-
-  // 2. Poll piece states until target startPiece is downloaded (state == 2)
-  const startTime = Date.now();
-  while (Date.now() - startTime < maxWaitMs) {
-    const states = await qbt.getPieceStates(hash);
-    if (!states || states.length === 0) return true;
-
-    const isStartPieceReady = states[startPiece] === 2;
-    if (isStartPieceReady) {
-      return true;
-    }
-
-    await new Promise(r => setTimeout(r, 250));
-  }
-
-  return false;
-}
-
-// ----------------- DISK QUOTA & HOST TELEMETRY -----------------
-
-function getDiskUsageStats(targetDir = '/') {
-  try {
-    if (fs.statfsSync) {
-      const stats = fs.statfsSync(targetDir);
-      const total = stats.blocks * stats.bsize;
-      const free = stats.bfree * stats.bsize;
-      const usedPct = Math.round(((total - free) / total) * 100);
+    const stats = fs.statfsSync ? fs.statfsSync(targetDir) : null;
+    if (stats) {
+      const totalBytes = stats.blocks * stats.bsize;
+      const freeBytes = stats.bfree * stats.bsize;
+      const usedBytes = totalBytes - freeBytes;
+      const usedPct = Math.round((usedBytes / totalBytes) * 100);
       return {
         usedPct,
-        totalGb: (total / (1024 * 1024 * 1024)).toFixed(1),
-        freeGb: (free / (1024 * 1024 * 1024)).toFixed(1)
+        freeGb: (freeBytes / (1024 * 1024 * 1024)).toFixed(1),
+        totalGb: (totalBytes / (1024 * 1024 * 1024)).toFixed(1)
       };
     }
   } catch {}
-  return { usedPct: 30, totalGb: '100.0', freeGb: '70.0' };
+
+  return { usedPct: 35, freeGb: '50.0', totalGb: '100.0' };
 }
 
-// ----------------- AUTOMATED 15-MINUTE GARBAGE COLLECTOR -----------------
+// ----------------- AUTOMATIC GARBAGE COLLECTION (15m Idle TTL) -----------------
 
 setInterval(async () => {
   try {
     const now = Date.now();
     const diskStats = getDiskUsageStats();
 
-    // 1. Prune expired heartbeat sessions
-    for (const [sessId, session] of playbackSessions.entries()) {
-      if (now - session.lastSeen > HEARTBEAT_TIMEOUT_MS) {
-        playbackSessions.delete(sessId);
-      }
-    }
+    for (const torrent of wtClient.torrents) {
+      const hash = (torrent.infoHash || '').toLowerCase();
+      const entry = torrentRegistry.get(hash);
 
-    const isLogged = await qbt.login();
-    if (!isLogged) return;
-
-    const allTorrents = await qbt.getAllTorrents();
-    if (!Array.isArray(allTorrents) || allTorrents.length === 0) return;
-
-    for (const t of allTorrents) {
-      const hash = t.hash.toLowerCase();
-      
-      let activeSessionsCount = 0;
-      for (const s of playbackSessions.values()) {
-        if (s.infoHash.toLowerCase() === hash) activeSessionsCount++;
-      }
-
-      const entry = torrentRegistry.get(hash) || { refCount: 0, lastActive: now };
-      const isStreaming = entry.refCount > 0 || activeSessionsCount > 0;
-
-      if (!isStreaming) {
-        const isIdleExpired = (now - entry.lastActive) >= IDLE_TTL_MS;
+      if (entry) {
+        const isIdleExpired = (now - entry.lastActive) > IDLE_TTL_MS;
         const isEmergencyDiskPressure = diskStats.usedPct >= 88;
 
         if (isIdleExpired || isEmergencyDiskPressure) {
           if (entry.refCount === 0) {
-            console.log(`[🧹 Auto-GC] Safely deleting idle torrent & files: "${t.name}" (Reason: ${isEmergencyDiskPressure ? 'Disk Pressure' : '15m Idle'})`);
-            await qbt.deleteTorrent(t.hash, true);
+            console.log(`[🧹 Auto-GC] Safely destroying idle torrent: "${torrent.name}" (Reason: ${isEmergencyDiskPressure ? 'Disk Pressure' : '15m Idle'})`);
+            torrent.destroy({ destroyStore: true });
             torrentRegistry.delete(hash);
           }
         }
@@ -489,33 +184,19 @@ setInterval(async () => {
  * Health & Host Telemetry Monitor
  */
 app.get('/health', async (req, res) => {
-  let qbtStatus = false;
-  let torrentsCount = 0;
-  let transferStats = null;
-
-  try {
-    qbtStatus = await qbt.login();
-    if (qbtStatus) {
-      const list = await qbt.getAllTorrents();
-      torrentsCount = list.length;
-      transferStats = await qbt.getTransferInfo();
-    }
-  } catch {}
-
   const diskStats = getDiskUsageStats();
   const totalMem = (os.totalmem() / (1024 * 1024)).toFixed(0);
   const freeMem = (os.freemem() / (1024 * 1024)).toFixed(0);
 
   res.json({
     status: 'online',
-    service: 'CineStream Torrent Bridge (Protected & Piece-Aware)',
+    service: 'CineStream Native Streaming Bridge (WebTorrent + Prisma)',
     security: {
       rateLimitingActive: true,
       pathTraversalGuards: true,
       adminAuthEnabled: true
     },
-    qBittorrentConnected: qbtStatus,
-    activeTorrentsCount: torrentsCount,
+    activeTorrentsCount: wtClient.torrents.length,
     activePlaybackSessions: playbackSessions.size,
     hostTelemetry: {
       loadAverage: os.loadavg(),
@@ -523,8 +204,8 @@ app.get('/health', async (req, res) => {
       ramFreeMb: Number(freeMem),
       diskUsagePercent: `${diskStats.usedPct}%`,
       diskFreeGb: `${diskStats.freeGb} GB`,
-      dlSpeed: transferStats ? `${(transferStats.dl_info_speed / (1024 * 1024)).toFixed(2)} MB/s` : '0 MB/s',
-      upSpeed: transferStats ? `${(transferStats.up_info_speed / (1024 * 1024)).toFixed(2)} MB/s` : '0 MB/s'
+      dlSpeed: `${(wtClient.downloadSpeed / (1024 * 1024)).toFixed(2)} MB/s`,
+      upSpeed: `${(wtClient.uploadSpeed / (1024 * 1024)).toFixed(2)} MB/s`
     },
     limits: {
       maxActiveTorrents: MAX_ACTIVE_TORRENTS,
@@ -575,8 +256,11 @@ app.post('/api/stream/session/leave', async (req, res) => {
     const reg = torrentRegistry.get(hash);
     if (reg) reg.refCount = Math.max(0, reg.refCount - 1);
 
-    await qbt.pauseTorrents([hash]).catch(() => {});
-    console.log(`[Bandwidth Saver] Viewer left session: ${sessionId}. Paused torrent: ${hash}`);
+    const torrent = wtClient.get(hash);
+    if (torrent) {
+      torrent.deselect(0, torrent.pieces.length - 1, false);
+      console.log(`[Bandwidth Saver] Viewer left session: ${sessionId}. Deselected pieces for: ${hash}`);
+    }
   }
   res.json({ status: 'left' });
 });
@@ -618,7 +302,16 @@ app.get('/api/search', checkRateLimit('search', 30, 60000), async (req, res) => 
  */
 app.get('/api/status', async (req, res) => {
   try {
-    const list = await qbt.getAllTorrents();
+    const list = wtClient.torrents.map(t => ({
+      hash: t.infoHash,
+      name: t.name,
+      progress: t.progress,
+      downloadSpeed: t.downloadSpeed,
+      uploadSpeed: t.uploadSpeed,
+      numPeers: t.numPeers,
+      downloaded: t.downloaded,
+      length: t.length
+    }));
     res.json(list);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -637,15 +330,12 @@ app.post('/api/cleanup', async (req, res) => {
   }
 
   try {
-    await qbt.login();
-    const list = await qbt.getAllTorrents();
     let cleaned = 0;
-
-    for (const t of list) {
-      const hash = t.hash.toLowerCase();
+    for (const torrent of wtClient.torrents) {
+      const hash = (torrent.infoHash || '').toLowerCase();
       const entry = torrentRegistry.get(hash);
       if (!entry || entry.refCount === 0) {
-        await qbt.deleteTorrent(t.hash, true);
+        torrent.destroy({ destroyStore: true });
         torrentRegistry.delete(hash);
         cleaned++;
       }
