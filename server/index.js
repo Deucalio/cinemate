@@ -18,11 +18,23 @@ import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
 import dotenv from 'dotenv';
+import WebTorrent from 'webtorrent';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 8888;
+
+// WebTorrent On-Demand Swarm Streamer
+const wtClient = new WebTorrent({
+  maxConns: 60,
+  dht: true,
+  tracker: true
+});
+
+wtClient.on('error', (err) => {
+  console.warn('[WebTorrent Engine Warning]:', err.message);
+});
 
 // Security & Admin Credentials
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'cinestream_secure_admin_token_8888';
@@ -646,9 +658,9 @@ app.post('/api/cleanup', async (req, res) => {
 });
 
 /**
- * Piece-Aware Streaming Endpoint (Rate Limited & Path Protected)
+ * Piece-Aware On-Demand Streaming Endpoint (Instant Playback & Full Range Seeking)
  */
-app.get('/api/stream', checkRateLimit('stream', 10, 60000), async (req, res) => {
+app.get('/api/stream', checkRateLimit('stream', 15, 60000), async (req, res) => {
   const magnet = req.query.magnet || req.query.link;
   const nameHint = req.query.title || '';
   const sessionId = req.headers['x-session-id'] || req.query.sessionId || `sess_${Date.now()}`;
@@ -663,54 +675,70 @@ app.get('/api/stream', checkRateLimit('stream', 10, 60000), async (req, res) => 
     return res.status(507).send(`VPS Disk Usage is at ${diskStats.usedPct}%. New streams temporarily throttled.`);
   }
 
-  const infoHash = qbt.extractInfoHash(magnet);
-
   try {
-    // 2. Add to qBittorrent
-    await qbt.addTorrent(magnet);
+    // 2. Get or add torrent to WebTorrent on-demand engine
+    let torrent = wtClient.get(magnet);
 
-    // 3. Poll for torrent metadata & verified safe media candidate
-    let torrentInfo = null;
-    let targetFilePath = null;
+    if (!torrent) {
+      torrent = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Swarm metadata resolution timeout (30s). Please try another release with more seeds.'));
+        }, 30000);
 
-    for (let i = 0; i < 20; i++) {
-      torrentInfo = await qbt.findTorrent(infoHash, nameHint, magnet);
-      if (torrentInfo) {
-        if (torrentInfo.content_path) {
-          targetFilePath = findSafeMediaFileCandidate(torrentInfo.content_path);
+        try {
+          wtClient.add(magnet, {
+            path: '/tmp/cinestream-media',
+            destroyStoreOnDestroy: true
+          }, (t) => {
+            clearTimeout(timeout);
+            resolve(t);
+          });
+        } catch (e) {
+          clearTimeout(timeout);
+          const existing = wtClient.get(magnet);
+          if (existing) resolve(existing);
+          else reject(e);
         }
-        if (!targetFilePath && torrentInfo.save_path && torrentInfo.name) {
-          targetFilePath = findSafeMediaFileCandidate(path.join(torrentInfo.save_path, torrentInfo.name));
-        }
-
-        if (targetFilePath && fs.existsSync(targetFilePath) && fs.statSync(targetFilePath).size >= MIN_MEDIA_FILE_BYTES) {
-          break;
-        }
-      }
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    if (!targetFilePath || !fs.existsSync(targetFilePath)) {
-      return res.status(503).send('Buffering metadata from BitTorrent swarm... Please wait a few seconds and retry.');
-    }
-
-    const matchedHash = (torrentInfo ? torrentInfo.hash : (infoHash || 'unknown')).toLowerCase();
-    const torrentName = torrentInfo ? torrentInfo.name : (nameHint || 'Media Stream');
-
-    // 4. Update Torrent Registry & Playback Session
-    if (!torrentRegistry.has(matchedHash)) {
-      torrentRegistry.set(matchedHash, {
-        hash: matchedHash,
-        name: torrentName,
-        refCount: 0,
-        lastActive: Date.now()
       });
     }
 
-    const regEntry = torrentRegistry.get(matchedHash);
-    regEntry.refCount++;
-    regEntry.lastActive = Date.now();
+    // 3. Find primary media file candidate
+    let file = null;
+    if (torrent.files && torrent.files.length > 0) {
+      file = torrent.files.find(f => ALLOWED_MEDIA_EXTS.has(path.extname(f.name).toLowerCase()) && f.length >= MIN_MEDIA_FILE_BYTES)
+        || torrent.files.reduce((a, b) => a.length > b.length ? a : b);
+    }
 
+    if (!file) {
+      return res.status(404).send('No valid video file found in torrent swarm.');
+    }
+
+    // 4. Calculate HTTP 206 Partial Content Range
+    const total = file.length;
+    const range = req.headers.range;
+
+    let start = 0;
+    let end = total - 1;
+
+    if (range) {
+      const parts = range.replace(/bytes=/, '').split('-');
+      start = parseInt(parts[0], 10);
+      end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+    }
+
+    // Cap open-ended range requests to 16 MB chunks for responsive seeking and fast buffering
+    const maxChunkSize = 16 * 1024 * 1024;
+    if (end - start + 1 > maxChunkSize) {
+      end = start + maxChunkSize - 1;
+    }
+    if (end >= total) end = total - 1;
+
+    const chunkSize = (end - start) + 1;
+    const ext = path.extname(file.name).toLowerCase();
+    const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
+    const matchedHash = (torrent.infoHash || '').toLowerCase();
+
+    // 5. Update Playback Session Tracking
     playbackSessions.set(sessionId, {
       id: sessionId,
       infoHash: matchedHash,
@@ -719,115 +747,35 @@ app.get('/api/stream', checkRateLimit('stream', 10, 60000), async (req, res) => 
       ip: req.ip
     });
 
-    qbt.resumeTorrents([matchedHash]).catch(() => {});
+    // 6. Write Standard HTTP 206 Header
+    res.writeHead(range ? 206 : 200, {
+      ...(range ? { 'Content-Range': `bytes ${start}-${end}/${total}` } : {}),
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunkSize,
+      'Content-Type': contentType,
+      'Cache-Control': 'no-cache'
+    });
 
-    // 5. Calculate File & Range Parameters
-    const stat = fs.statSync(targetFilePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
+    // 7. Pipe On-Demand WebTorrent ReadStream
+    const stream = file.createReadStream({ start, end });
+    stream.pipe(res);
 
-    let start = 0;
-    let end = fileSize - 1;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      start = parseInt(parts[0], 10);
-      end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    }
-
-    // 6. Piece Availability Layer: Verify required pieces exist on disk before serving
-    const pieceSize = torrentInfo ? (torrentInfo.piece_size || 2 * 1024 * 1024) : 2 * 1024 * 1024;
-    const isPieceReady = await waitForByteRangeAvailability(matchedHash, start, end, pieceSize, 0, 10000);
-
-    if (!isPieceReady && torrentInfo && torrentInfo.progress < 0.99) {
-      regEntry.refCount = Math.max(0, regEntry.refCount - 1);
-      res.setHeader('Retry-After', '3');
-      return res.status(503).send('Buffering requested video piece range from swarm. Retrying...');
-    }
-
-    // 7. Adaptive Media Delivery (Direct HTTP 206 vs FFmpeg Remux for MKV/HEVC)
-    const chunkSize = (end - start) + 1;
-    const ext = path.extname(targetFilePath).toLowerCase();
-    const isMKV = ext === '.mkv';
-    const isHEVC = /hevc|x265|h265/i.test(targetFilePath) || /hevc|x265|h265/i.test(nameHint);
-
-    let activeChildProcess = null;
-    let fileStream = null;
-
-    if (isMKV || isHEVC) {
-      console.log(`[Stream Transmux] Non-native container/codec detected (${ext}, HEVC: ${isHEVC}). Streaming via FFmpeg fMP4 remux.`);
-      
-      res.writeHead(200, {
-        'Content-Type': 'video/mp4',
-        'Accept-Ranges': 'none',
-        'Cache-Control': 'no-cache',
-        'X-Piece-Available': isPieceReady ? '1' : '0'
-      });
-
-      const vCodec = isHEVC
-        ? ['-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-crf', '22']
-        : ['-c:v', 'copy'];
-
-      const ffmpeg = spawn('ffmpeg', [
-        '-hide_banner',
-        '-loglevel', 'error',
-        '-i', targetFilePath,
-        ...vCodec,
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-f', 'mp4',
-        'pipe:1'
-      ]);
-
-      activeChildProcess = ffmpeg;
-      ffmpeg.stdout.pipe(res);
-
-      ffmpeg.stderr.on('data', (d) => {
-        // Suppress benign warnings
-      });
-
-      ffmpeg.on('error', (err) => {
-        console.warn(`[FFmpeg Error]:`, err.message);
-      });
-    } else {
-      const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
-      res.writeHead(range ? 206 : 200, {
-        ...(range ? { 'Content-Range': `bytes ${start}-${end}/${fileSize}` } : {}),
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
-        'Content-Type': contentType,
-        'Cache-Control': 'no-cache',
-        'X-Piece-Available': isPieceReady ? '1' : '0'
-      });
-
-      fileStream = fs.createReadStream(targetFilePath, { start, end });
-      fileStream.pipe(res);
-    }
-
-    // 8. Stream Close Handler (Instant Pause & Session Cleanup)
+    // 8. Stream Close Handler
     req.on('close', () => {
-      if (fileStream) fileStream.destroy();
-      if (activeChildProcess) {
-        try { activeChildProcess.kill('SIGKILL'); } catch {}
-      }
-
+      stream.destroy();
       playbackSessions.delete(sessionId);
-      regEntry.refCount = Math.max(0, regEntry.refCount - 1);
-      regEntry.lastActive = Date.now();
 
-      // Check if any fresh sessions exist (< 15s)
-      const now = Date.now();
-      let activeFreshCount = 0;
+      // Check if any active sessions remain
+      let activeSessions = 0;
       for (const s of playbackSessions.values()) {
-        if (s.infoHash.toLowerCase() === matchedHash && (now - s.lastSeen) < 15000) {
-          activeFreshCount++;
+        if (s.infoHash === matchedHash && (Date.now() - s.lastSeen) < 15000) {
+          activeSessions++;
         }
       }
 
-      if (regEntry.refCount === 0 && activeFreshCount === 0) {
-        qbt.pauseTorrents([matchedHash]).catch(() => {});
-        console.log(`[Bandwidth Saver] Stream closed. Immediately paused download for: "${torrentName}"`);
+      if (activeSessions === 0) {
+        torrent.deselect(0, torrent.pieces.length - 1, false);
+        console.log(`[Bandwidth Saver] Stream closed. Deselected pieces for: "${torrent.name}"`);
       }
     });
 
