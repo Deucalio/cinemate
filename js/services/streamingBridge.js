@@ -120,15 +120,22 @@ export const streamingBridge = {
       else if (/720p|hd/i.test(rawTitle)) resolution = '720p';
       else if (/480p|sd/i.test(rawTitle)) resolution = '480p';
 
-      // Detect features
-      const isHDR = /hdr|dolby|vision|dv/i.test(rawTitle);
-      const isEAC3 = /ddp|dd\+|eac3|ac3|atmos/i.test(rawTitle);
-      const isDTS = /dts/i.test(rawTitle);
-      const isAAC = /aac|mp3|stereo|2\.0/i.test(rawTitle) || !isEAC3;
-      const audioBadge = isEAC3 ? 'Dolby 5.1/Atmos' : (isDTS ? 'DTS 5.1' : 'AAC Stereo ✓');
+      // Detect features.
+      // NOTE: HDR and Dolby ATMOS are unrelated (one is video, one is audio) — matching /dolby/
+      // for HDR mislabels every DDP release as HDR, so Dolby Vision is matched explicitly.
+      const isHDR = /\bhdr(10)?\b|dolby\s*vision|\bdv\b/i.test(rawTitle);
+      const isEAC3 = /ddp|dd\+|eac3|e-ac3|ac3|atmos|truehd/i.test(rawTitle);
+      const isDTS = /\bdts\b/i.test(rawTitle);
+      // Previously `|| !isEAC3` — which declared every release without a Dolby tag to be AAC,
+      // so untagged 5.1 releases were badged "AAC Stereo ✓" and ranked as browser-safe.
+      const isAAC = /\baac\b|\bmp3\b|stereo|\b2\.0\b/i.test(rawTitle) && !isEAC3 && !isDTS;
+      const audioBadge = isEAC3 ? 'Dolby 5.1/Atmos' : (isDTS ? 'DTS 5.1' : (isAAC ? 'AAC Stereo ✓' : 'Audio unknown'));
       const isAtmos = isEAC3 || isDTS;
-      const codec = /hevc|x265|h265/i.test(rawTitle) ? 'HEVC' : (/x264|h264/i.test(rawTitle) ? 'H.264' : 'Web');
-      const isUniversal = isAAC && (codec === 'H.264' || /\.mp4/i.test(rawTitle));
+      const isHEVC = /hevc|x265|h265/i.test(rawTitle);
+      const codec = isHEVC ? 'HEVC' : (/x264|h264|avc/i.test(rawTitle) ? 'H.264' : 'Web');
+      // Browsers cannot decode HEVC in MP4, so an HEVC release is never "universal" however it is
+      // tagged. Anything else still plays after a server-side audio remux.
+      const isUniversal = isAAC && !isHEVC && (codec === 'H.264' || /\.mp4|\bmp4\b/i.test(rawTitle));
 
       return {
         title: rawTitle,
@@ -149,21 +156,57 @@ export const streamingBridge = {
       };
     });
 
-    // Filter items with magnet and sort by compatibility & seeders descending
+    // Rank by how likely the release is to actually play, then by swarm health.
+    const playabilityScore = (item) => {
+      if (item.codec === 'HEVC') return 0;   // browsers cannot decode it at all
+      if (item.isUniversal) return 3;        // plays directly, no server CPU
+      if (item.codec === 'H.264') return 2;  // plays after a cheap audio-only remux
+      return 1;
+    };
+
     return parsed
       .filter(item => Boolean(item.magnet))
       .sort((a, b) => {
-        // Prioritize universal browser playback if seeders are comparable
-        if (a.isUniversal && !b.isUniversal && (a.seeders >= 5)) return -1;
-        if (!a.isUniversal && b.isUniversal && (b.seeders >= 5)) return 1;
+        const diff = playabilityScore(b) - playabilityScore(a);
+        if (diff !== 0) return diff;
         return (b.seeders || 0) - (a.seeders || 0);
       });
   },
 
   /**
-   * Construct HTTP Stream URL for HTML5 <video>
+   * Ask the bridge to resolve a magnet and describe how it will be delivered, BEFORE handing the
+   * URL to <video>. A video element only ever reports an opaque MEDIA_ERR_* code, so without this
+   * the UI cannot tell "no seeders" from "unsupported codec" from "disk full".
+   *
+   * Resolves to the bridge's JSON: { ok: true, mode, durationSec, seekable, video, audio, ... }
+   * or { ok: false, code, error }.
    */
-  getStreamUrl(magnetOrLink, releaseTitle = '', sessionId = null, fileIndex = null, startSec = 0) {
+  async prepareStream(magnetOrLink, releaseTitle = '', sessionId = null) {
+    const serverUrl = this.getStreamServerUrl();
+    let url = `${serverUrl}/api/stream/prepare?magnet=${encodeURIComponent(magnetOrLink)}`;
+    if (releaseTitle) url += `&title=${encodeURIComponent(releaseTitle)}`;
+    if (sessionId) url += `&sessionId=${encodeURIComponent(sessionId)}`;
+
+    try {
+      // Swarm metadata can legitimately take ~25s on a cold torrent.
+      const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
+      const data = await res.json().catch(() => null);
+      if (data) return data;
+      return { ok: false, code: 'BAD_RESPONSE', error: `Bridge returned HTTP ${res.status}` };
+    } catch (err) {
+      return {
+        ok: false,
+        code: 'UNREACHABLE',
+        error: `Could not reach the streaming bridge at ${serverUrl} (${err.message}).`
+      };
+    }
+  },
+
+  /**
+   * Construct the HTTP stream URL for an HTML5 <video>.
+   * `mode` is 'direct' (native byte-range seeking) or 'remux' (progressive fMP4 from FFmpeg).
+   */
+  getStreamUrl(magnetOrLink, releaseTitle = '', sessionId = null, startSec = 0, mode = null, durationSec = 0) {
     const serverUrl = this.getStreamServerUrl();
     let url = `${serverUrl}/api/stream?magnet=${encodeURIComponent(magnetOrLink)}`;
     if (releaseTitle) {
@@ -172,27 +215,11 @@ export const streamingBridge = {
     if (sessionId) {
       url += `&sessionId=${encodeURIComponent(sessionId)}`;
     }
-    if (fileIndex !== null) {
-      url += `&fileIndex=${fileIndex}`;
-    }
     if (startSec > 0) {
       url += `&startSec=${Math.floor(startSec)}`;
     }
-    return url;
-  },
-
-  /**
-   * Construct HLS Master Playlist URL for Hls.js progressive streaming
-   * This route generates .m3u8 with segments that FFmpeg-remux to AAC on-the-fly
-   */
-  getHlsUrl(magnetOrLink, releaseTitle = '', sessionId = null, durationSec = 0) {
-    const serverUrl = this.getStreamServerUrl();
-    let url = `${serverUrl}/api/stream/hls/master.m3u8?magnet=${encodeURIComponent(magnetOrLink)}`;
-    if (releaseTitle) {
-      url += `&title=${encodeURIComponent(releaseTitle)}`;
-    }
-    if (sessionId) {
-      url += `&sessionId=${encodeURIComponent(sessionId)}`;
+    if (mode) {
+      url += `&mode=${encodeURIComponent(mode)}`;
     }
     if (durationSec > 0) {
       url += `&duration=${Math.floor(durationSec)}`;
@@ -212,6 +239,28 @@ export const streamingBridge = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId, infoHash, currentTime })
       });
+    } catch {}
+  },
+
+  /**
+   * Tell the bridge a playback session ended so it can stop spending swarm bandwidth immediately
+   * rather than waiting out the idle grace window.
+   */
+  sendLeave(sessionId, infoHash) {
+    if (!sessionId || !infoHash) return;
+    const serverUrl = this.getStreamServerUrl();
+    const payload = JSON.stringify({ sessionId, infoHash });
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(`${serverUrl}/api/stream/session/leave`, new Blob([payload], { type: 'application/json' }));
+      } else {
+        fetch(`${serverUrl}/api/stream/session/leave`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: payload,
+          keepalive: true
+        }).catch(() => {});
+      }
     } catch {}
   },
 

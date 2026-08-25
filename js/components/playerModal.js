@@ -18,6 +18,13 @@ export class PlayerModalManager {
     this.currentTime = 0;
     this.isPlaying = false;
     this.currentStreamTitle = null;
+    this.currentStreamMode = null;   // 'direct' (byte-range, natively seekable) | 'remux' (fMP4)
+    this.currentStartSec = 0;        // remux only: offset FFmpeg started the output at
+    this.probedDuration = 0;         // real duration from ffprobe, when available
+    this.resumeFromSec = 0;
+    this._pendingSeekSec = 0;
+    this._streamGeneration = 0;
+    this._remuxAttempted = false;
   }
 
   open(movie, options = {}) {
@@ -37,8 +44,19 @@ export class PlayerModalManager {
     this.totalRuntimeSeconds = runtimeMinutes * 60;
 
     // Initial starting time
-    this.currentTime = (existingProgress && existingProgress.currentTime) ? existingProgress.currentTime : 0;
+    this.resumeFromSec = (existingProgress && existingProgress.currentTime) ? existingProgress.currentTime : 0;
+    this.currentTime = this.resumeFromSec;
     this.duration = this.totalRuntimeSeconds;
+
+    // Reset per-open stream state
+    this.currentStreamMode = null;
+    this.currentStartSec = 0;
+    this.probedDuration = 0;
+    this._pendingSeekSec = 0;
+    this._remuxAttempted = false;
+    this._resumeConsumed = false;
+    this.currentMagnet = null;
+    this.currentInfoHash = null;
 
     const modal = document.createElement('div');
     modal.className = 'player-modal-backdrop animate-fade-in';
@@ -47,9 +65,9 @@ export class PlayerModalManager {
     modal.innerHTML = `
       <div class="player-container" id="player-container">
         <!-- Video Element -->
-        <video class="main-video-element" id="main-video-element" preload="auto" playsinline crossorigin="anonymous">
-          <source src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4" type="video/mp4">
-        </video>
+        <!-- No src until a torrent source is chosen. It previously auto-played a Google sample
+             clip, which made a broken bridge look like working playback. -->
+        <video class="main-video-element" id="main-video-element" preload="auto" playsinline crossorigin="anonymous"></video>
 
         <!-- Player Top Bar Overlay -->
         <div class="player-top-bar animate-fade-in">
@@ -172,7 +190,7 @@ export class PlayerModalManager {
         <div class="player-bottom-controls animate-fade-in" id="player-bottom-controls">
           <!-- Timeline / Scrubber -->
           <div class="player-timeline-wrap" id="player-timeline-wrap">
-            <div class="player-timeline-buffered" style="width: 80%;"></div>
+            <div class="player-timeline-buffered" style="width: 0%;"></div>
             <div class="player-timeline-progress" id="player-timeline-progress" style="width: 0%;"></div>
             <div class="player-timeline-handle" id="player-timeline-handle" style="left: 0%;"></div>
             <div class="player-timeline-tooltip" id="player-timeline-tooltip" style="display:none;">00:00</div>
@@ -262,8 +280,10 @@ export class PlayerModalManager {
       }
     }
 
-    // Auto play
-    this._play();
+    this._showBufferingHUD(
+      'Choose a Stream Source',
+      'Pick a torrent release from the Sources panel, or paste a magnet link, to begin playback.'
+    );
   }
 
   _bindPlayerEvents(isTV, season, episode, title, year) {
@@ -396,54 +416,54 @@ export class PlayerModalManager {
       testHealthBtn.textContent = 'Testing...';
       const health = await streamingBridge.checkServerHealth();
       if (health) {
-        toast.success(`Server Connected! Active torrents: ${health.activeTorrents}`, '✅');
+        toast.success(`Bridge online — ${health.activeTorrentsCount} active torrent(s), ` +
+          `FFmpeg ${health.toolchain && health.toolchain.ffmpeg ? 'ready' : 'MISSING'}`, '✅');
       } else {
         toast.error(`Could not reach ${streamingBridge.getStreamServerUrl()}. Please ensure the server is running.`, '✕');
       }
       testHealthBtn.textContent = '🩺 Test Server';
     });
 
-    // Video metadata & timeupdate
+    // ---- Video element state ----
     video.addEventListener('loadedmetadata', () => {
-      if (video.duration && isFinite(video.duration) && video.duration > 300) {
+      // Progressive fMP4 out of the remuxer reports Infinity/NaN, so fall back to the probed
+      // duration and finally to the TMDB runtime -- the scrubber must span the real film.
+      if (isFinite(video.duration) && video.duration > 300) {
         this.duration = video.duration;
+      } else if (this.probedDuration > 300) {
+        this.duration = this.probedDuration;
       } else {
         this.duration = this.totalRuntimeSeconds || 3300;
       }
-      if (this.currentTime > 0) {
-        video.currentTime = this.currentTime;
+
+      if (this._pendingSeekSec > 0) {
+        const target = this._pendingSeekSec;
+        this._pendingSeekSec = 0;
+        try { video.currentTime = target; } catch {}
       }
+
       this._updateTimeDisplay();
     });
 
     video.addEventListener('waiting', () => {
-      this._showBufferingHUD('Buffering Stream...', 'Receiving next sequential chunks from seeders via qBittorrent...');
+      if (!this.currentMagnet) return;
+      this._showBufferingHUD(
+        'Buffering Stream...',
+        'Waiting for qBittorrent to verify the next pieces from the swarm...'
+      );
     });
 
-    video.addEventListener('playing', () => {
-      this._hideBufferingHUD();
-    });
+    video.addEventListener('playing', () => this._hideBufferingHUD());
+    video.addEventListener('canplay', () => this._hideBufferingHUD());
+    video.addEventListener('progress', () => this._updateBufferedRange());
 
-    video.addEventListener('canplay', () => {
-      this._hideBufferingHUD();
-    });
-
-    video.addEventListener('progress', () => {
-      this._updateBufferedRange();
-    });
-
-    video.addEventListener('error', () => {
-      this._showBufferingHUD('Connecting to Stream Source...', 'qBittorrent is acquiring initial pieces from swarm. Buffering stream...');
-      setTimeout(() => {
-        if (this.videoElement && this.videoElement.paused) {
-          this.videoElement.load();
-          this._play();
-        }
-      }, 3500);
-    });
+    // Single, state-aware handler. The old one blind-reloaded the element every 3.5s forever,
+    // which both hid the real failure and raced the remux fallback by reloading the failed
+    // direct URL on top of it.
+    video.addEventListener('error', () => this._handleVideoError());
 
     video.addEventListener('timeupdate', () => {
-      this.currentTime = video.currentTime;
+      this.currentTime = this._getEffectiveTime();
       this._updateProgressBar();
       this._updateTimeDisplay();
     });
@@ -480,9 +500,9 @@ export class PlayerModalManager {
         e.preventDefault();
         this._togglePlay();
       } else if (e.key === 'ArrowLeft') {
-        video.currentTime = Math.max(0, video.currentTime - 10);
+        this._seekTo(Math.max(0, this._getEffectiveTime() - 10));
       } else if (e.key === 'ArrowRight') {
-        video.currentTime = Math.min(video.duration || this.duration, video.currentTime + 10);
+        this._seekTo(this._getEffectiveTime() + 10);
       } else if (e.key === 'f') {
         fullscreenBtn.click();
       } else if (e.key === 'm') {
@@ -497,7 +517,7 @@ export class PlayerModalManager {
         store.saveProgress({
           movie: this.currentMovie,
           currentTime: this.currentTime,
-          duration: this.duration || 7200
+          duration: this._totalDuration()
         });
       }
     }, 5000);
@@ -522,7 +542,8 @@ export class PlayerModalManager {
     const health = await streamingBridge.checkServerHealth();
     if (statusBar) {
       if (health) {
-        statusBar.innerHTML = `<span class="server-dot server-dot-online"></span> <span class="server-status-text text-green">VPS Bridge Online (${streamingBridge.getStreamServerUrl()}) • ${health.activeTorrents} active streams</span>`;
+        const ffmpegReady = health.toolchain ? health.toolchain.ffmpeg : true;
+        statusBar.innerHTML = `<span class="server-dot server-dot-online"></span> <span class="server-status-text text-green">VPS Bridge Online (${streamingBridge.getStreamServerUrl()}) • ${health.activeTorrentsCount} active torrent(s)${ffmpegReady ? '' : ' • ⚠ FFmpeg missing — only MP4/H.264/AAC releases will play'}</span>`;
       } else {
         statusBar.innerHTML = `<span class="server-dot server-dot-offline"></span> <span class="server-status-text text-amber">Bridge unreachable at ${streamingBridge.getStreamServerUrl()} (Make sure server is running on VPS/Local)</span>`;
       }
@@ -554,7 +575,8 @@ export class PlayerModalManager {
                   ${rel.isHDR ? `<span class="source-pill pill-hdr">HDR</span>` : ''}
                   <span class="source-pill pill-audio">${rel.audioBadge || (rel.isAtmos ? '5.1 ATMOS' : 'Stereo')}</span>
                   <span class="source-pill pill-codec">${rel.codec}</span>
-                  ${rel.isUniversal ? `<span class="source-pill" style="background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34,197,94,0.4);">⭐ Web Audio (AAC)</span>` : ''}
+                  ${rel.isUniversal ? `<span class="source-pill" style="background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34,197,94,0.4);">⭐ Plays Directly</span>` : ''}
+                  ${rel.codec === 'HEVC' ? `<span class="source-pill" style="background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239,68,68,0.4);">⚠ HEVC — browsers cannot decode</span>` : ''}
                   <span class="source-indexer-tag">${_escape(rel.indexer)}</span>
                 </div>
                 <h4 class="source-release-title" title="${_escape(rel.title)}">${_escape(rel.title)}</h4>
@@ -596,82 +618,217 @@ export class PlayerModalManager {
   }
 
   /**
-   * Switch player source to Torrent HTTP Stream via the Bridge
-   * Progressive WebTorrent engine with real-time FFmpeg AAC remuxing
+   * Point the player at a torrent, via the bridge.
+   *
+   * The bridge is asked to RESOLVE the release first (/api/stream/prepare) so we know the
+   * delivery mode, real duration and codec compatibility before <video> ever sees a URL. A
+   * <video> element only surfaces opaque MEDIA_ERR_* codes, so without this step "no seeders",
+   * "unsupported codec" and "disk full" all looked identical: an endless buffering spinner.
    */
-  streamMagnet(magnetLink, releaseTitle = 'Torrent Stream', startSec = 0) {
+  async streamMagnet(magnetLink, releaseTitle = 'Torrent Stream', startSec = 0) {
     if (!this.sessionId) {
       this.sessionId = `sess_${Math.random().toString(36).substring(2, 9)}_${Date.now()}`;
     }
 
+    // Honour saved watch progress on the first source of a session.
+    if (startSec === 0 && this.resumeFromSec > 5 && !this._resumeConsumed) {
+      startSec = this.resumeFromSec;
+    }
+    this._resumeConsumed = true;
+
     const hashMatch = magnetLink.match(/urn:btih:([a-zA-Z0-9]+)/i);
-    this.currentInfoHash = hashMatch ? hashMatch[1].toLowerCase() : 'custom';
+    this.currentInfoHash = hashMatch ? hashMatch[1].toLowerCase() : null;
     this.currentMagnet = magnetLink;
     this.currentStreamTitle = releaseTitle;
-    this.currentStartSec = startSec;
+    this.currentStartSec = 0;
+    this.probedDuration = 0;
+    this._remuxAttempted = false;
 
-    const streamUrl = streamingBridge.getStreamUrl(magnetLink, releaseTitle, this.sessionId, null, startSec);
+    // Guards against a slow prepare for an abandoned source overwriting a newer selection.
+    const generation = ++this._streamGeneration;
+
+    const shortTitle = releaseTitle.length > 40 ? `${releaseTitle.substring(0, 40)}...` : releaseTitle;
     const sourceBadge = this.modal.querySelector('#player-active-source-badge');
-
-    toast.info(`Connecting to torrent stream via bridge...`, '🧲');
-    this._showBufferingHUD('Connecting to BitTorrent Swarm...', `Buffering pieces for "${releaseTitle.substring(0, 32)}..." with Universal AAC Audio`);
-
     if (sourceBadge) {
-      sourceBadge.textContent = `🟢 TORRENT: ${releaseTitle.substring(0, 30)}...`;
+      sourceBadge.textContent = `🟡 RESOLVING: ${shortTitle}`;
       sourceBadge.style.display = 'inline-block';
     }
 
-    // Start 10s playback session heartbeat
-    if (this._heartbeatTimer) clearInterval(this._heartbeatTimer);
-    this._heartbeatTimer = setInterval(() => {
-      if (this.currentInfoHash && this.modal && !this.videoElement.paused) {
-        streamingBridge.sendHeartbeat(this.sessionId, this.currentInfoHash, this.videoElement.currentTime + (this.currentStartSec || 0));
-      }
-    }, 10000);
+    this._showBufferingHUD(
+      'Connecting to BitTorrent Swarm...',
+      `Resolving "${shortTitle}" and checking browser compatibility. A cold torrent can take ~20s.`
+    );
+    toast.info('Connecting to torrent stream via bridge...', '🧲');
 
-    // Destroy HLS instance if leftover
-    if (this._hlsInstance) {
-      try { this._hlsInstance.destroy(); } catch {}
-      this._hlsInstance = null;
+    // Start heart-beating immediately so Auto-GC never deletes the torrent while it resolves.
+    this._startHeartbeat();
+
+    const plan = await streamingBridge.prepareStream(magnetLink, releaseTitle, this.sessionId);
+
+    // Superseded by a newer source, or the player closed while we waited.
+    if (generation !== this._streamGeneration || !this.modal) return;
+
+    if (!plan || !plan.ok) {
+      this._showStreamError(
+        (plan && plan.error) || 'The bridge could not prepare this release.',
+        plan && plan.code
+      );
+      return;
     }
 
-    // Set video source
-    this.videoElement.src = streamUrl;
+    if (plan.infoHash) this.currentInfoHash = plan.infoHash;
+    this.probedDuration = plan.durationSec || 0;
+    if (plan.durationSec > 300) this.duration = plan.durationSec;
+
+    if (sourceBadge) {
+      const remuxNote = plan.audio && plan.audio.willTranscode ? ' • AAC remux' : '';
+      sourceBadge.textContent = `🟢 ${plan.mode === 'direct' ? 'DIRECT' : 'REMUX'}: ${shortTitle}${remuxNote}`;
+    }
+
+    if (plan.mode === 'remux') {
+      this._showBufferingHUD(
+        'Remuxing for your browser...',
+        `${plan.reason} — FFmpeg is rewrapping this release with stereo AAC audio.`
+      );
+    } else {
+      this._showBufferingHUD(
+        'Buffering first pieces...',
+        'Streaming verified pieces directly from qBittorrent — native seeking enabled.'
+      );
+    }
+
+    this._loadStreamUrl(plan.mode, startSec);
+  }
+
+  /**
+   * Points <video> at the bridge for a given delivery mode.
+   *
+   * direct : the bridge serves real byte ranges, so the element's clock IS the film's clock and
+   *          the browser seeks natively.
+   * remux  : FFmpeg starts its output AT startSec, so the element's clock restarts at zero and
+   *          we carry the offset in `currentStartSec`.
+   */
+  _loadStreamUrl(mode, startSec = 0) {
+    if (!this.currentMagnet || !this.videoElement) return;
+
+    this.currentStreamMode = mode;
+
+    if (mode === 'direct') {
+      this.currentStartSec = 0;
+      this._pendingSeekSec = startSec > 0 ? startSec : 0;
+    } else {
+      this.currentStartSec = startSec;
+      this._pendingSeekSec = 0;
+    }
+
+    const url = streamingBridge.getStreamUrl(
+      this.currentMagnet,
+      this.currentStreamTitle,
+      this.sessionId,
+      mode === 'remux' ? startSec : 0,
+      mode,
+      this.probedDuration || this.totalRuntimeSeconds || 0
+    );
+
+    this.videoElement.src = url;
     this.videoElement.load();
     this._play();
+  }
 
-    // Listen for playback start to dismiss buffering HUD
-    const onPlaying = () => {
-      this._hideBufferingHUD();
-      this.videoElement.removeEventListener('playing', onPlaying);
-      this.videoElement.removeEventListener('canplay', onPlaying);
-      this.videoElement.removeEventListener('timeupdate', onPlaying);
-    };
-    this.videoElement.addEventListener('playing', onPlaying);
-    this.videoElement.addEventListener('canplay', onPlaying);
-    this.videoElement.addEventListener('timeupdate', onPlaying);
+  /**
+   * Escalates at most once: a direct stream the browser cannot decode is retried through the
+   * FFmpeg remuxer. Anything else is reported instead of retried in a loop.
+   */
+  _handleVideoError() {
+    const mediaError = this.videoElement ? this.videoElement.error : null;
+    const code = mediaError ? mediaError.code : 0;
+    const label = {
+      1: 'MEDIA_ERR_ABORTED',
+      2: 'MEDIA_ERR_NETWORK',
+      3: 'MEDIA_ERR_DECODE',
+      4: 'MEDIA_ERR_SRC_NOT_SUPPORTED'
+    }[code] || `MEDIA_ERR_${code}`;
 
-    // Auto-fallback to FFmpeg AAC Remuxer if browser decoder cannot parse audio/container
-    const onError = () => {
-      this.videoElement.removeEventListener('error', onError);
-      if (!streamUrl.includes('remux=1')) {
-        console.log('[Player] Direct decode issue, switching to Real-Time FFmpeg AAC Remuxer...');
-        this._showBufferingHUD('Remuxing Audio Track...', 'Converting Dolby/DTS audio to Universal AAC Stereo for browser playback...');
-        this.videoElement.src = `${streamUrl}&remux=1`;
-        this.videoElement.load();
-        this._play();
-      }
+    console.warn(`[Player] ${label}`, mediaError && mediaError.message);
+
+    if (!this.currentMagnet) return; // nothing streaming yet
+    if (code === 1) return;          // we aborted it ourselves (source switch or close)
+
+    if (this.currentStreamMode === 'direct' && !this._remuxAttempted && (code === 3 || code === 4)) {
+      this._remuxAttempted = true;
+      this._showBufferingHUD(
+        'Switching to FFmpeg Remuxer...',
+        `${label} — rewrapping to MP4 with stereo AAC audio for your browser.`
+      );
+      toast.info('Browser could not decode this release directly. Remuxing...', '🎛️');
+      this._loadStreamUrl('remux', this._getEffectiveTime() || 0);
+      return;
+    }
+
+    this._showStreamError(
+      code === 2
+        ? 'The connection to the streaming bridge dropped. Check that the bridge is running and reachable.'
+        : `Your browser could not play this release (${label}). Try a different source.`,
+      label
+    );
+  }
+
+  _showStreamError(message, code = '') {
+    console.warn('[Player] stream failed', code || '', message);
+    this._stopHeartbeat();
+    this._showBufferingHUD('⚠️ Stream Unavailable', message);
+
+    const hud = this.modal ? this.modal.querySelector('#player-buffering-hud') : null;
+    if (hud) {
+      const spinner = hud.querySelector('.buffering-spinner-ring');
+      if (spinner) spinner.style.display = 'none';
+      const bar = hud.querySelector('.buffering-progress-bar-wrap');
+      if (bar) bar.style.display = 'none';
+    }
+
+    const badge = this.modal ? this.modal.querySelector('#player-active-source-badge') : null;
+    if (badge) badge.textContent = '🔴 STREAM FAILED — choose another source';
+
+    toast.error(message, '✕');
+  }
+
+  /**
+   * Heartbeats run for as long as the player is open, PAUSED OR NOT. Gating them on
+   * `!video.paused` meant a paused viewer stopped being counted as active and Auto-GC deleted
+   * the torrent out from under them.
+   */
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    const beat = () => {
+      if (!this.modal || !this.currentInfoHash) return;
+      streamingBridge.sendHeartbeat(this.sessionId, this.currentInfoHash, this._getEffectiveTime());
     };
-    this.videoElement.addEventListener('error', onError, { once: true });
+    beat();
+    this._heartbeatTimer = setInterval(beat, 10000);
+  }
+
+  _stopHeartbeat() {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
   }
 
   _showBufferingHUD(title = 'Connecting to Swarm...', subtext = 'Requesting sequential download pieces via VPS qBittorrent bridge...') {
     const hud = this.modal ? this.modal.querySelector('#player-buffering-hud') : null;
     if (!hud) return;
+
     const titleEl = hud.querySelector('#buffering-title');
     const subEl = hud.querySelector('#buffering-subtext');
     if (titleEl) titleEl.textContent = title;
     if (subEl) subEl.textContent = subtext;
+
+    // Restore the animated bits in case a previous error state hid them.
+    const spinner = hud.querySelector('.buffering-spinner-ring');
+    if (spinner) spinner.style.display = '';
+    const bar = hud.querySelector('.buffering-progress-bar-wrap');
+    if (bar) bar.style.display = '';
+
     hud.style.display = 'flex';
   }
 
@@ -680,15 +837,34 @@ export class PlayerModalManager {
     if (hud) hud.style.display = 'none';
   }
 
+  /**
+   * The film's full duration, preferring the element, then ffprobe, then the TMDB runtime.
+   */
+  _totalDuration() {
+    if (this.duration && this.duration > 300) return this.duration;
+    if (this.probedDuration && this.probedDuration > 300) return this.probedDuration;
+    return this.totalRuntimeSeconds || 3300;
+  }
+
+  _isBuffered(elementTime) {
+    const buf = this.videoElement ? this.videoElement.buffered : null;
+    if (!buf) return false;
+    for (let i = 0; i < buf.length; i++) {
+      if (elementTime >= buf.start(i) && elementTime <= buf.end(i)) return true;
+    }
+    return false;
+  }
+
   _updateBufferedRange() {
     const bufferedEl = this.modal ? this.modal.querySelector('.player-timeline-buffered') : null;
     const video = this.videoElement;
     if (!bufferedEl || !video) return;
 
-    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    const totalDur = this._totalDuration();
 
     if (video.buffered && video.buffered.length > 0) {
-      const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+      // In remux mode the element's timeline starts at currentStartSec, not at zero.
+      const bufferedEnd = video.buffered.end(video.buffered.length - 1) + (this.currentStartSec || 0);
       const percent = Math.min(100, Math.max(0, (bufferedEnd / totalDur) * 100));
       bufferedEl.style.width = `${percent}%`;
     }
@@ -703,11 +879,12 @@ export class PlayerModalManager {
   }
 
   _play() {
+    if (!this.videoElement || !this.videoElement.getAttribute('src')) return;
     this.videoElement.muted = false;
     this.videoElement.volume = 1.0;
     this._updateVolIcon(1.0);
 
-    const volSlider = this.modal ? this.modal.querySelector('#ctrl-vol-slider') : null;
+    const volSlider = this.modal ? this.modal.querySelector('#player-volume-slider') : null;
     if (volSlider) volSlider.value = 1.0;
 
     this.videoElement.play().then(() => {
@@ -740,32 +917,30 @@ export class PlayerModalManager {
   }
 
   _seekTo(targetSeconds) {
-    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    const video = this.videoElement;
+    if (!video) return;
+
+    const totalDur = this._totalDuration();
     const clamped = Math.max(0, Math.min(totalDur, targetSeconds));
 
-    if (this.videoElement) {
-      let isBuffered = false;
-      const buf = this.videoElement.buffered;
-      if (buf) {
-        for (let i = 0; i < buf.length; i++) {
-          if (clamped >= buf.start(i) && clamped <= buf.end(i)) {
-            isBuffered = true;
-            break;
-          }
-        }
-      }
-
-      if (isBuffered) {
-        this.videoElement.currentTime = clamped;
-      } else if (this.currentMagnet) {
-        this.streamMagnet(this.currentMagnet, this.currentStreamTitle, clamped);
+    if (!this.currentMagnet || this.currentStreamMode === 'direct') {
+      // Byte-range backed: seek natively and let the bridge map the offset onto torrent pieces.
+      try { video.currentTime = clamped; } catch {}
+    } else {
+      // Progressive fMP4 carries no index, so a seek outside the buffered window means restarting
+      // FFmpeg at the new timestamp. The previous code restarted the whole stream on EVERY seek,
+      // including seeks into already-buffered territory.
+      const local = clamped - (this.currentStartSec || 0);
+      if (local >= 0 && this._isBuffered(local)) {
+        try { video.currentTime = local; } catch {}
       } else {
-        this.videoElement.currentTime = clamped;
+        this._showBufferingHUD('Seeking...', `Restarting the remuxed stream at ${this._formatTime(clamped)}...`);
+        this._loadStreamUrl('remux', clamped);
       }
-
-      this._updateProgressBar();
-      this._updateTimeDisplay();
     }
+
+    this._updateProgressBar();
+    this._updateTimeDisplay();
   }
 
   _scrub(e) {
@@ -773,7 +948,7 @@ export class PlayerModalManager {
     if (!timeline) return;
     const rect = timeline.getBoundingClientRect();
     const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    const totalDur = this._totalDuration();
     const targetSeconds = Math.floor(pos * totalDur);
     this._seekTo(targetSeconds);
   }
@@ -783,7 +958,7 @@ export class PlayerModalManager {
     const progressHandle = this.modal ? this.modal.querySelector('#player-timeline-handle') : null;
     if (!progressFill || !progressHandle) return;
 
-    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    const totalDur = this._totalDuration();
     const current = this._getEffectiveTime();
     const percent = Math.min(100, Math.max(0, (current / totalDur) * 100));
 
@@ -794,7 +969,7 @@ export class PlayerModalManager {
   _updateTimeDisplay() {
     const curEl = this.modal ? this.modal.querySelector('#player-current-time') : null;
     const durEl = this.modal ? this.modal.querySelector('#player-total-duration') : null;
-    const totalDur = (this.duration && this.duration > 300) ? this.duration : (this.totalRuntimeSeconds || 3300);
+    const totalDur = this._totalDuration();
     const current = this._getEffectiveTime();
 
     if (curEl) curEl.textContent = this._formatTime(current);
@@ -817,56 +992,50 @@ export class PlayerModalManager {
     return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   }
 
-  _sendLeaveBeacon() {
-    if (this.sessionId && this.currentInfoHash) {
-      const serverUrl = streamingBridge.getStreamServerUrl();
-      const payload = JSON.stringify({ sessionId: this.sessionId, infoHash: this.currentInfoHash });
-      try {
-        if (navigator.sendBeacon) {
-          navigator.sendBeacon(`${serverUrl}/api/stream/session/leave`, payload);
-        } else {
-          fetch(`${serverUrl}/api/stream/session/leave`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: payload,
-            keepalive: true
-          }).catch(() => {});
-        }
-      } catch {}
-    }
-  }
-
   close() {
-    this._sendLeaveBeacon();
+    streamingBridge.sendLeave(this.sessionId, this.currentInfoHash);
 
-    // Destroy Hls.js instance
-    if (this._hlsInstance) {
-      this._hlsInstance.destroy();
-      this._hlsInstance = null;
-    }
+    this._stopHeartbeat();
 
-    if (this._heartbeatTimer) {
-      clearInterval(this._heartbeatTimer);
-      this._heartbeatTimer = null;
-    }
     if (this.progressTimer) {
       clearInterval(this.progressTimer);
       this.progressTimer = null;
     }
+
     if (this.currentMovie && this.currentTime > 5) {
       store.saveProgress({
         movie: this.currentMovie,
         currentTime: this.currentTime,
-        duration: this.duration || 7200
+        duration: this._totalDuration()
       });
     }
+
     if (this._keydownHandler) {
       window.removeEventListener('keydown', this._keydownHandler);
+      this._keydownHandler = null;
     }
+
+    // Detaching the source stops the browser holding the bridge connection open after close.
+    if (this.videoElement) {
+      try {
+        this.videoElement.pause();
+        this.videoElement.removeAttribute('src');
+        this.videoElement.load();
+      } catch {}
+    }
+
+    // Invalidate any prepare() still in flight for this player.
+    this._streamGeneration++;
+    this.currentMagnet = null;
+    this.currentInfoHash = null;
+    this.currentStreamMode = null;
+    this.sessionId = null;
+
     if (this.modal) {
       this.modal.remove();
       this.modal = null;
     }
+    this.videoElement = null;
   }
 }
 
