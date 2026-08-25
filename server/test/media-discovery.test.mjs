@@ -21,6 +21,10 @@ const SAMPLE_SIZE = 6000000;
 const BRIDGE_PORT = 8974;
 const MOCK_QBT_PORT = 18097;
 
+// What /torrents/properties reports. Real qBittorrent exposes piece_size ONLY here.
+const TOTAL_PIECES_FOR_MOCK = 64;
+const TOTAL_SIZE_FOR_MOCK = TOTAL_PIECES_FOR_MOCK * PIECE_SIZE;
+
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cinestream-media-'));
 
 let failures = 0;
@@ -71,6 +75,15 @@ const scenarios = {
     onDisk: [['Matroska.Release.mkv.!qB', MOVIE_SIZE]],
     expectFile: 'Matroska.Release.mkv'
   },
+  // qBittorrent reports no usable piece size. The bridge must refuse rather than guess.
+  noPieceSize: {
+    hash: '9'.repeat(40),
+    dir: 'NoPieceSize.Release',
+    files: [
+      { index: 0, name: 'NoPieceSize.Release/NoPieceSize.Release.mp4', size: MOVIE_SIZE, piece_range: [0, 11] }
+    ],
+    onDisk: [['NoPieceSize.Release.mp4', MOVIE_SIZE]]
+  },
   // Nothing streamable: must fail fast and clearly, not poll for 24 seconds.
   archive: {
     hash: 'e'.repeat(40),
@@ -99,6 +112,12 @@ const mockQbt = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const send = (o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
 
+  // piece_size and pieces_num live ONLY here — /torrents/info does not carry them.
+  if (url.pathname === '/api/v2/torrents/properties') {
+    const h = (url.searchParams.get('hash') || '').toLowerCase();
+    if (h === scenarios.noPieceSize.hash) return send({});
+    return send({ piece_size: PIECE_SIZE, pieces_num: TOTAL_PIECES_FOR_MOCK, total_size: TOTAL_SIZE_FOR_MOCK });
+  }
   if (url.pathname === '/api/v2/auth/login') {
     res.writeHead(200, { 'Set-Cookie': 'SID=t; path=/' }); return res.end('Ok.');
   }
@@ -108,7 +127,6 @@ const mockQbt = http.createServer((req, res) => {
       name: sc.dir,
       save_path: root,
       content_path: path.join(root, sc.dir),
-      piece_size: PIECE_SIZE,
       added_on: Math.floor(Date.now() / 1000),
       magnet_uri: `magnet:?xt=urn:btih:${sc.hash}`
     })));
@@ -169,6 +187,17 @@ check('picks the feature over the sample', smp.body.ok === true && smp.body.file
   smp.body.fileName || smp.body.error);
 check('feature size reported', smp.body.fileSizeBytes === scenarios.sample.expectSize,
   String(smp.body.fileSizeBytes));
+
+console.log('\n--- Piece size must come from /torrents/properties, never a guess ---');
+// piece_size is NOT a field of /torrents/info. Reading it from there yielded undefined and fell
+// back to a guessed 2 MB; when the real piece size is smaller, the computed piece index lands on an
+// already-downloaded piece and the reader serves sparse zeros — FFmpeg then reports
+// "0x00 ... invalid as first byte of an EBML number" and nothing plays until the torrent hits 100%.
+const nps = await prepare(scenarios.noPieceSize.hash);
+check('refuses to stream when the piece size is unknown', nps.body.ok === false,
+  JSON.stringify(nps.body).slice(0, 140));
+check('says why, instead of silently guessing',
+  typeof nps.body.error === 'string' && /piece size/i.test(nps.body.error), nps.body.error);
 
 console.log('\n--- Matroska routes away from direct ---');
 const mkv = await prepare(scenarios.matroska.hash);

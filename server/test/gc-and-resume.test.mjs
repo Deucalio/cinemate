@@ -27,6 +27,10 @@ const MOCK_QBT_PORT = 18096;
 const OLD_HASH = '1'.repeat(40);     // pre-existing, added long ago
 const PAUSED_HASH = '2'.repeat(40);  // exists but stopped
 
+// What /torrents/properties reports. Real qBittorrent exposes piece_size ONLY here.
+const TOTAL_PIECES_FOR_MOCK = 12;
+const TOTAL_SIZE_FOR_MOCK = TOTAL_PIECES_FOR_MOCK * PIECE_SIZE;
+
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cinestream-gc-'));
 
 let failures = 0;
@@ -51,7 +55,7 @@ const pausedFile = path.join(root, 'Paused.Release', 'Paused.Release.mp4.!qB');
 const torrents = () => [
   {
     hash: OLD_HASH, name: 'Old.Release', save_path: root,
-    content_path: path.join(root, 'Old.Release'), piece_size: PIECE_SIZE,
+    content_path: path.join(root, 'Old.Release'),
     // Added two hours ago: far older than IDLE_TTL.
     added_on: Math.floor(Date.now() / 1000) - 7200,
     state: 'stalledUP', progress: 1, num_seeds: 3, num_leechs: 1, dlspeed: 0,
@@ -59,7 +63,7 @@ const torrents = () => [
   },
   {
     hash: PAUSED_HASH, name: 'Paused.Release', save_path: root,
-    content_path: path.join(root, 'Paused.Release'), piece_size: PIECE_SIZE,
+    content_path: path.join(root, 'Paused.Release'),
     added_on: Math.floor(Date.now() / 1000) - 7200,
     state: pausedState, progress: 0.1, num_seeds: 5, num_leechs: 2, dlspeed: 0,
     magnet_uri: `magnet:?xt=urn:btih:${PAUSED_HASH}`
@@ -70,6 +74,10 @@ const mockQbt = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const send = (o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
 
+  // piece_size and pieces_num live ONLY here — /torrents/info does not carry them.
+  if (url.pathname === '/api/v2/torrents/properties') {
+    return send({ piece_size: PIECE_SIZE, pieces_num: TOTAL_PIECES_FOR_MOCK, total_size: TOTAL_SIZE_FOR_MOCK });
+  }
   if (url.pathname === '/api/v2/auth/login') {
     res.writeHead(200, { 'Set-Cookie': 'SID=t; path=/' }); return res.end('Ok.');
   }

@@ -179,6 +179,20 @@ class QBittorrentClient {
   }
 
   /**
+   * Torrent properties. This is the ONLY place qBittorrent exposes `piece_size` and `pieces_num` —
+   * they are NOT fields of /torrents/info, despite how often that is assumed.
+   */
+  async getProperties(hash) {
+    try {
+      const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/properties?hash=${hash}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * File list for a torrent. Used to map a file's byte offset onto GLOBAL torrent piece indices.
    * Entries expose { index, name, size, priority, piece_range: [first, last] }.
    */
@@ -647,6 +661,16 @@ function createPieceAwareTorrentStream(filePath, infoHash, startByte, endByte, p
 
     while (!closed && Date.now() < deadline) {
       const states = await qbt.getPieceStates(infoHash);
+
+      if (Array.isArray(states) && states.length > 0 && globalPiece >= states.length) {
+        // The computed index is past the end of the torrent, which means the piece size we were
+        // given does not match reality. Waiting cannot fix that — fail loudly.
+        throw new Error(
+          `Computed piece ${globalPiece} exceeds the torrent's ${states.length} pieces — ` +
+          `the piece size used for mapping is wrong.`
+        );
+      }
+
       if (Array.isArray(states) && states.length > globalPiece && states[globalPiece] === 2) return true;
 
       if (!nudged) {
@@ -1510,14 +1534,55 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
 
   const matchedHash = (torrentInfo.hash || infoHash || '').toLowerCase();
   reserveTorrent(matchedHash);
-  const pieceSize = torrentInfo.piece_size || 2 * 1024 * 1024;
+
+  // The piece size MUST come from /torrents/properties. It is not a field of /torrents/info, so
+  // `torrentInfo.piece_size` was always undefined and silently fell back to a guessed 2 MB. When
+  // the real piece size is smaller, floor(offset / 2MB) resolves to a piece index far LOWER than
+  // the true one — an already-downloaded piece — so the reader ran ahead of the download frontier
+  // and served sparse zeros. FFmpeg then reported "0x00 ... invalid as first byte of an EBML
+  // number" and nothing played until the torrent hit 100%, at which point no zeros remained.
+  //
+  // Guessing is not acceptable here: a wrong piece size silently corrupts the stream. If it cannot
+  // be established, refuse to serve.
+  const props = await qbt.getProperties(matchedHash);
+  const totalSize = torrentInfo.total_size || torrentInfo.size || 0;
+  const piecesNum = props && props.pieces_num > 0 ? props.pieces_num : 0;
+
+  let pieceSize = props && props.piece_size > 0 ? props.piece_size : 0;
+
+  if (!pieceSize && piecesNum && totalSize) {
+    // Derive it, rounding up to a power of two (libtorrent always uses one).
+    pieceSize = 2 ** Math.ceil(Math.log2(totalSize / piecesNum));
+    console.warn(`[Piece Size] properties.piece_size missing — derived ${pieceSize} from pieces_num=${piecesNum}`);
+  }
+
+  if (!pieceSize) {
+    return {
+      ok: false,
+      status: 503,
+      message:
+        'qBittorrent did not report a piece size for this torrent (/torrents/properties returned ' +
+        'nothing usable). Refusing to stream rather than guess, which would serve corrupt data.'
+    };
+  }
+
+  if (piecesNum && totalSize) {
+    const expected = Math.ceil(totalSize / pieceSize);
+    if (expected !== piecesNum) {
+      console.warn(
+        `[Piece Size] Inconsistent: piece_size=${pieceSize} and total_size=${totalSize} imply ` +
+        `${expected} pieces, but qBittorrent reports ${piecesNum}. Piece gating may be unreliable.`
+      );
+    }
+  }
 
   const mapping = computeFileMapping(files, chosen, pieceSize);
 
   console.log(
     `[Media Select] "${torrentInfo.name}" -> ${path.basename(chosen.name)} ` +
     `(${(chosen.size / 1048576).toFixed(1)} MB, file #${chosen.index}, ` +
-    `offset ${mapping.fileOffsetInTorrent}${mapping.exact ? '' : ' approx'}) at ${targetFilePath}`
+    `offset ${mapping.fileOffsetInTorrent}${mapping.exact ? '' : ' approx'}, ` +
+    `pieceSize ${(pieceSize / 1024).toFixed(0)}KB x ${piecesNum || '?'}) at ${targetFilePath}`
   );
 
   // Spend swarm bandwidth and disk only on the file we are actually serving.

@@ -13,6 +13,10 @@ const PIECE_SIZE = 1048576;
 const PAD_SIZE = 3000000;
 const MOVIE_SIZE = 12000000;
 const TOTAL_PIECES = Math.ceil((PAD_SIZE + MOVIE_SIZE) / PIECE_SIZE);
+// What /torrents/properties reports. Real qBittorrent exposes piece_size ONLY here.
+const TOTAL_PIECES_FOR_MOCK = TOTAL_PIECES;
+const TOTAL_SIZE_FOR_MOCK = PAD_SIZE + MOVIE_SIZE;
+
 const HASH = 'b'.repeat(40);
 const MOCK_QBT_PORT = 18098;
 const BRIDGE_PORT = 8973;
@@ -29,13 +33,17 @@ const mockQbt = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const send = (o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
 
+  // piece_size and pieces_num live ONLY here — /torrents/info does not carry them.
+  if (url.pathname === '/api/v2/torrents/properties') {
+    return send({ piece_size: PIECE_SIZE, pieces_num: TOTAL_PIECES_FOR_MOCK, total_size: TOTAL_SIZE_FOR_MOCK });
+  }
   if (url.pathname === '/api/v2/auth/login') {
     res.writeHead(200, { 'Set-Cookie': 'SID=t; path=/' }); return res.end('Ok.');
   }
   if (url.pathname === '/api/v2/torrents/info') {
     return send([{
       hash: HASH, name: 'MockRelease', save_path: root, content_path: releaseDir,
-      piece_size: PIECE_SIZE, added_on: Math.floor(Date.now() / 1000) - 3600,
+      added_on: Math.floor(Date.now() / 1000) - 3600,
       magnet_uri: `magnet:?xt=urn:btih:${HASH}`
     }]);
   }
