@@ -39,7 +39,11 @@ const check = (name, ok, detail = '') => {
   if (!ok) failures++;
 };
 
-const calls = { deleted: [], started: [] };
+const calls = { deleted: [], started: [], toggledSeq: [], toggledFLP: [] };
+// Both pre-existing torrents are NOT in sequential mode, exactly like a torrent qBittorrent
+// already had before the bridge ever saw it.
+let seqDl = false;
+let flPiecePrio = false;
 // The paused torrent only materialises its file once it has been resumed.
 let pausedState = 'stoppedDL';
 let pausedFileWritten = false;
@@ -59,6 +63,7 @@ const torrents = () => [
     // Added two hours ago: far older than IDLE_TTL.
     added_on: Math.floor(Date.now() / 1000) - 7200,
     state: 'stalledUP', progress: 1, num_seeds: 3, num_leechs: 1, dlspeed: 0,
+    seq_dl: seqDl, f_l_piece_prio: flPiecePrio,
     magnet_uri: `magnet:?xt=urn:btih:${OLD_HASH}`
   },
   {
@@ -66,6 +71,7 @@ const torrents = () => [
     content_path: path.join(root, 'Paused.Release'),
     added_on: Math.floor(Date.now() / 1000) - 7200,
     state: pausedState, progress: 0.1, num_seeds: 5, num_leechs: 2, dlspeed: 0,
+    seq_dl: seqDl, f_l_piece_prio: flPiecePrio,
     magnet_uri: `magnet:?xt=urn:btih:${PAUSED_HASH}`
   }
 ];
@@ -94,6 +100,14 @@ const mockQbt = http.createServer((req, res) => {
   req.on('end', () => {
     if (url.pathname === '/api/v2/torrents/delete') {
       calls.deleted.push(body);
+    }
+    if (url.pathname === '/api/v2/torrents/toggleSequentialDownload') {
+      calls.toggledSeq.push(body);
+      seqDl = !seqDl;
+    }
+    if (url.pathname === '/api/v2/torrents/toggleFirstLastPiecePrio') {
+      calls.toggledFLP.push(body);
+      flPiecePrio = !flPiecePrio;
     }
     if (url.pathname === '/api/v2/torrents/start' || url.pathname === '/api/v2/torrents/resume') {
       calls.started.push(body);
@@ -159,6 +173,22 @@ check('resume was actually issued', calls.started.some(b => b.includes(PAUSED_HA
 check('logs why it resumed', /was stoppedDL — resuming it/.test(log),
   (log.match(/\[Resolve\][^\n]*/g) || []).join(' | ').slice(0, 200));
 check('resolves the file once written', body.fileName === 'Paused.Release.mp4', body.fileName);
+
+// ---- 3. Sequential mode must be forced onto pre-existing torrents ----------
+console.log('\n--- Sequential download must be enforced, not assumed ---');
+// torrents/add sets sequentialDownload, but add is a no-op for a torrent qBittorrent already has.
+// Without an explicit toggle those torrents download rarest-first, so the piece-aware reader waits
+// on early pieces that never arrive in order — "Piece 1 not verified" at 27% downloaded.
+check('sequential download is toggled on for a pre-existing torrent',
+  calls.toggledSeq.length >= 1, `${calls.toggledSeq.length} toggle(s)`);
+check('first/last piece priority is toggled on too',
+  calls.toggledFLP.length >= 1, `${calls.toggledFLP.length} toggle(s)`);
+check('it ends up ENABLED, not toggled back off', seqDl === true && flPiecePrio === true,
+  `seq_dl=${seqDl} f_l_piece_prio=${flPiecePrio}`);
+// The endpoints are toggles: firing them twice would switch sequential mode back OFF.
+check('never toggled more than once per torrent', calls.toggledSeq.length === 1,
+  `${calls.toggledSeq.length} toggle(s) — repeats would disable it again`);
+check('logs that it enabled sequential mode', /\[Sequential\] Enabled sequential download/.test(log));
 
 bridge.kill('SIGKILL');
 if (typeof mockQbt.closeAllConnections === 'function') mockQbt.closeAllConnections();

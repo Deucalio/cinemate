@@ -109,6 +109,8 @@ class QBittorrentClient {
     this._pieceCache = new Map();
     // one-shot diagnostics so unsupported endpoints are reported once, not on every read
     this._warned = new Set();
+    // hashes already switched to sequential mode (the qBt endpoints are toggles, not setters)
+    this._sequentialEnsured = new Set();
   }
 
   warnOnce(key, message) {
@@ -227,6 +229,48 @@ class QBittorrentClient {
     } catch {}
   }
 
+  /**
+   * Guarantees sequential download and first/last piece priority are ON for a torrent.
+   *
+   * These are set in torrents/add — but add is a NO-OP for a torrent qBittorrent already has, so
+   * any pre-existing torrent kept downloading rarest-first. The piece-aware reader then waited on
+   * early pieces that arrive in arbitrary order: "Piece 1 was not verified" while the torrent sat
+   * at 27%. Playback only worked once the download hit 100%, when order stopped mattering.
+   *
+   * Both endpoints are TOGGLES, not setters, so the current state must be read first. `seq_dl` and
+   * `f_l_piece_prio` come from torrents/info. Guarded per hash so concurrent range requests cannot
+   * toggle it twice and turn it back off.
+   */
+  async ensureSequentialDownload(torrentInfo) {
+    const hash = String(torrentInfo.hash || '').toLowerCase();
+    if (!hash || this._sequentialEnsured.has(hash)) return;
+    this._sequentialEnsured.add(hash);
+
+    const toggle = async (action) => {
+      const body = new URLSearchParams();
+      body.append('hashes', hash);
+      await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString()
+      });
+    };
+
+    try {
+      if (!torrentInfo.seq_dl) {
+        await toggle('toggleSequentialDownload');
+        console.log(`[Sequential] Enabled sequential download for "${torrentInfo.name}"`);
+      }
+      if (!torrentInfo.f_l_piece_prio) {
+        await toggle('toggleFirstLastPiecePrio');
+        console.log(`[Sequential] Enabled first/last piece priority for "${torrentInfo.name}"`);
+      }
+    } catch (err) {
+      this._sequentialEnsured.delete(hash);
+      console.warn('[Sequential] Could not set download order:', err.message);
+    }
+  }
+
   async getAllTorrents() {
     try {
       const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/info`);
@@ -337,8 +381,11 @@ class QBittorrentClient {
     return this._transitionTorrents('start', 'resume', hashes);
   }
 
-  async deleteTorrent(hash, deleteFiles = true) {
+  async deleteTorrent(hash, deleteFiles = true, reason = 'unspecified') {
     if (!hash) return false;
+    // Every deletion is logged with its caller. Torrents were vanishing mid-test with no record of
+    // what removed them; this makes it unambiguous whether the bridge did it.
+    console.log(`[Delete] Removing torrent ${hash} (deleteFiles=${deleteFiles}) — reason: ${reason}`);
     try {
       const formData = new URLSearchParams();
       formData.append('hashes', hash);
@@ -1067,6 +1114,11 @@ const torrentRegistry = new Map();
 // IP Rate Limiting Map: ip -> { searchCount, searchReset, streamCount, streamReset }
 const rateLimitMap = new Map();
 
+// sessionId -> the FFmpeg process currently serving it. A <video> element opens more than one
+// connection per source (metadata probe, then playback), and each was spawning its own transcode;
+// two FFmpeg processes then competed for the same not-yet-downloaded pieces.
+const ffmpegBySession = new Map();
+
 // Sessions that have already logged their [Stream Start] line, so it appears once per playback
 // rather than once per range request.
 const loggedStreamStarts = new Set();
@@ -1332,7 +1384,10 @@ setInterval(async () => {
           `(${isEmergency ? `disk pressure ${diskStats.usedPct}%` : `idle ${IDLE_TTL_MINUTES}m`})`
         );
         if (entry.cleanTimer) clearTimeout(entry.cleanTimer);
-        await qbt.deleteTorrent(t.hash, true).catch(() => {});
+        await qbt.deleteTorrent(
+          t.hash, true,
+          isEmergency ? `Auto-GC disk pressure ${diskStats.usedPct}%` : `Auto-GC idle ${IDLE_TTL_MINUTES}m`
+        ).catch(() => {});
         purgeTorrentCaches(hash);
       }
     }
@@ -1467,6 +1522,9 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
       // returns, and /api/stream/prepare never did at all — so a torrent the Bandwidth Saver or a
       // previous session had paused could never be restarted, and every retry timed out the same way.
       // torrents/add does not resume an existing paused torrent either.
+      // Must happen for pre-existing torrents too, not just ones we just added.
+      await qbt.ensureSequentialDownload(torrentInfo);
+
       if (!resumeAttempted && (/^(paused|stopped)/i.test(state) || state === 'queuedDL')) {
         resumeAttempted = true;
         console.log(`[Resolve] "${torrentInfo.name}" was ${state} — resuming it.`);
@@ -1917,9 +1975,17 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
       `audio=${auto.copyAudio ? 'copy' : 'aac-stereo'} (${auto.reason})`
     );
 
+    // Supersede any transcode already running for this session.
+    const previous = ffmpegBySession.get(sessionId);
+    if (previous) {
+      try { previous.kill('SIGKILL'); } catch {}
+      ffmpegBySession.delete(sessionId);
+    }
+
     let ffmpeg;
     try {
       ffmpeg = spawn(FFMPEG_BIN, ffmpegArgs);
+      ffmpegBySession.set(sessionId, ffmpeg);
     } catch (err) {
       release();
       return res.status(500).json({ error: `Could not start FFmpeg ("${FFMPEG_BIN}"): ${err.message}` });
@@ -1961,6 +2027,7 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
       if (cleanedUp) return;
       cleanedUp = true;
       try { ffmpeg.kill('SIGKILL'); } catch {}
+      if (ffmpegBySession.get(sessionId) === ffmpeg) ffmpegBySession.delete(sessionId);
       release();
     };
 
@@ -2191,7 +2258,7 @@ app.post('/api/cleanup', async (req, res) => {
       const hash = t.hash.toLowerCase();
       const entry = torrentRegistry.get(hash);
       if (!entry || entry.refCount === 0) {
-        await qbt.deleteTorrent(t.hash, true);
+        await qbt.deleteTorrent(t.hash, true, 'manual /api/cleanup');
         torrentRegistry.delete(hash);
         cleaned++;
       }
