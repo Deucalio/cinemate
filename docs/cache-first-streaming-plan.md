@@ -233,18 +233,42 @@ cannot pre-transcode a file you do not yet have.
 
 ## 3. Open questions
 
-### Torrents disappearing mid-download — UNRESOLVED
+### Torrents disappearing mid-download — RESOLVED (2026-08-25)
 
-Reported: seeking (and sometimes idle playback) removes the file and restarts the download. Not yet
-attributed. Cache-first *masks* this (far fewer re-resolutions) but does not fix a genuine cause.
+**Cause: a Sonarr/Radarr stack sharing this qBittorrent instance.**
 
-`deleteTorrent()` now logs every call with its reason (`a955c7e`), which makes this decidable:
+Established by elimination, in order:
 
-- A `[Delete] … reason: …` line appears → the bridge did it; fix that specific path.
-- The torrent vanishes with **no** `[Delete]` line → the bridge is not responsible; investigate
-  qBittorrent's own settings and log.
+1. qBittorrent's own log said `'<torrent>' was removed from the transfer list and hard disk` — its
+   exact wording for an API delete with `deleteFiles=true`. So nothing was lost or reset; something
+   *asked* for the deletion.
+2. Zero `error`/`fail` lines in that log, so it was not a failed move or a disk problem.
+3. The bridge logged nothing at those timestamps. Every deletion path logs `[Delete] … reason: …`
+   (added in `a955c7e`) precisely so this question could be answered rather than argued.
+4. No stray bridge process — the two unexplained `node index.js` processes on the host resolved to
+   unrelated backends.
+5. `[AutoRun]` was empty, ruling out a completion script.
+6. `stream-download.service` carries `Documentation=file:///opt/stream/SONARR-SETUP.md`, and the
+   download directory contained `Lanterns - S01E01 - Pilot.mkv` and `Stand by Me (1986)/` —
+   Sonarr and Radarr naming conventions, not release names.
 
-**Do not design around this until it is attributed.**
+\*arr **Completed Download Handling** imports a finished download into the library and then removes
+the torrent and its data from the client. That fires the moment a download completes, which is
+exactly when playback was starting.
+
+**Fix:** torrents are now added under their own qBittorrent category (`QBT_CATEGORY`, default
+`cinemate`). \*arr tools only manage their configured category. The bridge also warns once when it
+finds a torrent under a foreign category, since that means something else may be managing it.
+
+**Better long-term fix:** give the bridge its own qBittorrent instance. Sharing one means another
+tool's retention policy can delete files mid-stream, our `filePrio` and sequential toggles alter its
+torrents, and `MAX_ACTIVE_TORRENTS` counts torrents we do not own. See
+[scaling-roadmap.md](./scaling-roadmap.md).
+
+**Lesson worth keeping:** four wrong theories preceded the right one (ratio-limit removal, a failed
+move-on-completion, our own `filePrio` calls, a stale bridge process). What settled it was making
+the bridge log every deletion with a reason, then reading the *other* system's log. Neither of those
+is guesswork.
 
 ### Verify the deployed revision
 

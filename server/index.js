@@ -32,6 +32,18 @@ const QBT_URL = process.env.QBT_URL || 'http://127.0.0.1:18080';
 const QBT_USER = process.env.QBT_USER || 'admin';
 const QBT_PASS = process.env.QBT_PASS || 'adminadmin';
 
+// Torrents are added under their own qBittorrent category.
+//
+// This host's qBittorrent is shared with a Sonarr/Radarr stack, whose "Completed Download Handling"
+// imports a finished download and then REMOVES the torrent and its data from the client. Anything
+// added without a category can fall into whatever those tools monitor, which is how completed
+// torrents were vanishing seconds after playback started — qBittorrent logged
+// "removed from the transfer list and hard disk" while this bridge logged nothing at all.
+//
+// *arr tools only manage their own category, so labelling ours keeps the two from fighting.
+// Set QBT_CATEGORY='' to disable if the bridge ever gets a qBittorrent instance to itself.
+const QBT_CATEGORY = process.env.QBT_CATEGORY !== undefined ? process.env.QBT_CATEGORY : 'cinemate';
+
 const PROWLARR_URL = process.env.PROWLARR_URL || 'http://127.0.0.1:9696';
 const PROWLARR_KEY = process.env.PROWLARR_KEY || '5a197b3359f247e8a69c7866650058e4';
 
@@ -190,6 +202,8 @@ class QBittorrentClient {
       formData.append('urls', enrichMagnetWithTrackers(magnet));
       formData.append('sequentialDownload', 'true');
       formData.append('firstLastPiecePrio', 'true');
+      // Keeps our torrents out of any *arr stack sharing this qBittorrent instance.
+      if (QBT_CATEGORY) formData.append('category', QBT_CATEGORY);
       const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/add`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1689,6 +1703,17 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
       // Must happen for pre-existing torrents too, not just ones we just added.
       await qbt.ensureSequentialDownload(torrentInfo);
 
+      // A torrent under a different category is very likely managed by something else on this
+      // host (Sonarr/Radarr import-then-delete, for example). Say so once rather than letting the
+      // files disappear mid-playback with no explanation.
+      if (QBT_CATEGORY && torrentInfo.category && torrentInfo.category !== QBT_CATEGORY) {
+        qbt.warnOnce(
+          `category:${torrentInfo.category}`,
+          `[Category] "${torrentInfo.name}" is in qBittorrent category "${torrentInfo.category}", ` +
+          `not "${QBT_CATEGORY}". Another tool may be managing it and can delete it on completion.`
+        );
+      }
+
       // A torrent that was complete and is now not complete has been reset by something outside
       // this process (qBittorrent recheck, external removal, storage moved). Say so loudly —
       // silently re-downloading is what made this look like the bridge's doing.
@@ -2659,6 +2684,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   Engine:             qBittorrent C++ + Piece-Aware Streamer + FFmpeg AAC`);
   console.log(`📡 Port:               ${PORT}`);
   console.log(`📥 qBittorrent:        ${QBT_URL}`);
+  console.log(`🏷️ Torrent Category:   ${QBT_CATEGORY || '(none)'}`);
   console.log(`🔍 Prowlarr Proxy:     ${PROWLARR_URL}`);
   console.log(`🛡️ Rate Limiting:      Enabled`);
   console.log(`🧹 Auto-GC Idle TTL:   ${IDLE_TTL_MINUTES} minute(s)`);
