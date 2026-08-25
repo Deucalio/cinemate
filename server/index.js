@@ -64,6 +64,11 @@ const DISK_USAGE_OVERRIDE_PCT = process.env.DISK_USAGE_OVERRIDE_PCT
 // Derived representations (HLS segment sets) live OUTSIDE the torrent's download directory, so
 // qBittorrent never sees them, rechecks them, or moves them on completion.
 const HLS_DIR = process.env.HLS_DIR || '/var/lib/cinemate/hls';
+const HLS_SEGMENT_SECONDS = parseInt(process.env.HLS_SEGMENT_SECONDS || '4', 10);
+// Transcodes must never starve serving. Leave a couple of cores for everything else.
+const HLS_MAX_CONCURRENT = parseInt(
+  process.env.HLS_MAX_CONCURRENT || String(Math.max(1, os.cpus().length - 2)), 10);
+const HLS_MANIFEST_VERSION = 1;
 
 // Where LRU state survives restarts. Without this, every deploy resets the eviction order and a
 // rewatch after a restart re-downloads a file that is still sitting on disk.
@@ -76,7 +81,14 @@ const IDLE_TTL_MS = IDLE_TTL_MINUTES * 60 * 1000;
 // Piece-Aware Reader Tuning
 const PIECE_STATE_CACHE_MS = parseInt(process.env.PIECE_STATE_CACHE_MS || '500', 10);
 const PIECE_POLL_MS = parseInt(process.env.PIECE_POLL_MS || '250', 10);
-const PIECE_WAIT_TIMEOUT_MS = parseInt(process.env.PIECE_WAIT_TIMEOUT_MS || '120000', 10);
+// How long the reader tolerates a torrent making NO progress before failing a read.
+//
+// This is deliberately a STALL timeout, not a wall-clock one. A slow-but-advancing download must be
+// able to block indefinitely: with a wall-clock limit, a two-minute swarm stall would kill a
+// transcode halfway through a two-hour title. See docs/phase5-hls-plan.md §5.4.
+// PIECE_WAIT_TIMEOUT_MS is honoured as the previous name.
+const PIECE_STALL_TIMEOUT_MS = parseInt(
+  process.env.PIECE_STALL_TIMEOUT_MS || process.env.PIECE_WAIT_TIMEOUT_MS || '120000', 10);
 const READ_CHUNK_BYTES = parseInt(process.env.READ_CHUNK_BYTES || '262144', 10); // 256 KB
 
 // A browser opens and abandons many short-lived connections per video. Torrents must NOT be paused
@@ -804,10 +816,13 @@ function createPieceAwareTorrentStream(filePath, infoHash, startByte, endByte, p
   });
 
   async function waitForPiece(globalPiece) {
-    const deadline = Date.now() + PIECE_WAIT_TIMEOUT_MS;
+    // Deadline is reset every time the torrent verifies another piece, so only a genuinely STALLED
+    // torrent fails the read. A slow download blocks for as long as it keeps advancing.
+    let stallDeadline = Date.now() + PIECE_STALL_TIMEOUT_MS;
+    let lastVerifiedCount = -1;
     let nudged = false;
 
-    while (!closed && Date.now() < deadline) {
+    while (!closed) {
       const states = await qbt.getPieceStates(infoHash);
 
       if (Array.isArray(states) && states.length > 0 && globalPiece >= states.length) {
@@ -820,6 +835,17 @@ function createPieceAwareTorrentStream(filePath, infoHash, startByte, endByte, p
       }
 
       if (Array.isArray(states) && states.length > globalPiece && states[globalPiece] === 2) return true;
+
+      if (Array.isArray(states)) {
+        let verified = 0;
+        for (let i = 0; i < states.length; i++) if (states[i] === 2) verified++;
+        if (verified > lastVerifiedCount) {
+          lastVerifiedCount = verified;
+          stallDeadline = Date.now() + PIECE_STALL_TIMEOUT_MS;
+        }
+      }
+
+      if (Date.now() >= stallDeadline) return false;
 
       if (!nudged) {
         nudged = true;
@@ -856,7 +882,8 @@ function createPieceAwareTorrentStream(filePath, infoHash, startByte, endByte, p
           closed = true;
           closeFd();
           stream.destroy(new Error(
-            `Piece ${globalPiece} was not verified within ${PIECE_WAIT_TIMEOUT_MS}ms (swarm too slow or stalled)`
+            `Piece ${globalPiece} was not verified — the torrent made no progress for ` +
+            `${PIECE_STALL_TIMEOUT_MS}ms (swarm stalled)`
           ));
           return;
         }
@@ -1069,6 +1096,10 @@ function summarizeProbe(probe) {
     durationSec: Number.isFinite(rawDuration) ? rawDuration : 0,
     formatName: (probe.format && probe.format.format_name) || '',
     videoCodec: video ? video.codec_name : null,
+    // codec_name alone is not enough to decide playability: a High 10 / 4:2:2 release probes as
+    // "h264" and no browser can decode it. See docs/phase5-hls-plan.md §4.1.
+    videoProfile: video ? (video.profile || null) : null,
+    pixFmt: video ? (video.pix_fmt || null) : null,
     audioCodec: audio ? audio.codec_name : null,
     audioChannels: audio ? (audio.channels || 0) : 0
   };
@@ -1265,6 +1296,9 @@ function hasRunningRepresentation(entry) {
  * outlive their source.
  */
 function deleteRepresentations(hash, reason) {
+  // A running transcode holds the directory open and would keep writing into it.
+  stopHlsJob(hash, `representation deleted — ${reason}`);
+
   for (const kind of REPRESENTATION_KINDS) {
     const dir = representationDir(kind, hash);
     if (!fs.existsSync(dir)) continue;
@@ -1278,6 +1312,399 @@ function deleteRepresentations(hash, reason) {
     } catch (err) {
       console.warn(`[Cache] Could not remove ${kind} representation for ${hash}:`, err.message);
     }
+  }
+}
+
+// ----------------- HLS TRANSCODE MANAGER -----------------
+//
+// One FFmpeg per title, ever — not per viewer and not per seek. The expensive, stateful operation
+// moves out of the request layer and into the cache layer. See docs/phase5-hls-plan.md §2.
+//
+// hlsJobs tracks LIVE PROCESSES ONLY and is never authoritative. The filesystem is the source of
+// truth; a restart reconciles against it. This is the same lesson that made an in-memory-only
+// torrentRegistry wipe every torrent on restart.
+
+// infohash -> { proc, dir, startedAt, stderrTail[] }
+const hlsJobs = new Map();
+
+function hlsPlaylistPath(dir) { return path.join(dir, 'playlist.m3u8'); }
+function hlsManifestPath(dir) { return path.join(dir, 'manifest.json'); }
+
+/**
+ * Writes manifest.json atomically — temp file then rename — so a crash mid-write can never leave a
+ * half-parsed manifest that reconciliation would misread.
+ */
+function writeHlsManifest(dir, manifest) {
+  const target = hlsManifestPath(dir);
+  const tmp = `${target}.tmp`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2));
+  fs.renameSync(tmp, target);
+}
+
+function readHlsManifest(dir) {
+  try {
+    return JSON.parse(fs.readFileSync(hlsManifestPath(dir), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parses an HLS playlist into { transcodedDurationSec, segments[], hasEndList }.
+ *
+ * Duration comes from summing EXTINF rather than multiplying segment count by the target duration:
+ * the final segment is short and keyframe alignment means segments are rarely exactly hls_time.
+ * The player needs this figure anyway to draw the seek boundary, so it is one source of truth
+ * rather than two. See docs/phase5-hls-plan.md §4.7.
+ */
+function parseHlsPlaylist(playlistPath) {
+  const result = { transcodedDurationSec: 0, segments: [], hasEndList: false };
+
+  let text;
+  try {
+    text = fs.readFileSync(playlistPath, 'utf8');
+  } catch {
+    return result;
+  }
+
+  const lines = text.split(/\r?\n/);
+  let pendingDuration = null;
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    if (line === '#EXT-X-ENDLIST') {
+      result.hasEndList = true;
+      continue;
+    }
+
+    const extinf = /^#EXTINF:([0-9.]+)/.exec(line);
+    if (extinf) {
+      pendingDuration = parseFloat(extinf[1]);
+      continue;
+    }
+
+    if (line.startsWith('#')) continue;
+
+    // A media line. It only counts once its EXTINF has been seen.
+    if (pendingDuration !== null) {
+      result.segments.push({ name: line, durationSec: pendingDuration });
+      result.transcodedDurationSec += pendingDuration;
+      pendingDuration = null;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Decides what to do with an HLS directory found on disk. Every branch of
+ * docs/phase5-hls-plan.md §5.2.
+ *
+ * Returns { state: 'complete' | 'discard', reason }.
+ *
+ * Note there is no 'resume': v1 discards and rebuilds an interrupted job. Resuming needs -ss plus
+ * hls_start_number plus append_list and risks timestamp discontinuities, which surface as
+ * intermittent playback glitches — the hardest possible thing to debug. A rebuild costs minutes of
+ * CPU. See §5.3.
+ */
+function validateHlsDirectory(dir, source) {
+  // FFmpeg writes segNNNNN.ts.tmp and renames, so a leftover .tmp is a torn write and nothing more.
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (f.endsWith('.tmp')) {
+        try { fs.rmSync(path.join(dir, f), { force: true }); } catch {}
+      }
+    }
+  } catch {}
+
+  const manifest = readHlsManifest(dir);
+  if (!manifest) return { state: 'discard', reason: 'missing or unreadable manifest.json' };
+  if (manifest.version !== HLS_MANIFEST_VERSION) {
+    return { state: 'discard', reason: `manifest version ${manifest.version} != ${HLS_MANIFEST_VERSION}` };
+  }
+
+  // A representation is only valid for the exact source it was derived from.
+  if (source) {
+    const m = manifest.source || {};
+    if (m.path !== source.path) return { state: 'discard', reason: 'source path changed' };
+    if (source.sizeBytes && m.sizeBytes !== source.sizeBytes) {
+      return { state: 'discard', reason: 'source size changed' };
+    }
+    if (source.mtimeMs && m.mtimeMs !== source.mtimeMs) {
+      return { state: 'discard', reason: 'source mtime changed' };
+    }
+  }
+
+  const playlist = parseHlsPlaylist(hlsPlaylistPath(dir));
+  if (playlist.segments.length === 0) {
+    return { state: 'discard', reason: 'playlist has no segments' };
+  }
+
+  // Every segment the playlist names must actually exist. Atomic renames make this rare, but a
+  // playlist referencing a file that is not there would break playback mid-stream.
+  for (const seg of playlist.segments) {
+    if (!fs.existsSync(path.join(dir, seg.name))) {
+      return { state: 'discard', reason: `playlist references missing segment ${seg.name}` };
+    }
+  }
+
+  if (!playlist.hasEndList) {
+    return { state: 'discard', reason: 'interrupted job (no EXT-X-ENDLIST) — rebuilding' };
+  }
+
+  return { state: 'complete', reason: 'validated', playlist, manifest };
+}
+
+/**
+ * Builds the FFmpeg argument list. Separated out so it can be asserted without spawning anything —
+ * the dev machine has no FFmpeg.
+ */
+function buildHlsFfmpegArgs({ inputUrl, dir, copyVideo, copyAudio, segmentSeconds = HLS_SEGMENT_SECONDS }) {
+  const args = ['-hide_banner', '-loglevel', 'error'];
+
+  // Reading over loopback HTTP so FFmpeg can seek to the container header, and so the piece-aware
+  // reader can block while the download catches up.
+  args.push('-seekable', '1', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '10');
+  args.push('-i', inputUrl);
+
+  args.push('-map', '0:v:0?', '-map', '0:a:0?');
+
+  if (copyVideo) {
+    args.push('-c:v', 'copy');
+  } else {
+    args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p');
+  }
+
+  if (copyAudio) {
+    args.push('-c:a', 'copy');
+  } else {
+    args.push('-c:a', 'aac', '-b:a', '192k', '-ac', '2');
+  }
+
+  args.push(
+    '-max_muxing_queue_size', '1024',
+    '-f', 'hls',
+    '-hls_time', String(segmentSeconds),
+    // The playlist grows and never drops entries; ENDLIST is written on completion, at which point
+    // hls.js treats it as ordinary VOD.
+    '-hls_playlist_type', 'event',
+    '-hls_list_size', '0',
+    // temp_file is what makes "a segment named in the playlist is complete on disk" true rather
+    // than merely likely.
+    '-hls_flags', 'temp_file+independent_segments',
+    '-hls_segment_filename', path.join(dir, 'seg%05d.ts'),
+    hlsPlaylistPath(dir)
+  );
+
+  return args;
+}
+
+/**
+ * Current state of a title's HLS representation, for the API and the client.
+ */
+function hlsStatus(hash, durationSec = 0) {
+  const key = String(hash || '').toLowerCase();
+  const dir = representationDir('hls', key);
+  const job = hlsJobs.get(key);
+
+  const playlist = parseHlsPlaylist(hlsPlaylistPath(dir));
+  const transcodedDurationSec = playlist.transcodedDurationSec;
+  const total = durationSec || (readHlsManifest(dir)?.media?.durationSec || 0);
+
+  let state = 'absent';
+  if (playlist.hasEndList) state = 'complete';
+  else if (job) state = job.failed ? 'failed' : 'running';
+  else if (playlist.segments.length > 0) state = 'interrupted';
+
+  return {
+    state,
+    dir,
+    segmentsReady: playlist.segments.length,
+    transcodedDurationSec: Math.round(transcodedDurationSec * 10) / 10,
+    durationSec: Math.round(total),
+    transcodeProgress: total > 0 ? Math.min(1, transcodedDurationSec / total) : 0,
+    error: job && job.error ? job.error : null
+  };
+}
+
+/**
+ * Starts (or joins) the transcode for a title.
+ *
+ * Idempotent by design: a second viewer joins the running job rather than starting another. This is
+ * what retires the per-session FFmpeg supersede logic.
+ */
+function startHlsJob({ hash, name, sourcePath, sourceStat, summary, inputUrl, copyVideo, copyAudio }) {
+  const key = String(hash || '').toLowerCase();
+
+  const existing = hlsJobs.get(key);
+  if (existing) return { joined: true, state: 'running' };
+
+  if (hlsJobs.size >= HLS_MAX_CONCURRENT) {
+    return { joined: false, state: 'queued', reason: `${hlsJobs.size} transcodes already running` };
+  }
+
+  const dir = representationDir('hls', key);
+
+  // Always start from a clean directory — v1 rebuilds rather than resumes.
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  fs.mkdirSync(dir, { recursive: true });
+
+  const args = buildHlsFfmpegArgs({ inputUrl, dir, copyVideo, copyAudio });
+
+  const manifest = {
+    version: HLS_MANIFEST_VERSION,
+    infohash: key,
+    name,
+    source: {
+      path: sourcePath,
+      sizeBytes: sourceStat ? sourceStat.size : 0,
+      mtimeMs: sourceStat ? Math.round(sourceStat.mtimeMs) : 0
+    },
+    media: {
+      durationSec: summary ? summary.durationSec : 0,
+      videoCodec: summary ? summary.videoCodec : null,
+      videoProfile: summary ? summary.videoProfile : null,
+      pixFmt: summary ? summary.pixFmt : null,
+      audioCodec: summary ? summary.audioCodec : null,
+      audioChannels: summary ? summary.audioChannels : 0
+    },
+    hls: {
+      segmentDurationSec: HLS_SEGMENT_SECONDS,
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+      // Recorded so a representation built under parameters we no longer use is obvious, and so a
+      // bad transcode can be reproduced exactly.
+      ffmpegArgs: args
+    }
+  };
+
+  // Written BEFORE spawning: a directory with segments but no manifest is unidentifiable, and
+  // reconciliation would discard it.
+  writeHlsManifest(dir, manifest);
+
+  let proc;
+  try {
+    proc = spawn(FFMPEG_BIN, args);
+  } catch (err) {
+    console.warn(`[HLS] Could not start FFmpeg for "${name}": ${err.message}`);
+    return { joined: false, state: 'failed', reason: err.message };
+  }
+
+  const job = { proc, dir, name, startedAt: Date.now(), stderrTail: [], error: null, failed: false };
+  hlsJobs.set(key, job);
+
+  console.log(
+    `[HLS] Transcoding "${name}" → ${dir} ` +
+    `(video=${copyVideo ? 'copy' : 'libx264'} audio=${copyAudio ? 'copy' : 'aac-stereo'}, ` +
+    `${hlsJobs.size}/${HLS_MAX_CONCURRENT} slots)`
+  );
+
+  proc.stderr.on('data', (d) => {
+    const msg = d.toString().trim();
+    if (!msg) return;
+    job.stderrTail.push(msg);
+    if (job.stderrTail.length > 20) job.stderrTail.shift();
+    console.warn('[HLS ffmpeg]', msg);
+  });
+
+  proc.on('error', (err) => {
+    job.failed = true;
+    job.error = err.message;
+    console.warn(`[HLS] FFmpeg error for "${name}":`, err.message);
+  });
+
+  proc.on('close', (code) => {
+    hlsJobs.delete(key);
+
+    if (code === 0) {
+      const current = readHlsManifest(dir) || manifest;
+      current.hls.completedAt = new Date().toISOString();
+      try { writeHlsManifest(dir, current); } catch {}
+
+      const done = parseHlsPlaylist(hlsPlaylistPath(dir));
+      console.log(
+        `[HLS] Completed "${name}" — ${done.segments.length} segments, ` +
+        `${Math.round(done.transcodedDurationSec)}s, ` +
+        `${(directorySizeBytes(dir) / 1048576).toFixed(1)} MB`
+      );
+      return;
+    }
+
+    job.failed = true;
+    job.error = job.stderrTail.slice(-3).join(' | ') || `ffmpeg exited with code ${code}`;
+    console.warn(`[HLS] FAILED "${name}" (exit ${code}): ${job.error}`);
+    // The partial directory is left in place; reconciliation discards it on the next sweep or boot,
+    // and the error is retained for the client until then.
+  });
+
+  return { joined: false, state: 'running' };
+}
+
+function stopHlsJob(hash, reason) {
+  const key = String(hash || '').toLowerCase();
+  const job = hlsJobs.get(key);
+  if (!job) return false;
+  console.log(`[HLS] Stopping transcode for "${job.name}" — ${reason}`);
+  try { job.proc.kill('SIGKILL'); } catch {}
+  hlsJobs.delete(key);
+  return true;
+}
+
+/**
+ * Boot reconciliation. The filesystem is authoritative, so every representation directory is
+ * validated against its manifest and its source before anything trusts it.
+ */
+function reconcileHlsAtBoot() {
+  if (!fs.existsSync(HLS_DIR)) return;
+
+  let dirents;
+  try {
+    dirents = fs.readdirSync(HLS_DIR, { withFileTypes: true });
+  } catch (err) {
+    console.warn('[HLS] Could not scan representation directory:', err.message);
+    return;
+  }
+
+  let complete = 0;
+  let discarded = 0;
+
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory()) continue;
+    const dir = path.join(HLS_DIR, dirent.name);
+
+    const manifest = readHlsManifest(dir);
+    const source = manifest && manifest.source ? manifest.source : null;
+
+    // Re-stat the source so a file that changed underneath a representation is caught.
+    let liveSource = null;
+    if (source && source.path) {
+      try {
+        const st = fs.statSync(source.path);
+        liveSource = { path: source.path, sizeBytes: st.size, mtimeMs: Math.round(st.mtimeMs) };
+      } catch {
+        liveSource = null;   // source gone
+      }
+    }
+
+    const verdict = source && !liveSource
+      ? { state: 'discard', reason: 'source file no longer exists' }
+      : validateHlsDirectory(dir, liveSource);
+
+    if (verdict.state === 'complete') {
+      complete++;
+      continue;
+    }
+
+    console.log(`[HLS] Discarding ${dirent.name}: ${verdict.reason}`);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    discarded++;
+  }
+
+  if (complete || discarded) {
+    console.log(`[HLS] Reconciled representations: ${complete} usable, ${discarded} discarded`);
   }
 }
 
@@ -2992,6 +3419,7 @@ app.post('/api/cleanup', async (req, res) => {
 // Start Server
 app.listen(PORT, '0.0.0.0', () => {
   verifyToolchain();
+  reconcileHlsAtBoot();
   console.log(`====================================================`);
   console.log(`🎬 CineStream Piece-Aware Progressive Streaming Bridge`);
   console.log(`   Engine:             qBittorrent C++ + Piece-Aware Streamer + FFmpeg AAC`);
@@ -3006,6 +3434,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📦 Delivery Mode:      ${REQUIRE_COMPLETE ? 'cache-first (wait for full download)' : 'progressive piece-aware'}`);
   console.log(`♻️ Eviction:           LRU by last playback · evict >${DISK_AGGRESSIVE_PCT}% down to ${DISK_TARGET_PCT}% · halt >${DISK_EMERGENCY_PCT}%`);
   console.log(`🎞️ Representations:    ${HLS_DIR} · source policy: ${HLS_SOURCE_POLICY}`);
+  console.log(`⚙️ HLS Transcode:      ${HLS_SEGMENT_SECONDS}s segments · max ${HLS_MAX_CONCURRENT} concurrent`);
   console.log(`🩺 Health check:       http://localhost:${PORT}/health`);
   console.log(`====================================================`);
 });

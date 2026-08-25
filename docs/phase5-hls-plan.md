@@ -343,16 +343,35 @@ Covered by `server/test/cache-representations.test.mjs` (15 assertions), includi
 motivates §5.5: under disk pressure, an idle title is evicted with its representation while a
 **transcoding** title is spared.
 
-### 6.2 Transcode manager
+### 6.2 Transcode manager — ✅ DONE
 
-- [ ] `hlsJobs` registry: `infohash -> { state, dir, proc, startedAt, error }` — **live processes
-      only**, never authoritative.
-- [ ] `startHlsJob(entry, summary)` — FFmpeg reading the loopback piece-aware URL.
-- [ ] Idempotent: a second caller joins the running job.
-- [ ] Write `manifest.json` before spawning; stamp `completedAt` on clean exit.
-- [ ] Non-zero exit → `failed`, retaining the last stderr lines for the client.
-- [ ] `HLS_MAX_CONCURRENT` (default `cores - 2`) so transcodes never starve serving.
-- [ ] Boot reconciliation per §5.2.
+- [x] `hlsJobs` registry — **live processes only**, never authoritative.
+- [x] `startHlsJob()` — FFmpeg reading the loopback piece-aware URL.
+- [x] Idempotent: a second caller joins the running job.
+- [x] `manifest.json` written **atomically** before spawning; `completedAt` stamped on clean exit.
+- [x] Non-zero exit → `failed`, retaining the last stderr lines.
+- [x] `HLS_MAX_CONCURRENT` (default `cores - 2`); at capacity a request reports `queued`.
+- [x] Boot reconciliation per §5.2, every branch.
+- [x] `buildHlsFfmpegArgs()` split out so it is assertable without spawning.
+- [x] `parseHlsPlaylist()` — `EXTINF` sum, segment list, `ENDLIST` detection.
+- [x] `hlsStatus()` — state, `segmentsReady`, `transcodedDurationSec`, `transcodeProgress`.
+- [x] Eviction stops a running job before deleting its directory.
+- [x] **§5.4 landed here too**: piece waiting is now a STALL timeout, not wall-clock.
+
+**Notes from implementation:**
+
+- `PIECE_WAIT_TIMEOUT_MS` became `PIECE_STALL_TIMEOUT_MS` (old name still honoured). The deadline
+  resets whenever the torrent verifies another piece, so a slow-but-advancing download blocks
+  indefinitely and only a genuinely stalled one fails. Without this a two-minute swarm stall would
+  kill a transcode halfway through a two-hour title.
+- `summarizeProbe()` now captures `videoProfile` and `pixFmt`, which §4.1's policy needs and the
+  manifest records.
+- Reconciliation re-`stat`s the source on every boot rather than trusting the manifest, so a source
+  that changed underneath a representation is caught.
+
+Covered by `server/test/hls-transcode-manager.test.mjs` (16 assertions). Reconciliation is tested by
+laying out one directory per failure branch, booting the real bridge, and reading which survived —
+the actual code path, not a re-implementation. Nothing spawns FFmpeg.
 
 ```
 -hide_banner -loglevel error

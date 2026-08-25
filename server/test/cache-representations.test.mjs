@@ -45,31 +45,48 @@ const REP_SEGMENT_BYTES = 300000;
 const REP_SEGMENTS = 6;
 const REP_SIZE = REP_SEGMENT_BYTES * REP_SEGMENTS;
 
-function writeSource(t) {
-  const dir = path.join(root, t.name);
+function writeSource(name) {
+  const dir = path.join(root, name);
   fs.mkdirSync(dir, { recursive: true });
-  const f = path.join(dir, `${t.name}.mp4`);
+  const f = path.join(dir, `${name}.mp4`);
   fs.writeFileSync(f, Buffer.alloc(1024));
   fs.truncateSync(f, SOURCE_SIZE);
+  return f;
 }
 
-function writeRepresentation(hash, { complete }) {
+/**
+ * Writes what FFmpeg would actually leave behind: segments, a playlist naming them, and a manifest
+ * identifying the exact source. Boot reconciliation validates all three, so a fixture missing any
+ * of them is correctly discarded — which is the behaviour under test elsewhere, not something to
+ * work around here.
+ */
+function writeRepresentation(hash, { complete, sourcePath }) {
   const dir = path.join(hlsRoot, hash);
   fs.mkdirSync(dir, { recursive: true });
+
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:4',
+                 '#EXT-X-MEDIA-SEQUENCE:0', '#EXT-X-PLAYLIST-TYPE:EVENT'];
+
   for (let i = 0; i < REP_SEGMENTS; i++) {
-    const seg = path.join(dir, `seg${String(i).padStart(5, '0')}.ts`);
+    const name = `seg${String(i).padStart(5, '0')}.ts`;
+    const seg = path.join(dir, name);
     fs.writeFileSync(seg, Buffer.alloc(1024));
     fs.truncateSync(seg, REP_SEGMENT_BYTES);
+    lines.push('#EXTINF:4.000,', name);
   }
+  if (complete) lines.push('#EXT-X-ENDLIST');
+  fs.writeFileSync(path.join(dir, 'playlist.m3u8'), lines.join('\n') + '\n');
+
+  const st = fs.statSync(sourcePath);
   fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({
     version: 1,
     infohash: hash,
-    source: { path: `${root}/x.mp4`, sizeBytes: SOURCE_SIZE, mtimeMs: Date.now() },
+    source: { path: sourcePath, sizeBytes: st.size, mtimeMs: Math.round(st.mtimeMs) },
     media: { durationSec: 24, videoCodec: 'h264', audioCodec: 'aac' },
     hls: {
       segmentDurationSec: 4,
       startedAt: new Date().toISOString(),
-      // A manifest with no completedAt is a job still in flight.
+      // No completedAt means a job still in flight.
       completedAt: complete ? new Date().toISOString() : null
     }
   }));
@@ -82,12 +99,19 @@ function representationSizeOnDisk(dir) {
   return fs.readdirSync(dir).reduce((n, f) => n + fs.statSync(path.join(dir, f)).size, 0);
 }
 
-writeSource(IDLE);
-writeSource(BUSY);
-const idleRepDir = writeRepresentation(IDLE.hash, { complete: true });
-const busyRepDir = writeRepresentation(BUSY.hash, { complete: false });
-const orphanRepDir = writeRepresentation(GONE, { complete: true });
+const idleSource = writeSource(IDLE.name);
+const busySource = writeSource(BUSY.name);
+const orphanSource = writeSource('Orphan.Release');
+
+// Present before boot, so both must survive reconciliation: complete, valid, real sources.
+const idleRepDir = writeRepresentation(IDLE.hash, { complete: true, sourcePath: idleSource });
+const orphanRepDir = writeRepresentation(GONE, { complete: true, sourcePath: orphanSource });
 const IDLE_REP_SIZE = representationSizeOnDisk(idleRepDir);
+
+// BUSY's representation is written AFTER the bridge boots — see below. An in-flight job cannot
+// exist across a restart by definition: there is no live process, so boot reconciliation discards
+// the partial directory (§5.3, rebuild rather than resume).
+const busyRepDir = path.join(hlsRoot, BUSY.hash);
 
 // ---- Mock qBittorrent -------------------------------------------------------
 const deleted = [];
@@ -155,6 +179,9 @@ bridge.stderr.on('data', d => log += d);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 await sleep(2500);
 
+// Now that boot reconciliation has run, stage an in-flight representation.
+writeRepresentation(BUSY.hash, { complete: false, sourcePath: busySource });
+
 const base = `http://127.0.0.1:${BRIDGE_PORT}`;
 
 // ---- 1. Footprint includes representations ---------------------------------
@@ -185,6 +212,9 @@ check('the source retention policy is reported', cache.sourcePolicy === 'retain'
 // ---- 2. Orphan reclamation --------------------------------------------------
 console.log('\n--- Orphan representations are reclaimed ---');
 await sleep(16000);   // one GC sweep
+check('a valid representation survives boot reconciliation',
+  /Reconciled representations: \d+ usable/.test(log),
+  (log.match(/\[HLS\][^\n]*/g) || []).join(' | ').slice(0, 200));
 check('a representation with no torrent is deleted', !fs.existsSync(orphanRepDir),
   orphanRepDir);
 check('and says why', /orphan — no matching torrent/.test(log),
