@@ -543,6 +543,18 @@ export class PlayerModalManager {
     };
     window.addEventListener('keydown', this._keydownHandler);
 
+    // Closing the TAB never ran close(), so the leave beacon was only sent when the player was
+    // dismissed from inside the app. A closed tab therefore left the torrent running until the
+    // heartbeat went stale — up to a minute of pointless swarm traffic, and a session lingering in
+    // the bridge's registry.
+    //
+    // 'pagehide' rather than 'beforeunload': it fires on mobile and on back/forward-cache
+    // navigations, where beforeunload does not.
+    this._pageHideHandler = () => {
+      streamingBridge.sendLeave(this.sessionId, this.currentInfoHash);
+    };
+    window.addEventListener('pagehide', this._pageHideHandler);
+
     // Auto-save progress
     this.progressTimer = setInterval(() => {
       if (this.currentMovie && this.currentTime > 5) {
@@ -1176,6 +1188,10 @@ export class PlayerModalManager {
     if (this._onTimelineUp) {
       window.removeEventListener('mouseup', this._onTimelineUp);
       this._onTimelineUp = null;
+    }
+    if (this._pageHideHandler) {
+      window.removeEventListener('pagehide', this._pageHideHandler);
+      this._pageHideHandler = null;
     }
 
     // Detaching the source stops the browser holding the bridge connection open after close.
