@@ -39,7 +39,22 @@ const PROWLARR_KEY = process.env.PROWLARR_KEY || '5a197b3359f247e8a69c7866650058
 const MAX_ACTIVE_TORRENTS = parseInt(process.env.MAX_ACTIVE_TORRENTS || '5', 10);
 const MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_CONCURRENT_STREAMS || '15', 10);
 const DISK_MAX_USAGE_PCT = parseInt(process.env.DISK_MAX_USAGE_PCT || '85', 10);
-const IDLE_TTL_MINUTES = parseInt(process.env.IDLE_TTL_MINUTES || '1', 10); // 1 minute auto-delete
+// Above this, evict least-recently-played torrents until back under DISK_TARGET_PCT.
+const DISK_AGGRESSIVE_PCT = parseInt(process.env.DISK_AGGRESSIVE_PCT || '88', 10);
+const DISK_TARGET_PCT = parseInt(process.env.DISK_TARGET_PCT || '80', 10);
+// Above this, stop all downloading to protect the host's other services.
+const DISK_EMERGENCY_PCT = parseInt(process.env.DISK_EMERGENCY_PCT || '95', 10);
+// Test seam: forces getDiskUsageStats() to report a fixed percentage.
+const DISK_USAGE_OVERRIDE_PCT = process.env.DISK_USAGE_OVERRIDE_PCT
+  ? parseInt(process.env.DISK_USAGE_OVERRIDE_PCT, 10)
+  : null;
+
+// Where LRU state survives restarts. Without this, every deploy resets the eviction order and a
+// rewatch after a restart re-downloads a file that is still sitting on disk.
+const LRU_STATE_PATH = process.env.LRU_STATE_PATH || path.join(process.cwd(), '.cache', 'torrent-lru.json');
+// Cache-first makes a downloaded file worth keeping: a rewatch within the window is instant.
+// The old 1-minute default deleted a torrent (and its data) if you paused for a phone call.
+const IDLE_TTL_MINUTES = parseInt(process.env.IDLE_TTL_MINUTES || '30', 10);
 const IDLE_TTL_MS = IDLE_TTL_MINUTES * 60 * 1000;
 
 // Piece-Aware Reader Tuning
@@ -1021,6 +1036,33 @@ function decideStreamMode(summary, ext) {
 }
 
 /**
+ * Persists lastActive / pinned across restarts so eviction order and pinning survive a deploy.
+ * Small file, written on the GC tick; losing it costs nothing but a reset eviction order.
+ */
+function saveLruState() {
+  try {
+    const state = {};
+    for (const [hash, entry] of torrentRegistry) {
+      state[hash] = { name: entry.name, lastActive: entry.lastActive, pinned: !!entry.pinned };
+    }
+    fs.mkdirSync(path.dirname(LRU_STATE_PATH), { recursive: true });
+    fs.writeFileSync(LRU_STATE_PATH, JSON.stringify(state));
+  } catch (err) {
+    console.warn('[LRU] Could not persist state:', err.message);
+  }
+}
+
+function loadLruState() {
+  try {
+    if (!fs.existsSync(LRU_STATE_PATH)) return {};
+    return JSON.parse(fs.readFileSync(LRU_STATE_PATH, 'utf8')) || {};
+  } catch (err) {
+    console.warn('[LRU] Could not read state:', err.message);
+    return {};
+  }
+}
+
+/**
  * True while any playback session for this torrent has sent a heartbeat recently.
  */
 function hasFreshSession(infoHash, maxAgeMs = HEARTBEAT_FRESH_MS) {
@@ -1102,6 +1144,9 @@ function armIdlePauseTimer(hash, torrentName) {
  * Get disk usage statistics
  */
 function getDiskUsageStats(targetDir = '/') {
+  if (DISK_USAGE_OVERRIDE_PCT !== null) {
+    return { usedPct: DISK_USAGE_OVERRIDE_PCT, totalGb: '100.0', freeGb: '10.0' };
+  }
   try {
     if (fs.statfsSync) {
       const stats = fs.statfsSync(targetDir);
@@ -1356,6 +1401,38 @@ function purgeTorrentCaches(hash) {
   }
 }
 
+// Restored at boot so eviction order and pins survive a restart.
+const persistedLru = loadLruState();
+if (Object.keys(persistedLru).length > 0) {
+  console.log(`[LRU] Restored playback history for ${Object.keys(persistedLru).length} torrent(s)`);
+}
+
+/**
+ * True when something is actively reading or watching this torrent right now.
+ */
+function isTorrentInUse(hash, entry) {
+  return Boolean(
+    (entry && entry.refCount > 0) ||
+    hasFreshSession(hash) ||
+    isReserved(hash)
+  );
+}
+
+/**
+ * True when eviction must skip this torrent — in use, or deliberately pinned.
+ * Kept distinct from isTorrentInUse so a pinned-but-idle torrent is not reported as "in use".
+ */
+function isEvictionProtected(hash, entry) {
+  return isTorrentInUse(hash, entry) || Boolean(entry && entry.pinned);
+}
+
+async function evictTorrent(entry, torrent, reason) {
+  console.log(`[Auto-GC] Evicting "${torrent.name}" — ${reason}`);
+  if (entry && entry.cleanTimer) clearTimeout(entry.cleanTimer);
+  await qbt.deleteTorrent(torrent.hash, true, reason).catch(() => {});
+  purgeTorrentCaches(torrent.hash.toLowerCase());
+}
+
 setInterval(async () => {
   try {
     const now = Date.now();
@@ -1373,8 +1450,6 @@ setInterval(async () => {
       if ((now - sess.lastSeen) > (HEARTBEAT_FRESH_MS * 3)) playbackSessions.delete(id);
     }
 
-    const diskStats = getDiskUsageStats();
-
     const isLogged = await qbt.login();
     if (!isLogged) return;
 
@@ -1386,45 +1461,94 @@ setInterval(async () => {
       if (!liveHashes.has(hash)) purgeTorrentCaches(hash);
     }
 
+    // Make sure every live torrent is tracked, restoring persisted history where we have it.
     for (const t of allTorrents) {
       const hash = t.hash.toLowerCase();
+      if (torrentRegistry.has(hash)) continue;
 
-      let entry = torrentRegistry.get(hash);
-      if (!entry) {
-        // Start the idle clock NOW, not at the torrent's original added_on.
-        //
-        // torrentRegistry lives in memory, so after any restart every existing torrent is unknown.
-        // Back-dating to added_on made them all instantly older than IDLE_TTL, so the first sweep
-        // 15s after boot deleted every torrent AND its downloaded data — a full re-download on
-        // every deploy, and a stream that was mid-resolution lost the files underneath it.
-        entry = { hash, name: t.name, refCount: 0, lastActive: now, cleanTimer: null };
-        torrentRegistry.set(hash, entry);
-        console.log(`[Auto-GC] Now tracking pre-existing torrent "${t.name}" (idle timer starts now)`);
-      }
+      const restored = persistedLru[hash];
+      torrentRegistry.set(hash, {
+        hash,
+        name: t.name,
+        refCount: 0,
+        // Start the idle clock now unless we have a real playback time from before the restart.
+        lastActive: restored && restored.lastActive ? restored.lastActive : now,
+        pinned: Boolean(restored && restored.pinned),
+        cleanTimer: null
+      });
+      console.log(
+        `[Auto-GC] Now tracking "${t.name}"` +
+        (restored ? ' (restored playback history)' : ' (idle timer starts now)')
+      );
+    }
 
-      // In use if a connection holds a reference, a player is heart-beating, or a stream is
-      // still resolving swarm metadata for it.
-      if (entry.refCount > 0 || hasFreshSession(hash) || isReserved(hash)) {
-        entry.lastActive = now;
+    // ---- Pass 1: ordinary idle expiry -------------------------------------------------------
+    for (const t of allTorrents) {
+      const hash = t.hash.toLowerCase();
+      const entry = torrentRegistry.get(hash);
+      if (!entry) continue;
+
+      if (isEvictionProtected(hash, entry)) {
+        // Only genuine activity refreshes the idle clock; pinning must not make a torrent look
+        // permanently "just played", or unpinning it would grant a full extra TTL window.
+        if (isTorrentInUse(hash, entry)) entry.lastActive = now;
         continue;
       }
 
-      const isIdleExpired = (now - entry.lastActive) >= IDLE_TTL_MS;
-      const isEmergency = diskStats.usedPct >= 88;
-
-      if (isIdleExpired || isEmergency) {
-        console.log(
-          `[Auto-GC] Deleting idle torrent and its files: "${t.name}" ` +
-          `(${isEmergency ? `disk pressure ${diskStats.usedPct}%` : `idle ${IDLE_TTL_MINUTES}m`})`
-        );
-        if (entry.cleanTimer) clearTimeout(entry.cleanTimer);
-        await qbt.deleteTorrent(
-          t.hash, true,
-          isEmergency ? `Auto-GC disk pressure ${diskStats.usedPct}%` : `Auto-GC idle ${IDLE_TTL_MINUTES}m`
-        ).catch(() => {});
-        purgeTorrentCaches(hash);
+      if ((now - entry.lastActive) >= IDLE_TTL_MS) {
+        await evictTorrent(entry, t, `idle ${IDLE_TTL_MINUTES}m`);
       }
     }
+
+    // ---- Pass 2: LRU eviction under disk pressure --------------------------------------------
+    //
+    // The previous behaviour deleted EVERY idle torrent the moment the disk crossed 88%, which
+    // threw away the whole cache — including titles about to be rewatched — to reclaim space that
+    // one or two files would have covered. Now the least-recently-played torrent is evicted one at
+    // a time, and only until usage is back under DISK_TARGET_PCT.
+    let disk = getDiskUsageStats();
+
+    if (disk.usedPct >= DISK_AGGRESSIVE_PCT) {
+      const remaining = await qbt.getAllTorrents();
+      const candidates = (Array.isArray(remaining) ? remaining : [])
+        .map(t => ({ torrent: t, entry: torrentRegistry.get(t.hash.toLowerCase()) }))
+        .filter(({ torrent, entry }) => entry && !isEvictionProtected(torrent.hash.toLowerCase(), entry))
+        .sort((a, b) => a.entry.lastActive - b.entry.lastActive); // least recently played first
+
+      console.log(
+        `[Auto-GC] Disk at ${disk.usedPct}% (>= ${DISK_AGGRESSIVE_PCT}%). ` +
+        `Evicting least-recently-played of ${candidates.length} candidate(s) down to ${DISK_TARGET_PCT}%.`
+      );
+
+      for (const { torrent, entry } of candidates) {
+        disk = getDiskUsageStats();
+        if (disk.usedPct < DISK_TARGET_PCT) break;
+        const idleMins = Math.round((now - entry.lastActive) / 60000);
+        await evictTorrent(entry, torrent, `LRU at ${disk.usedPct}% disk, last played ${idleMins}m ago`);
+      }
+
+      disk = getDiskUsageStats();
+      if (disk.usedPct >= DISK_TARGET_PCT) {
+        console.warn(
+          `[Auto-GC] Still at ${disk.usedPct}% after evicting everything evictable — ` +
+          `the remaining torrents are all in use or pinned.`
+        );
+      }
+    }
+
+    // ---- Pass 3: emergency halt --------------------------------------------------------------
+    if (disk.usedPct >= DISK_EMERGENCY_PCT) {
+      const active = (await qbt.getAllTorrents()).filter(t => (t.progress || 0) < 1);
+      if (active.length > 0) {
+        console.error(
+          `[Auto-GC] EMERGENCY: disk at ${disk.usedPct}%. Pausing ${active.length} downloading ` +
+          `torrent(s) to protect the host.`
+        );
+        await qbt.pauseTorrents(active.map(t => t.hash)).catch(() => {});
+      }
+    }
+
+    saveLruState();
   } catch (err) {
     console.warn('[Auto-GC Warning]:', err.message);
   }
@@ -2275,7 +2399,16 @@ app.get('/health', async (req, res) => {
       maxActiveTorrents: MAX_ACTIVE_TORRENTS,
       maxConcurrentStreams: MAX_CONCURRENT_STREAMS,
       maxDiskUsagePercent: `${DISK_MAX_USAGE_PCT}%`,
-      idleCleanupMinutes: IDLE_TTL_MINUTES
+      evictAbovePercent: `${DISK_AGGRESSIVE_PCT}%`,
+      evictDownToPercent: `${DISK_TARGET_PCT}%`,
+      emergencyHaltPercent: `${DISK_EMERGENCY_PCT}%`,
+      idleCleanupMinutes: IDLE_TTL_MINUTES,
+      deliveryMode: REQUIRE_COMPLETE ? 'cache-first' : 'progressive',
+      evictionPolicy: 'lru-by-last-playback'
+    },
+    cache: {
+      trackedTorrents: torrentRegistry.size,
+      pinnedTorrents: [...torrentRegistry.values()].filter(e => e.pinned).length
     },
     uptime: process.uptime()
   });
@@ -2381,6 +2514,77 @@ app.get('/api/status', async (req, res) => {
 });
 
 /**
+ * Pin a torrent so LRU eviction and idle expiry skip it.
+ *
+ * Useful for a series you are working through, or anything expensive to re-acquire. Pinned torrents
+ * are still counted against the disk thresholds — pinning too much simply means the emergency halt
+ * fires instead of eviction, which is the correct and visible failure.
+ */
+app.post('/api/torrent/pin', async (req, res) => {
+  const authHeader = req.headers['x-admin-token'] || req.headers['authorization'];
+  const providedToken = authHeader ? authHeader.replace(/^Bearer\s+/i, '') : null;
+  if (!providedToken || providedToken !== ADMIN_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized: Valid X-Admin-Token required.' });
+  }
+
+  const hash = String((req.body && req.body.hash) || '').toLowerCase();
+  const pinned = !(req.body && req.body.pinned === false);
+
+  if (!hash) return res.status(400).json({ error: 'Missing hash' });
+
+  const entry = torrentRegistry.get(hash);
+  if (!entry) return res.status(404).json({ error: 'Unknown torrent hash' });
+
+  entry.pinned = pinned;
+  if (pinned) entry.lastActive = Date.now();
+  saveLruState();
+
+  console.log(`[Pin] "${entry.name}" ${pinned ? 'pinned — exempt from eviction' : 'unpinned'}`);
+  res.json({ ok: true, hash, pinned, name: entry.name });
+});
+
+/**
+ * Cache contents, most recently played first. Shows what eviction would remove and in what order.
+ */
+app.get('/api/cache', async (req, res) => {
+  try {
+    const torrents = await qbt.getAllTorrents();
+    const now = Date.now();
+
+    const rows = (Array.isArray(torrents) ? torrents : []).map((t) => {
+      const hash = t.hash.toLowerCase();
+      const entry = torrentRegistry.get(hash);
+      return {
+        hash,
+        name: t.name,
+        sizeBytes: t.total_size || t.size || 0,
+        progress: t.progress || 0,
+        pinned: Boolean(entry && entry.pinned),
+        inUse: isTorrentInUse(hash, entry),
+        idleMinutes: entry ? Math.round((now - entry.lastActive) / 60000) : null
+      };
+    }).sort((a, b) => (a.idleMinutes || 0) - (b.idleMinutes || 0));
+
+    const disk = getDiskUsageStats();
+    res.json({
+      ok: true,
+      diskUsagePercent: disk.usedPct,
+      thresholds: {
+        softCapPercent: DISK_MAX_USAGE_PCT,
+        evictAbovePercent: DISK_AGGRESSIVE_PCT,
+        evictDownToPercent: DISK_TARGET_PCT,
+        emergencyHaltPercent: DISK_EMERGENCY_PCT,
+        idleTtlMinutes: IDLE_TTL_MINUTES
+      },
+      // Eviction order is the reverse of this list, skipping pinned and in-use entries.
+      cached: rows
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
  * Admin-Protected Manual Disk Cleanup Endpoint
  */
 app.post('/api/cleanup', async (req, res) => {
@@ -2426,6 +2630,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`⏳ Pause Grace Window: ${Math.round(STREAM_IDLE_GRACE_MS / 1000)}s after last connection`);
   console.log(`🎞️ Video Transcode:    ${ALLOW_VIDEO_TRANSCODE ? 'enabled' : 'disabled (set ALLOW_VIDEO_TRANSCODE=1)'}`);
   console.log(`📦 Delivery Mode:      ${REQUIRE_COMPLETE ? 'cache-first (wait for full download)' : 'progressive piece-aware'}`);
+  console.log(`♻️ Eviction:           LRU by last playback · evict >${DISK_AGGRESSIVE_PCT}% down to ${DISK_TARGET_PCT}% · halt >${DISK_EMERGENCY_PCT}%`);
   console.log(`🩺 Health check:       http://localhost:${PORT}/health`);
   console.log(`====================================================`);
 });

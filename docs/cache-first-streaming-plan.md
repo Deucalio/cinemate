@@ -1,6 +1,6 @@
 # Cache-First Streaming — Implementation Plan & Change Log
 
-> **Status:** Phases 0–2 complete · Phase 3 next · Phases 4–5 optional
+> **Status:** Phases 0–3 complete · Phases 4–5 optional
 > **Owner:** Deucalio
 > **Created:** 2026-08-25
 
@@ -146,13 +146,43 @@ path on purpose (piece gating, mid-download `.!qB` selection, progress reporting
 
 ### Phase 3 — Retention
 
-- [ ] `IDLE_TTL_MINUTES=30`.
-- [ ] Change eviction from "oldest idle" to **LRU by last playback**, so a rewatch does not force a
-      re-download.
-- [ ] Keep existing disk thresholds (85 % soft cap / 88 % aggressive GC / 95 % halt).
-- [ ] Optional: a "pin" flag so a series you are mid-way through survives eviction.
+- [x] `IDLE_TTL_MINUTES` default raised from **1** to **30**.
+- [x] Eviction changed from "oldest idle" to **LRU by last playback**.
+- [x] Disk thresholds kept and completed: 85 % soft cap · 88 % evict · 80 % target · 95 % halt.
+- [x] Pin flag, admin-gated, persisted.
+- [x] LRU state survives restarts.
 
-**Outcome:** _(fill in when landed)_
+**Outcome:**
+
+- **Eviction is incremental.** The old policy deleted *every* idle torrent the instant the disk
+  crossed 88 %, discarding the whole cache — including titles about to be rewatched — to reclaim
+  space one or two files would have covered. Now the least-recently-played torrent is evicted one at
+  a time, stopping as soon as usage is back under `DISK_TARGET_PCT` (80 %). If it runs out of
+  evictable candidates it says so rather than failing silently.
+- **The 95 % emergency halt now exists.** It was documented in project.md §7 but never implemented.
+  Above `DISK_EMERGENCY_PCT` all *downloading* torrents are paused, protecting the host's other
+  services. Seeding and playback of completed files continue.
+- **LRU state persists** to `server/.cache/torrent-lru.json` and is restored at boot. Without it,
+  every deploy reset the eviction order and a rewatch after a restart re-downloaded a file that was
+  still sitting on disk.
+- **"In use" and "protected from eviction" are separate predicates.** Conflating them made a pinned
+  but idle torrent report as `inUse: true`, which is both wrong and actively misleading when
+  deciding what to unpin. Pinning also no longer refreshes the idle clock — otherwise unpinning
+  would silently grant a full extra TTL window.
+- **New `GET /api/cache`** lists what is cached, sorted so that eviction order is the reverse of the
+  listing, with `pinned` / `inUse` / `idleMinutes` per entry and the active thresholds.
+- **New `POST /api/torrent/pin`** (admin token) pins or unpins; the state is persisted immediately.
+
+**Test coverage** — new `server/test/lru-eviction.test.mjs`, 14 assertions, using a
+`DISK_USAGE_OVERRIDE_PCT` test seam so the policy can be exercised without filling a real volume.
+Asserts eviction order (COLD → WARM → RECENT), that pinned survives, that the reason is logged, and
+that restart-restored history is honoured.
+
+**Caught by the suite:** persisting LRU state to a shared default path made the *tests*
+non-hermetic — they inherited playback history from previous runs, so torrents looked long-idle and
+were evicted. Every suite now points `LRU_STATE_PATH` at its own temp directory.
+
+Suite total: **96 assertions across 6 suites**, all green.
 
 ---
 
@@ -234,75 +264,13 @@ Production logs showed neither `[Sequential]` nor `[Delete]` lines. Confirm the 
 
 ---
 
-## 5. Scaling notes — 200 concurrent viewers, all watching *different* titles
+## 5. Scaling
 
-Recorded because the answer is counter-intuitive: **the torrent engine is not the constraint.**
+Moved to its own document: **[scaling-roadmap.md](./scaling-roadmap.md)**.
 
-Assumptions: 1080p WEB-DL, ~6 Mbps, ~3 GB average file. Current host: 8 cores, 32 GB RAM, 300 GB
-free, 1 Gbps.
-
-| Resource | Needed for 200 distinct | Available | Verdict |
-|---|---|---|---|
-| **Disk** (all 200 files resident) | ~600 GB | 300 GB | ✗ **2× short — binds first** |
-| **Egress** (sustained) | 1.2 Gbps | 1 Gbps | ✗ |
-| **Egress** (monthly, ~4 h/day peak) | ~65 TB | typically 2–32 TB included | ✗ |
-| **CPU** — per-viewer remux (~5 % core each) | ~10 cores | 8 | ✗ marginal |
-| **CPU** — with Phase 5 + `sendfile()` | < 1 core | 8 | ✓ |
-| **RAM** | ~8 GB | 32 GB | ✓ comfortable |
-| **Ingest** (600 GB @ 70 MB/s) | ~2.4 h | — | ✓ queues, does not block |
-
-**Realistic ceiling on the current box: ~80 concurrent distinct titles, disk-bound.**
-
-Note the shape of the failure: nothing here is fixed by changing torrent engine.
-`torrent-stream` / `peerflix` / TorrServer optimise *time-to-first-frame on a cold title*, which
-caching already solves, and they make CPU **worse** because a remux of a partial file cannot be
-cached. They are the wrong lever for throughput.
-
-### The all-different case is the worst case
-
-With any popularity skew, 200 viewers might touch only 30–50 distinct titles, which fits. Cache-first
-degrades gracefully here: **only the first viewer of a title waits**, everyone after starts instantly.
-Progressive streaming has no equivalent property — every viewer independently drives piece requests.
-
-### Order of upgrades, by value per pound
-
-1. **Phase 5 (per-title transcode cache)** — free, removes the CPU wall entirely.
-2. **Serve files from nginx/Caddy rather than Node** — kernel `sendfile()` zero-copy.
-3. **More disk.** Network block storage is fine for video (sequential throughput matters, not IOPS).
-   Hetzner Volumes are roughly 4–5× cheaper per GB than DigitalOcean / Vultr / Linode block storage.
-4. **A dedicated server with local disks and unmetered transfer.** Hetzner's dedicated line
-   (AX-series for CPU, SX-series for bulk storage) costs about the same as a mid VPS but includes
-   unmetered 1 Gbps, which removes the egress *cost* problem outright. This is usually the biggest
-   single step.
-5. **Object storage + CDN** — the only thing that reaches 200 distinct properly. Transcode to HLS
-   segments, push to object storage, let a CDN serve viewers. The origin then never serves video
-   bytes, and local disk only needs the working set being transcoded rather than all 200 files.
-
-   Egress pricing dominates the choice:
-   - **Cloudflare R2** — **zero egress**, ~$0.015/GB/month storage. Best fit by a wide margin.
-   - **Backblaze B2** — ~$0.006/GB/month, egress free to Cloudflare via the Bandwidth Alliance.
-   - **Wasabi** — ~$0.007/GB/month, no egress fee but minimum-retention and fair-use terms apply.
-   - **AWS S3 / GCS** — avoid for video; ~$0.09/GB egress makes them an order of magnitude worse.
-
-   At R2 pricing, 600 GB of segments is roughly **$9/month with no egress charge** — against ~65 TB
-   of VPS egress it is not a close comparison.
-
-   *(Prices are indicative and change; verify before committing.)*
-
-### Target architecture, if this is ever real
-
-```
-qBittorrent ─► download ─► transcode/segment ─► object storage (R2)
-   (compute tier: VPS or dedicated)                    │
-                                                       ▼
-   API + playlists ◄──────────────────────────────  CDN ──► viewers
-```
-
-The compute tier sizes to *ingest and transcode rate*, not to viewer count. Viewer count is absorbed
-by the CDN. Disk sizes to the transcode working set, not the catalogue.
-
-Both steps here depend on complete files: you cannot pre-transcode or pre-segment media you do not
-yet have. **Cache-first is the enabler for the entire scaling path.**
+Short version — for 200 concurrent viewers each watching a *different* title, the current box binds
+on **disk** first (~80 titles), then egress, then per-viewer remux CPU. None of those are fixed by
+changing torrent engine, and Phase 5 removes the CPU wall for free.
 
 ---
 
@@ -312,7 +280,8 @@ Append one entry per landed change. Newest first.
 
 | Date | Commit | Phase | What changed |
 |---|---|---|---|
-| 2026-08-25 | _(this commit)_ | 2 | Cache-first delivery: `REQUIRE_COMPLETE`, plain file reads, FFmpeg on the local path, client parks until ready |
+| 2026-08-25 | _(this commit)_ | 3 | LRU eviction by last playback, 30 m TTL, 95 % emergency halt, pin flag, persisted LRU state, `/api/cache` |
+| 2026-08-25 | `6d59a1d` | 2 | Cache-first delivery: `REQUIRE_COMPLETE`, plain file reads, FFmpeg on the local path, client parks until ready |
 | 2026-08-25 | `573eec0` | 1 | `/api/stream/status`, `readyState` on prepare, determinate progress HUD with speed and ETA |
 | 2026-08-25 | `707d138` | 0 | Vite adopted (vanilla); credentials moved to `.env.local` |
 | 2026-08-25 | `a955c7e` | pre | Enforce sequential download on pre-existing torrents; log every torrent deletion with its reason; one FFmpeg per playback session |

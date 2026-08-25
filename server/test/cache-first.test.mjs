@@ -107,6 +107,9 @@ const bridge = spawn(process.execPath, ['index.js'], {
     ...process.env,
     PORT: String(BRIDGE_PORT),
     QBT_URL: `http://127.0.0.1:${MOCK_QBT_PORT}`,
+    // Own LRU file per suite: the default lives in server/.cache and would carry
+    // playback history between runs, making torrents look long-idle.
+    LRU_STATE_PATH: path.join(root, '.cache', 'lru.json'),
     PIECE_POLL_MS: '80',
     PIECE_STATE_CACHE_MS: '80',
     PIECE_WAIT_TIMEOUT_MS: '4000',   // so a regression fails fast instead of hanging the suite

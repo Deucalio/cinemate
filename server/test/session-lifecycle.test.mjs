@@ -75,6 +75,9 @@ const bridge = spawn(process.execPath, ['index.js'], {
     ...process.env,
     PORT: String(BRIDGE_PORT),
     QBT_URL: `http://127.0.0.1:${MOCK_QBT_PORT}`,
+    // Own LRU file per suite: the default lives in server/.cache and would carry
+    // playback history between runs, making torrents look long-idle.
+    LRU_STATE_PATH: path.join(root, '.cache', 'lru.json'),
     // This suite asserts progress reporting on an INCOMPLETE torrent and streams
     // from it, so it must run against the progressive path.
     REQUIRE_COMPLETE: '0',

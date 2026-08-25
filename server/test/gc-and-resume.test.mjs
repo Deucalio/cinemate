@@ -134,6 +134,9 @@ const bridge = spawn(process.execPath, ['index.js'], {
     ...process.env,
     PORT: String(BRIDGE_PORT),
     QBT_URL: `http://127.0.0.1:${MOCK_QBT_PORT}`,
+    // Own LRU file per suite: the default lives in server/.cache and would carry
+    // playback history between runs, making torrents look long-idle.
+    LRU_STATE_PATH: path.join(root, '.cache', 'lru.json'),
     PIECE_POLL_MS: '80',
     PIECE_STATE_CACHE_MS: '80',
     IDLE_TTL_MINUTES: '1'   // the aggressive production default that exposed the bug
@@ -157,7 +160,8 @@ check('a torrent added long ago is NOT deleted right after boot',
   !calls.deleted.some(b => b.includes(OLD_HASH)),
   `delete calls: ${calls.deleted.length}`);
 check('the sweep announces it is now tracking it',
-  /Now tracking pre-existing torrent "Old\.Release"/.test(log));
+  /Now tracking "Old\.Release" \(idle timer starts now\)/.test(log),
+  (log.match(/Now tracking.*/g) || []).join(' | ').slice(0, 160));
 
 // ---- 2. A paused torrent gets resumed during resolution ---------------------
 console.log('\n--- Resolution must resume a paused torrent ---');
