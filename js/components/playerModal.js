@@ -853,6 +853,10 @@ export class PlayerModalManager {
       if (spinner) spinner.style.display = 'none';
       const bar = hud.querySelector('.buffering-progress-bar-wrap');
       if (bar) bar.style.display = 'none';
+      // Download figures are meaningless next to a playback failure, and "0.0% downloaded" under
+      // an error message reads as a second, contradictory fault.
+      const stats = hud.querySelector('#buffering-stats');
+      if (stats) stats.style.display = 'none';
     }
 
     const badge = this.modal ? this.modal.querySelector('#player-active-source-badge') : null;

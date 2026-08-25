@@ -1652,7 +1652,13 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
     };
   }
 
-  await qbt.addTorrent(magnet);
+  // Only add what is genuinely new. Re-POSTing an add for an existing torrent should be a no-op in
+  // qBittorrent, but a completed torrent has been observed reverting to downloading right after
+  // playback started, and this removes the bridge from that picture entirely. It is also simply
+  // wasteful: prepare runs on every uncached resolution.
+  if (!alreadyPresent) {
+    await qbt.addTorrent(magnet);
+  }
 
   // Poll for metadata, then for the chosen file to appear on disk.
   //
@@ -1682,6 +1688,19 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
       // torrents/add does not resume an existing paused torrent either.
       // Must happen for pre-existing torrents too, not just ones we just added.
       await qbt.ensureSequentialDownload(torrentInfo);
+
+      // A torrent that was complete and is now not complete has been reset by something outside
+      // this process (qBittorrent recheck, external removal, storage moved). Say so loudly —
+      // silently re-downloading is what made this look like the bridge's doing.
+      const hashKey = (torrentInfo.hash || '').toLowerCase();
+      if (completedTorrents.has(hashKey) && (torrentInfo.progress || 0) < 1) {
+        console.warn(
+          `[Integrity] "${torrentInfo.name}" was complete but now reports ` +
+          `${((torrentInfo.progress || 0) * 100).toFixed(1)}% (state=${torrentInfo.state}). ` +
+          `The bridge did not delete it — check qBittorrent's own log.`
+        );
+        completedTorrents.delete(hashKey);
+      }
 
       if (!resumeAttempted && (/^(paused|stopped)/i.test(state) || state === 'queuedDL')) {
         resumeAttempted = true;
