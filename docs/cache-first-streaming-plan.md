@@ -1,6 +1,6 @@
 # Cache-First Streaming — Implementation Plan & Change Log
 
-> **Status:** Phases 0–2 complete · Phase 3 next
+> **Status:** Phases 0–2 complete · Phase 3 next · Phases 4–5 optional
 > **Owner:** Deucalio
 > **Created:** 2026-08-25
 
@@ -174,6 +174,33 @@ missing piece, not from `progress`.
 
 ---
 
+### Phase 5 — Per-title transcode cache
+
+*The single highest-leverage change available, and only possible because of cache-first.*
+
+Today FFmpeg runs **per viewer**, producing byte-identical output every time. The source file is
+complete and immutable, so the result is cacheable.
+
+- [ ] After a download completes, if the release is not browser-native, transcode **once** to
+      `<name>.web.mp4` (H.264 + AAC stereo, `+faststart` so `moov` sits at the front) beside the
+      original.
+- [ ] `prepare` prefers the `.web.mp4` when present and reports `mode: 'direct'` for it.
+- [ ] Run transcodes through a small queue (concurrency ≈ cores − 2) so they cannot starve serving.
+- [ ] Report transcode progress through the existing `/api/stream/status` shape, so the client's
+      progress HUD covers "downloading" and "preparing" with no new UI.
+- [ ] Evict the derived file with its source.
+
+**What it changes:** CPU goes from `O(concurrent viewers)` to `O(distinct titles)`, and every viewer
+gets a plain `fs.createReadStream` with **native seeking** — no FFmpeg in the playback path at all.
+Remux is roughly 20–50× realtime, so a 2-hour film costs ~3–6 minutes of one core, once, ever.
+
+This is what Plex and Jellyfin call an "optimized version". Progressive streaming cannot do it — you
+cannot pre-transcode a file you do not yet have.
+
+**Outcome:** _(fill in when landed)_
+
+---
+
 ## 3. Open questions
 
 ### Torrents disappearing mid-download — UNRESOLVED
@@ -207,7 +234,79 @@ Production logs showed neither `[Sequential]` nor `[Delete]` lines. Confirm the 
 
 ---
 
-## 5. Change log
+## 5. Scaling notes — 200 concurrent viewers, all watching *different* titles
+
+Recorded because the answer is counter-intuitive: **the torrent engine is not the constraint.**
+
+Assumptions: 1080p WEB-DL, ~6 Mbps, ~3 GB average file. Current host: 8 cores, 32 GB RAM, 300 GB
+free, 1 Gbps.
+
+| Resource | Needed for 200 distinct | Available | Verdict |
+|---|---|---|---|
+| **Disk** (all 200 files resident) | ~600 GB | 300 GB | ✗ **2× short — binds first** |
+| **Egress** (sustained) | 1.2 Gbps | 1 Gbps | ✗ |
+| **Egress** (monthly, ~4 h/day peak) | ~65 TB | typically 2–32 TB included | ✗ |
+| **CPU** — per-viewer remux (~5 % core each) | ~10 cores | 8 | ✗ marginal |
+| **CPU** — with Phase 5 + `sendfile()` | < 1 core | 8 | ✓ |
+| **RAM** | ~8 GB | 32 GB | ✓ comfortable |
+| **Ingest** (600 GB @ 70 MB/s) | ~2.4 h | — | ✓ queues, does not block |
+
+**Realistic ceiling on the current box: ~80 concurrent distinct titles, disk-bound.**
+
+Note the shape of the failure: nothing here is fixed by changing torrent engine.
+`torrent-stream` / `peerflix` / TorrServer optimise *time-to-first-frame on a cold title*, which
+caching already solves, and they make CPU **worse** because a remux of a partial file cannot be
+cached. They are the wrong lever for throughput.
+
+### The all-different case is the worst case
+
+With any popularity skew, 200 viewers might touch only 30–50 distinct titles, which fits. Cache-first
+degrades gracefully here: **only the first viewer of a title waits**, everyone after starts instantly.
+Progressive streaming has no equivalent property — every viewer independently drives piece requests.
+
+### Order of upgrades, by value per pound
+
+1. **Phase 5 (per-title transcode cache)** — free, removes the CPU wall entirely.
+2. **Serve files from nginx/Caddy rather than Node** — kernel `sendfile()` zero-copy.
+3. **More disk.** Network block storage is fine for video (sequential throughput matters, not IOPS).
+   Hetzner Volumes are roughly 4–5× cheaper per GB than DigitalOcean / Vultr / Linode block storage.
+4. **A dedicated server with local disks and unmetered transfer.** Hetzner's dedicated line
+   (AX-series for CPU, SX-series for bulk storage) costs about the same as a mid VPS but includes
+   unmetered 1 Gbps, which removes the egress *cost* problem outright. This is usually the biggest
+   single step.
+5. **Object storage + CDN** — the only thing that reaches 200 distinct properly. Transcode to HLS
+   segments, push to object storage, let a CDN serve viewers. The origin then never serves video
+   bytes, and local disk only needs the working set being transcoded rather than all 200 files.
+
+   Egress pricing dominates the choice:
+   - **Cloudflare R2** — **zero egress**, ~$0.015/GB/month storage. Best fit by a wide margin.
+   - **Backblaze B2** — ~$0.006/GB/month, egress free to Cloudflare via the Bandwidth Alliance.
+   - **Wasabi** — ~$0.007/GB/month, no egress fee but minimum-retention and fair-use terms apply.
+   - **AWS S3 / GCS** — avoid for video; ~$0.09/GB egress makes them an order of magnitude worse.
+
+   At R2 pricing, 600 GB of segments is roughly **$9/month with no egress charge** — against ~65 TB
+   of VPS egress it is not a close comparison.
+
+   *(Prices are indicative and change; verify before committing.)*
+
+### Target architecture, if this is ever real
+
+```
+qBittorrent ─► download ─► transcode/segment ─► object storage (R2)
+   (compute tier: VPS or dedicated)                    │
+                                                       ▼
+   API + playlists ◄──────────────────────────────  CDN ──► viewers
+```
+
+The compute tier sizes to *ingest and transcode rate*, not to viewer count. Viewer count is absorbed
+by the CDN. Disk sizes to the transcode working set, not the catalogue.
+
+Both steps here depend on complete files: you cannot pre-transcode or pre-segment media you do not
+yet have. **Cache-first is the enabler for the entire scaling path.**
+
+---
+
+## 6. Change log
 
 Append one entry per landed change. Newest first.
 
