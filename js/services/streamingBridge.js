@@ -11,10 +11,11 @@ export const streamingBridge = {
    */
   getStreamServerUrl() {
     const saved = localStorage.getItem('cinestream_stream_server_url');
-    if (!saved || saved.includes(':8888')) {
-      return 'http://77.37.74.7:8899';
-    }
-    return saved;
+    // ':8888' was an old default that no longer matches the bridge's port; ignore it if stored.
+    if (saved && !saved.includes(':8888')) return saved;
+
+    const env = import.meta.env || {};
+    return (env.VITE_STREAM_SERVER || 'http://127.0.0.1:8899').replace(/\/$/, '');
   },
 
   setStreamServerUrl(url) {
@@ -25,9 +26,12 @@ export const streamingBridge = {
    * Get configured Prowlarr / Torznab API URL & Key
    */
   getProwlarrConfig() {
+    const env = import.meta.env || {};
     return {
-      baseUrl: localStorage.getItem('cinestream_prowlarr_url') || 'http://localhost:9696',
-      apiKey: localStorage.getItem('cinestream_prowlarr_key') || '5a197b3359f247e8a69c7866650058e4'
+      baseUrl: localStorage.getItem('cinestream_prowlarr_url') || env.VITE_PROWLARR_URL || 'http://localhost:9696',
+      // Only used by the direct-to-Prowlarr fallback; the normal path proxies through the bridge,
+      // which holds the real key server-side.
+      apiKey: localStorage.getItem('cinestream_prowlarr_key') || env.VITE_PROWLARR_KEY || ''
     };
   },
 

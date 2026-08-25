@@ -3,3 +3,11 @@ server/node_modules/
 .env
 .DS_Store
 *.log
+
+# Vite
+dist/
+.vite/
+
+# Local credentials (see .env.example)
+.env.local
+.env.*.local

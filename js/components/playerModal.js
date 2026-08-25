@@ -176,7 +176,7 @@ export class PlayerModalManager {
 
               <div class="form-group">
                 <label class="form-label" for="setting-prowlarr-key">PROWLARR API KEY</label>
-                <input type="text" id="setting-prowlarr-key" class="form-input" placeholder="5a197b3359f247e8a69c7866650058e4" value="${streamingBridge.getProwlarrConfig().apiKey}" />
+                <input type="text" id="setting-prowlarr-key" class="form-input" placeholder="Prowlarr API key" value="${streamingBridge.getProwlarrConfig().apiKey}" />
               </div>
             </div>
 

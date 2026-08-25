@@ -1,10 +1,25 @@
 /**
  * TMDB API Client
- * Uses credentials provided in TMDB_API_CHEATSHEET.md
+ *
+ * Credentials come from .env.local (see .env.example). They were previously hardcoded here, which
+ * put them in every build and in git history.
+ *
+ * NOTE: anything prefixed VITE_ is inlined into the client bundle at build time. That is fine for
+ * a read-only TMDB key, but it is NOT a secret store — never put a bridge admin token, JWT secret
+ * or database URL behind a VITE_ prefix.
  */
 
-const TMDB_TOKEN = 'eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI5NGI3N2IyZjViZTUxYjc5NGNjZmQzOTlmNjBmYTE3MyIsIm5iZiI6MTc4NzUzNjcwNy45MDYsInN1YiI6IjZhOGJhNTQzMGQyNGNlZTAzOWMwZWE1YSIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.pRSYS5G-KfDd8CKGyrNhd62mUo5WI83nLFN7cJEslG0';
-const TMDB_API_KEY = '94b77b2f5be51b794ccfd399f60fa173';
+const env = import.meta.env || {};
+
+const TMDB_TOKEN = env.VITE_TMDB_TOKEN || '';
+const TMDB_API_KEY = env.VITE_TMDB_API_KEY || '';
+
+if (!TMDB_API_KEY && !TMDB_TOKEN) {
+  console.error(
+    '[TMDB] No credentials configured. Copy .env.example to .env.local and set ' +
+    'VITE_TMDB_API_KEY / VITE_TMDB_TOKEN, then restart the dev server.'
+  );
+}
 const BASE_URL = 'https://api.themoviedb.org/3';
 export const IMAGE_BASE = 'https://image.tmdb.org/t/p';
 
