@@ -1851,11 +1851,27 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
     `pieceSize ${(pieceSize / 1024).toFixed(0)}KB x ${piecesNum || '?'}) at ${targetFilePath}`
   );
 
-  // Spend swarm bandwidth and disk only on the file we are actually serving.
-  if (mapping.fileIndex !== null) {
-    await qbt.setFilePriority(matchedHash, [mapping.fileIndex], 7);
-    if (mapping.otherIndexes.length > 0) {
-      await qbt.setFilePriority(matchedHash, mapping.otherIndexes, 0);
+  // Focus the swarm on the file we are serving — but ONLY while there is still something to
+  // download, and only when the priorities are not already what we want.
+  //
+  // Two reasons to be conservative here. Setting a file to priority 0 makes libtorrent discard that
+  // file's data and recompute completeness; with TempPathEnabled that can move a finished torrent
+  // back to the incomplete directory. And prepare runs on every uncached resolution, so this was
+  // firing repeatedly against torrents that had nothing left to fetch.
+  const isAlreadyComplete = (torrentInfo.progress || 0) >= 1;
+
+  if (mapping.fileIndex !== null && !isAlreadyComplete) {
+    const current = new Map(
+      files.map((f, i) => [(typeof f.index === 'number' ? f.index : i), f.priority])
+    );
+
+    if (current.get(mapping.fileIndex) !== 7) {
+      await qbt.setFilePriority(matchedHash, [mapping.fileIndex], 7);
+    }
+
+    const needsZeroing = mapping.otherIndexes.filter(i => current.get(i) !== 0);
+    if (needsZeroing.length > 0) {
+      await qbt.setFilePriority(matchedHash, needsZeroing, 0);
     }
   }
 
