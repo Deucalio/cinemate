@@ -24,6 +24,24 @@
 
 ---
 
+## Quick path: use the installer
+
+Steps 1–3 below are scripted. Pasting long heredocs into some terminals mangles them, so prefer
+this:
+
+```bash
+cd /opt/cinemate && git pull
+sudo bash deploy/install-qbt.sh
+```
+
+It is idempotent, never overwrites an existing config, and prints the exact next commands on
+success or the diagnostic commands on failure. Set `QBT_USER=<name>` to run qBittorrent as someone
+other than `rdpuser`.
+
+The manual steps are kept below for reference and for understanding what the script does.
+
+---
+
 ## 1. Storage owned by the bridge user
 
 The bridge runs under pm2 as `rdpuser`. Running its qBittorrent as the **same user** removes every

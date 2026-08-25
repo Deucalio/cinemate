@@ -1,0 +1,56 @@
+[Unit]
+Description=CineStream download client (qBittorrent-nox)
+Documentation=file:///opt/cinemate/docs/dedicated-qbittorrent.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as the same user as the bridge (pm2), so the bridge owns its downloads
+# outright. That is what removes the ACL workaround needed on the shared instance.
+User=__QBT_USER__
+Group=__QBT_USER__
+UMask=0002
+
+ExecStart=/usr/bin/qbittorrent-nox --profile=/var/lib/cinemate/qbt --webui-port=18081
+
+Restart=on-failure
+RestartSec=10s
+# Torrents need time to write session state and send stop announcements.
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+
+# --- resource ceilings ----------------------------------------------------
+# Downloads are IO-heavy far more than CPU-heavy, so IOWeight matters most.
+# This host runs other people's services; never compete with them.
+Nice=15
+CPUWeight=10
+IOWeight=10
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=256
+
+# --- hardening ------------------------------------------------------------
+# NOTE: ProtectHome is deliberately NOT set. The shared instance runs as a
+# dedicated service account, but this one runs as the bridge's user and would
+# be unable to read its own home directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadWritePaths=/var/lib/cinemate /var/log/cinemate
+
+StandardOutput=append:/var/log/cinemate/qbt.log
+StandardError=append:/var/log/cinemate/qbt.err.log
+
+[Install]
+WantedBy=multi-user.target
