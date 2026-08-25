@@ -109,6 +109,9 @@ const bridge = spawn(process.execPath, ['index.js'], {
     ...process.env,
     PORT: String(BRIDGE_PORT),
     QBT_URL: `http://127.0.0.1:${MOCK_QBT_PORT}`,
+    // This suite exercises the PROGRESSIVE piece-aware path (Phase 4 territory),
+    // which cache-first bypasses by design.
+    REQUIRE_COMPLETE: '0',
     PIECE_POLL_MS: '80',
     PIECE_STATE_CACHE_MS: '80',
     PIECE_WAIT_TIMEOUT_MS: '15000',

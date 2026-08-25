@@ -25,6 +25,7 @@ export class PlayerModalManager {
     this._pendingSeekSec = 0;
     this._streamGeneration = 0;
     this._remuxAttempted = false;
+    this._pendingLoad = null;   // { generation, startSec } while waiting for the download
   }
 
   open(movie, options = {}) {
@@ -668,6 +669,7 @@ export class PlayerModalManager {
     this.currentStartSec = 0;
     this.probedDuration = 0;
     this._remuxAttempted = false;
+    this._pendingLoad = null;
 
     // Guards against a slow prepare for an abandoned source overwriting a newer selection.
     const generation = ++this._streamGeneration;
@@ -690,7 +692,21 @@ export class PlayerModalManager {
     // Show real download progress from the first second, rather than an indeterminate spinner.
     this._startStatusPolling();
 
-    const plan = await streamingBridge.prepareStream(magnetLink, releaseTitle, this.sessionId);
+    await this._resolveAndLoad(generation, startSec);
+  }
+
+  /**
+   * Asks the bridge for a delivery plan and loads it — or waits, if the file is still downloading.
+   *
+   * Under cache-first the bridge withholds a plan until the download completes, reporting
+   * `readyState: 'downloading'` instead. Rather than failing, we park and let the status poller
+   * call back once it is ready. Each attempt is tagged with the stream generation so an abandoned
+   * source can never load over a newer one.
+   */
+  async _resolveAndLoad(generation, startSec = 0) {
+    const plan = await streamingBridge.prepareStream(
+      this.currentMagnet, this.currentStreamTitle, this.sessionId
+    );
 
     // Superseded by a newer source, or the player closed while we waited.
     if (generation !== this._streamGeneration || !this.modal) return;
@@ -704,9 +720,26 @@ export class PlayerModalManager {
     }
 
     if (plan.infoHash) this.currentInfoHash = plan.infoHash;
+
+    // Still downloading to the server — park until the poller reports ready.
+    if (plan.readyState === 'downloading') {
+      this._pendingLoad = { generation, startSec };
+      this._showBufferingHUD(
+        'Downloading to the server...',
+        plan.message || 'Playback starts once the file is complete.'
+      );
+      return;
+    }
+
+    this._pendingLoad = null;
     this.probedDuration = plan.durationSec || 0;
     if (plan.durationSec > 300) this.duration = plan.durationSec;
 
+    const shortTitle = this.currentStreamTitle.length > 40
+      ? `${this.currentStreamTitle.substring(0, 40)}...`
+      : this.currentStreamTitle;
+
+    const sourceBadge = this.modal.querySelector('#player-active-source-badge');
     if (sourceBadge) {
       const remuxNote = plan.audio && plan.audio.willTranscode ? ' • AAC remux' : '';
       sourceBadge.textContent = `🟢 ${plan.mode === 'direct' ? 'DIRECT' : 'REMUX'}: ${shortTitle}${remuxNote}`;
@@ -725,21 +758,12 @@ export class PlayerModalManager {
       streamInfo.title = `${plan.fileName || ''} — ${plan.reason || ''}`;
     }
 
-    const stillDownloading = plan.readyState === 'downloading';
-
-    if (plan.mode === 'remux') {
-      this._showBufferingHUD(
-        stillDownloading ? 'Downloading & Remuxing...' : 'Remuxing for your browser...',
-        `${plan.reason} — FFmpeg is rewrapping this release with stereo AAC audio.`
-      );
-    } else {
-      this._showBufferingHUD(
-        stillDownloading ? 'Downloading...' : 'Starting playback...',
-        stillDownloading
-          ? 'Playback begins as soon as enough of the file is on the server.'
-          : 'Streaming directly from the server — native seeking enabled.'
-      );
-    }
+    this._showBufferingHUD(
+      plan.mode === 'remux' ? 'Remuxing for your browser...' : 'Starting playback...',
+      plan.mode === 'remux'
+        ? `${plan.reason} — FFmpeg is rewrapping this release with stereo AAC audio.`
+        : 'Streaming from the completed file — native seeking enabled.'
+    );
 
     this._loadStreamUrl(plan.mode, startSec);
   }
@@ -879,6 +903,14 @@ export class PlayerModalManager {
       if (!status || !status.ok) return;
 
       this._renderDownloadProgress(status);
+
+      // Cache-first: the file just finished downloading, so a plan is now available.
+      if (status.ready && this._pendingLoad && this._pendingLoad.generation === generation) {
+        const { startSec } = this._pendingLoad;
+        this._pendingLoad = null;
+        this._showBufferingHUD('Download complete', 'Preparing playback...');
+        this._resolveAndLoad(generation, startSec);
+      }
     };
 
     poll();

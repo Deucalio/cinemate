@@ -56,6 +56,14 @@ const STREAM_IDLE_GRACE_MS = parseInt(process.env.STREAM_IDLE_GRACE_MS || '45000
 const STREAM_RATE_LIMIT_PER_MIN = parseInt(process.env.STREAM_RATE_LIMIT_PER_MIN || '600', 10);
 const HEARTBEAT_FRESH_MS = parseInt(process.env.HEARTBEAT_FRESH_MS || '45000', 10);
 
+// Cache-first delivery (Phase 2): wait for the download to finish, then serve a complete file.
+//
+// On this host the swarm runs at 12-70 MB/s, so a 2-3 GB release lands in about a minute. Paying
+// that once buys a delivery path with no piece gating, no sparse-zero reads, no .!qB path chasing
+// and native browser seeking. Set REQUIRE_COMPLETE=0 to fall back to progressive piece-aware
+// streaming (retained for Phase 4).
+const REQUIRE_COMPLETE = process.env.REQUIRE_COMPLETE !== '0';
+
 // Transcoding
 const FFMPEG_BIN = process.env.FFMPEG_BIN || 'ffmpeg';
 const FFPROBE_BIN = process.env.FFPROBE_BIN || 'ffprobe';
@@ -831,9 +839,12 @@ function parseRangeHeader(rangeHeader, fileSize) {
 }
 
 /**
- * Serves a byte range for a torrent file over HTTP 206/200, backed by verified pieces only.
- * Shared by the public /api/stream endpoint and the loopback /internal/piece-file endpoint
- * that FFmpeg reads from.
+ * Serves a byte range for a torrent file over HTTP 206/200.
+ *
+ * Two backings:
+ *  - `pieceAware: false` (cache-first default) — a plain fs.createReadStream over a COMPLETE file.
+ *    Nothing can be missing, so there is nothing to verify. This is the whole point of Phase 2.
+ *  - `pieceAware: true` — the piece-verified reader, for streaming a file that is still downloading.
  */
 function servePieceAwareRange(req, res, ctx) {
   const { filePath, hash, pieceSize, fileOffsetInTorrent, fileSize, contentType } = ctx;
@@ -886,10 +897,14 @@ function servePieceAwareRange(req, res, ctx) {
     return;
   }
 
-  const stream = createPieceAwareTorrentStream(filePath, hash, start, end, pieceSize, fileOffsetInTorrent);
+  const pieceAware = ctx.pieceAware !== false;
+
+  const stream = pieceAware
+    ? createPieceAwareTorrentStream(filePath, hash, start, end, pieceSize, fileOffsetInTorrent)
+    : fs.createReadStream(filePath, { start, end });
 
   stream.on('error', (err) => {
-    console.warn(`[Piece Stream] ${err.message}`);
+    console.warn(`[${pieceAware ? 'Piece Stream' : 'File Stream'}] ${err.message}`);
     res.destroy();
     release();
   });
@@ -1165,6 +1180,24 @@ const probeCache = new Map();
 const preparedStreamCache = new Map();
 const PREPARED_CACHE_MS = parseInt(process.env.PREPARED_CACHE_MS || '60000', 10);
 
+// Hashes known to be 100% downloaded. A torrent cannot become incomplete again, so once a hash is
+// in here the completeness check costs nothing for the rest of its life.
+const completedTorrents = new Set();
+
+async function isTorrentComplete(hash) {
+  const key = String(hash || '').toLowerCase();
+  if (!key) return false;
+  if (completedTorrents.has(key)) return true;
+
+  const list = await qbt.getAllTorrents();
+  const torrent = Array.isArray(list) ? list.find(t => t.hash && t.hash.toLowerCase() === key) : null;
+  if (torrent && (torrent.progress || 0) >= 1) {
+    completedTorrents.add(key);
+    return true;
+  }
+  return false;
+}
+
 // hash -> expiresAt. A stream spends up to ~25s waiting on swarm metadata before it can take a
 // reference, and Auto-GC would happily delete the torrent inside that window. Reservations close
 // that race.
@@ -1303,6 +1336,7 @@ function checkRateLimit(type = 'search', limit = 30, windowMs = 60000) {
 function purgeTorrentCaches(hash) {
   torrentRegistry.delete(hash);
   torrentReservations.delete(hash);
+  completedTorrents.delete(hash);
   qbt.invalidatePieceCache(hash);
 
   for (const [key, entry] of preparedStreamCache) {
@@ -1809,6 +1843,25 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
       return res.status(prep.status).json({ ok: false, code: 'NO_MEDIA', error: prep.message });
     }
 
+    // Cache-first: while the file is incomplete there is nothing worth probing — ffprobe would be
+    // reading sparse regions and failing, which is exactly the "probe unavailable" noise that made
+    // every incomplete .mkv fall back to a guess. Report progress and let the client wait.
+    if (REQUIRE_COMPLETE && !(await isTorrentComplete(prep.matchedHash))) {
+      const live = await qbt.findTorrent(prep.matchedHash, nameHint, magnet);
+      const progress = live ? (live.progress || 0) : 0;
+      return res.json({
+        ok: true,
+        readyState: 'downloading',
+        progress,
+        progressPercent: Math.round(progress * 1000) / 10,
+        infoHash: prep.matchedHash,
+        torrentName: prep.torrentName,
+        fileName: path.basename(prep.mediaName),
+        fileSizeBytes: prep.fileSize,
+        message: 'Downloading to the server. Playback starts once the file is complete.'
+      });
+    }
+
     const ext = prep.mediaExt;
     const summary = await getProbeSummary(prep.matchedHash, prep.targetFilePath, prep.token);
     const decision = decideStreamMode(summary, ext);
@@ -1947,6 +2000,24 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
       ip: req.ip
     });
 
+    // Cache-first gate. Serving an incomplete file is what every piece-related bug in this project
+    // came from; under REQUIRE_COMPLETE we simply do not.
+    const isComplete = await isTorrentComplete(matchedHash);
+    if (REQUIRE_COMPLETE && !isComplete) {
+      const live = await qbt.findTorrent(matchedHash, nameHint, magnet);
+      const progress = live ? (live.progress || 0) : 0;
+      playbackSessions.delete(sessionId);
+      releaseTorrentReference(matchedHash, torrentName);
+      registered = null;
+      return res.status(503).json({
+        error: 'Still downloading to the server. Playback starts once the file is complete.',
+        code: 'NOT_READY',
+        readyState: 'downloading',
+        progress,
+        progressPercent: Math.round(progress * 1000) / 10
+      });
+    }
+
     // Decide how to deliver this specific file, from its LOGICAL extension.
     const ext = prep.mediaExt;
     const summary = await getProbeSummary(matchedHash, targetFilePath, token);
@@ -1973,7 +2044,8 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
     if (mode === 'direct') {
       const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
       console.log(
-        `[Direct 206] "${torrentName}" range=${req.headers.range || 'none'} size=${(fileSize / 1048576).toFixed(1)} MB`
+        `[Direct 206] "${torrentName}" range=${req.headers.range || 'none'} ` +
+        `size=${(fileSize / 1048576).toFixed(1)} MB source=${isComplete ? 'complete-file' : 'piece-aware'}`
       );
 
       servePieceAwareRange(req, res, {
@@ -1983,6 +2055,8 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
         fileOffsetInTorrent,
         fileSize,
         contentType,
+        // A complete file needs no piece verification — nothing in it can be missing.
+        pieceAware: !isComplete,
         onRelease: release
       });
       return;
@@ -2001,20 +2075,20 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
       });
     }
 
-    const ffmpegArgs = [
-      '-hide_banner',
-      '-loglevel', 'error',
-      '-seekable', '1',
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '10'
-    ];
+    const ffmpegArgs = ['-hide_banner', '-loglevel', 'error'];
 
-    // Input seeking: accurate, cheap, and unlike the old byte-offset hack it lands on a keyframe
-    // with the container header intact.
+    // Against a COMPLETE file, FFmpeg reads the path directly. The loopback HTTP endpoint exists
+    // only so FFmpeg could seek across piece-gated reads; on a whole file it is pure overhead and
+    // was the source of the "Stream ends prematurely" / "Input/output error" noise.
+    const ffmpegInput = isComplete ? targetFilePath : internalUrlFor(token);
+    if (!isComplete) {
+      ffmpegArgs.push('-seekable', '1', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '10');
+    }
+
+    // Input seeking: fast and keyframe-accurate, with the container header intact.
     if (startSec > 0) ffmpegArgs.push('-ss', String(startSec));
 
-    ffmpegArgs.push('-i', internalUrlFor(token));
+    ffmpegArgs.push('-i', ffmpegInput);
     ffmpegArgs.push('-map', '0:v:0?', '-map', '0:a:0?');
 
     if (auto.copyVideo) {
@@ -2038,7 +2112,7 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
 
     console.log(
       `[Remux] "${torrentName}" start=${startSec}s video=${auto.copyVideo ? 'copy' : 'libx264'} ` +
-      `audio=${auto.copyAudio ? 'copy' : 'aac-stereo'} (${auto.reason})`
+      `audio=${auto.copyAudio ? 'copy' : 'aac-stereo'} input=${isComplete ? 'local-file' : 'loopback'} (${auto.reason})`
     );
 
     // Supersede any transcode already running for this session.
@@ -2061,6 +2135,8 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
     // stream with &startSec= instead; advertise that so it does not try native seeking.
     res.writeHead(200, {
       'Content-Type': 'video/mp4',
+      // Progressive fMP4 has no index, so the browser cannot seek it natively regardless of whether
+      // the source file is complete. The client restarts the stream with &startSec= instead.
       'Accept-Ranges': 'none',
       'Cache-Control': 'no-store',
       'Access-Control-Allow-Origin': '*',
@@ -2349,6 +2425,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🧹 Auto-GC Idle TTL:   ${IDLE_TTL_MINUTES} minute(s)`);
   console.log(`⏳ Pause Grace Window: ${Math.round(STREAM_IDLE_GRACE_MS / 1000)}s after last connection`);
   console.log(`🎞️ Video Transcode:    ${ALLOW_VIDEO_TRANSCODE ? 'enabled' : 'disabled (set ALLOW_VIDEO_TRANSCODE=1)'}`);
+  console.log(`📦 Delivery Mode:      ${REQUIRE_COMPLETE ? 'cache-first (wait for full download)' : 'progressive piece-aware'}`);
   console.log(`🩺 Health check:       http://localhost:${PORT}/health`);
   console.log(`====================================================`);
 });

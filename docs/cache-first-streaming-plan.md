@@ -1,6 +1,6 @@
 # Cache-First Streaming — Implementation Plan & Change Log
 
-> **Status:** Phase 1 complete · Phase 2 next
+> **Status:** Phases 0–2 complete · Phase 3 next
 > **Owner:** Deucalio
 > **Created:** 2026-08-25
 
@@ -103,19 +103,44 @@ Also folded in ahead of the phases (step 1 of the agreed order):
 
 ### Phase 2 — Serve completed files simply
 
-- [ ] `REQUIRE_COMPLETE=1` (env, default on): `prepare` withholds the stream URL until
-      `progress === 1`.
-- [ ] **Direct path:** plain `fs.createReadStream` + 206 ranges. No piece gating.
-- [ ] **Remux path:** FFmpeg reads the **local file path** (`-i /path/file.mkv`), not the loopback
-      HTTP URL. `-ss` becomes instant and frame-accurate. Drop `-reconnect*` and `-seekable`.
-- [ ] Keep `/internal/piece-file` and `createPieceAwareTorrentStream` in the tree but unused on this
-      path, behind the flag, so Phase 4 can revive them.
+- [x] `REQUIRE_COMPLETE` (env, default **on**): `prepare` and `/api/stream` withhold delivery until
+      `progress === 1`. Set `REQUIRE_COMPLETE=0` for the old progressive behaviour.
+- [x] **Direct path:** plain `fs.createReadStream` + 206 ranges. No piece gating.
+- [x] **Remux path:** FFmpeg reads the **local file path**; `-reconnect*` / `-seekable` dropped.
+- [x] `/internal/piece-file` and `createPieceAwareTorrentStream` retained but unused on this path.
 
 **Why the FFmpeg input change matters:** the loopback HTTP endpoint exists *only* so FFmpeg could
 seek across piece-gated reads. Against a complete local file that indirection is pure overhead and
 the source of the `Input/output error` / `Stream ends prematurely` noise.
 
-**Outcome:** _(fill in when landed)_
+**Outcome:**
+
+- **Completeness is cached, not re-checked.** A torrent cannot become incomplete again, so once a
+  hash is confirmed at 100 % it goes into `completedTorrents` and the check costs nothing for the
+  rest of its life. Before that it is one `torrents/info` call per request.
+- **An incomplete file is never probed.** `prepare` returns `readyState: 'downloading'` and exits
+  before `ffprobe` runs. This removes the `probe unavailable → falling back on container extension`
+  path entirely, which is what made every incomplete `.mkv` guess at its own codecs.
+- **`/api/stream` refuses with `503 NOT_READY`** and includes `progressPercent`, so a client that
+  requests too early gets a number rather than a hang.
+- **The client parks and resumes.** `_resolveAndLoad()` is separated from `streamMagnet()`; when the
+  bridge says `downloading`, the attempt is stored in `_pendingLoad` (tagged with the stream
+  generation) and the Phase 1 status poller calls it back on completion. An abandoned source can
+  never load over a newer one.
+- **Native seeking now works.** Complete + direct means the browser issues its own range requests
+  and the bridge answers them from a whole file. Seeking no longer restarts FFmpeg, re-resolves the
+  torrent, or produces a new `/api/stream` request — which is what caused the pending-request
+  pile-up and the churn that looked like "seeking re-downloads the file".
+
+**Test coverage** — new `server/test/cache-first.test.mjs`, 16 assertions. The decisive one: the
+mock reports **every piece as not-downloaded** while the torrent reports `progress: 1.0`. A
+piece-aware read would block forever; the test asserts the bytes arrive, the sha256 matches, and
+`pieceStates` is **never requested**. That is the only convincing proof the piece path is out of the
+way rather than merely unlikely to trigger.
+
+The three older suites now set `REQUIRE_COMPLETE=0` explicitly, since they exercise the progressive
+path on purpose (piece gating, mid-download `.!qB` selection, progress reporting). Suite total:
+**80 assertions**, all green.
 
 ---
 
@@ -188,7 +213,8 @@ Append one entry per landed change. Newest first.
 
 | Date | Commit | Phase | What changed |
 |---|---|---|---|
-| 2026-08-25 | _(this commit)_ | 1 | `/api/stream/status`, `readyState` on prepare, determinate progress HUD with speed and ETA |
+| 2026-08-25 | _(this commit)_ | 2 | Cache-first delivery: `REQUIRE_COMPLETE`, plain file reads, FFmpeg on the local path, client parks until ready |
+| 2026-08-25 | `573eec0` | 1 | `/api/stream/status`, `readyState` on prepare, determinate progress HUD with speed and ETA |
 | 2026-08-25 | `707d138` | 0 | Vite adopted (vanilla); credentials moved to `.env.local` |
 | 2026-08-25 | `a955c7e` | pre | Enforce sequential download on pre-existing torrents; log every torrent deletion with its reason; one FFmpeg per playback session |
 | 2026-08-25 | `a236618` | pre | Drag-scrubbing no longer spawns an FFmpeg per mousemove; removed auto-resume; made player controls honest; `[Stream Start]` logs live download % |

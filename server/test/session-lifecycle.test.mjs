@@ -75,6 +75,9 @@ const bridge = spawn(process.execPath, ['index.js'], {
     ...process.env,
     PORT: String(BRIDGE_PORT),
     QBT_URL: `http://127.0.0.1:${MOCK_QBT_PORT}`,
+    // This suite asserts progress reporting on an INCOMPLETE torrent and streams
+    // from it, so it must run against the progressive path.
+    REQUIRE_COMPLETE: '0',
     PIECE_POLL_MS: '80',
     PIECE_STATE_CACHE_MS: '80',
     IDLE_TTL_MINUTES: '60',
