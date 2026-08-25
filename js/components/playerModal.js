@@ -21,7 +21,7 @@ export class PlayerModalManager {
     this.currentStreamMode = null;   // 'direct' (byte-range, natively seekable) | 'remux' (fMP4)
     this.currentStartSec = 0;        // remux only: offset FFmpeg started the output at
     this.probedDuration = 0;         // real duration from ffprobe, when available
-    this.resumeFromSec = 0;
+    this.userVolume = 0.9;           // matches the slider's initial value
     this._pendingSeekSec = 0;
     this._streamGeneration = 0;
     this._remuxAttempted = false;
@@ -37,15 +37,16 @@ export class PlayerModalManager {
     const year = releaseDate ? releaseDate.substring(0, 4) : '';
     const season = options.season || 1;
     const episode = options.episode || 1;
-    const existingProgress = store.getMovieProgress(movie.id);
 
     // Accurate runtime calculation from TMDB
     const runtimeMinutes = movie.runtime || (movie.episode_run_time && movie.episode_run_time[0]) || (isTV ? 55 : 120);
     this.totalRuntimeSeconds = runtimeMinutes * 60;
 
-    // Initial starting time
-    this.resumeFromSec = (existingProgress && existingProgress.currentTime) ? existingProgress.currentTime : 0;
-    this.currentTime = this.resumeFromSec;
+    // Always start at the beginning. Auto-resuming from saved progress meant a freshly-added
+    // torrent had to be downloaded up to that timestamp before anything could play, which looked
+    // like the player jumping to a random time and then hanging. Progress is still recorded for
+    // the library views; it just no longer drives playback.
+    this.currentTime = 0;
     this.duration = this.totalRuntimeSeconds;
 
     // Reset per-open stream state
@@ -54,7 +55,6 @@ export class PlayerModalManager {
     this.probedDuration = 0;
     this._pendingSeekSec = 0;
     this._remuxAttempted = false;
-    this._resumeConsumed = false;
     this.currentMagnet = null;
     this.currentInfoHash = null;
 
@@ -100,7 +100,8 @@ export class PlayerModalManager {
               <span class="btn-icon">⚙️</span>
             </button>
 
-            <span class="player-quality-pill">4K HDR</span>
+            <!-- Populated from the bridge's actual probe of the chosen release. -->
+            <span class="player-quality-pill" id="player-stream-info" title="Actual stream format">—</span>
           </div>
         </div>
 
@@ -229,25 +230,12 @@ export class PlayerModalManager {
             </div>
 
             <div class="player-controls-right">
-              <!-- Audio & Subtitles -->
-              <button class="player-ctrl-btn" id="ctrl-subs-btn" title="Subtitles (English)">
-                <span class="ctrl-icon">💬</span>
-                <span class="ctrl-label">CC</span>
-              </button>
-
               <!-- Speed Selector -->
               <select class="player-select-ctrl" id="ctrl-speed-select" title="Playback Speed">
                 <option value="0.75">0.75x</option>
                 <option value="1" selected>1.0x</option>
                 <option value="1.25">1.25x</option>
                 <option value="1.5">1.5x</option>
-              </select>
-
-              <!-- Quality -->
-              <select class="player-select-ctrl" id="ctrl-quality-select" title="Stream Quality">
-                <option value="4k" selected>4K UHD</option>
-                <option value="1080p">1080p</option>
-                <option value="720p">720p</option>
               </select>
 
               <!-- Fullscreen -->
@@ -265,11 +253,6 @@ export class PlayerModalManager {
     this.videoElement = modal.querySelector('#main-video-element');
 
     this._bindPlayerEvents(isTV, season, episode, title, year);
-
-    // If starting from saved progress
-    if (this.currentTime > 0) {
-      toast.info(`Resuming "${title}" from ${this._formatTime(this.currentTime)}`);
-    }
 
     // Auto open sources drawer if requested or by default
     if (options.openSources !== false) {
@@ -294,7 +277,6 @@ export class PlayerModalManager {
     const volBtn = this.modal.querySelector('#ctrl-volume-btn');
     const volSlider = this.modal.querySelector('#player-volume-slider');
     const fullscreenBtn = this.modal.querySelector('#ctrl-fullscreen-btn');
-    const subsBtn = this.modal.querySelector('#ctrl-subs-btn');
     const speedSelect = this.modal.querySelector('#ctrl-speed-select');
     const timeline = this.modal.querySelector('#player-timeline-wrap');
     const sourcesBtn = this.modal.querySelector('#player-btn-sources');
@@ -329,7 +311,8 @@ export class PlayerModalManager {
 
     // Volume
     volSlider.addEventListener('input', (e) => {
-      video.volume = e.target.value;
+      this.userVolume = Number(e.target.value);
+      video.volume = this.userVolume;
       video.muted = false;
       this._updateVolIcon(video.volume);
     });
@@ -342,12 +325,6 @@ export class PlayerModalManager {
     // Speed
     speedSelect.addEventListener('change', (e) => {
       video.playbackRate = Number(e.target.value);
-    });
-
-    // Subtitles
-    subsBtn.addEventListener('click', () => {
-      subsBtn.classList.toggle('is-active');
-      toast.info(subsBtn.classList.contains('is-active') ? 'Subtitles: English [CC] ON' : 'Subtitles: OFF');
     });
 
     // Fullscreen
@@ -468,20 +445,61 @@ export class PlayerModalManager {
       this._updateTimeDisplay();
     });
 
-    // Timeline Scrubbing
+    // Timeline scrubbing.
+    //
+    // Dragging must NOT seek on every mousemove. In remux mode a seek restarts FFmpeg, so one drag
+    // across the bar spawned dozens of transcodes and stream requests, all competing for the same
+    // pieces. The drag now only previews; the seek is committed once, on release.
+    //
+    // These listeners are on `window` (a drag continues outside the timeline), so they must be
+    // removed on close — previously they leaked, and every re-open added another live handler.
     let isScrubbing = false;
+    let pendingSeekSec = null;
+    const tooltip = this.modal.querySelector('#player-timeline-tooltip');
+
+    const positionToSeconds = (e) => {
+      const rect = timeline.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      return Math.floor(ratio * this._totalDuration());
+    };
+
+    const previewAt = (e) => {
+      const seconds = positionToSeconds(e);
+      pendingSeekSec = seconds;
+
+      const percent = Math.min(100, Math.max(0, (seconds / this._totalDuration()) * 100));
+      const fill = this.modal.querySelector('#player-timeline-progress');
+      const handle = this.modal.querySelector('#player-timeline-handle');
+      if (fill) fill.style.width = `${percent}%`;
+      if (handle) handle.style.left = `${percent}%`;
+      if (tooltip) {
+        tooltip.textContent = this._formatTime(seconds);
+        tooltip.style.left = `${percent}%`;
+        tooltip.style.display = 'block';
+      }
+    };
+
     timeline.addEventListener('mousedown', (e) => {
       isScrubbing = true;
-      this._scrub(e);
+      previewAt(e);
     });
 
-    window.addEventListener('mousemove', (e) => {
-      if (isScrubbing) this._scrub(e);
-    });
+    this._onTimelineMove = (e) => {
+      if (isScrubbing) previewAt(e);
+    };
 
-    window.addEventListener('mouseup', () => {
-      if (isScrubbing) isScrubbing = false;
-    });
+    this._onTimelineUp = () => {
+      if (!isScrubbing) return;
+      isScrubbing = false;
+      if (tooltip) tooltip.style.display = 'none';
+      if (pendingSeekSec === null) return;
+      const target = pendingSeekSec;
+      pendingSeekSec = null;
+      this._seekTo(target);
+    };
+
+    window.addEventListener('mousemove', this._onTimelineMove);
+    window.addEventListener('mouseup', this._onTimelineUp);
 
     // Keyboard Shortcuts
     this._keydownHandler = (e) => {
@@ -630,12 +648,6 @@ export class PlayerModalManager {
       this.sessionId = `sess_${Math.random().toString(36).substring(2, 9)}_${Date.now()}`;
     }
 
-    // Honour saved watch progress on the first source of a session.
-    if (startSec === 0 && this.resumeFromSec > 5 && !this._resumeConsumed) {
-      startSec = this.resumeFromSec;
-    }
-    this._resumeConsumed = true;
-
     const hashMatch = magnetLink.match(/urn:btih:([a-zA-Z0-9]+)/i);
     this.currentInfoHash = hashMatch ? hashMatch[1].toLowerCase() : null;
     this.currentMagnet = magnetLink;
@@ -683,6 +695,19 @@ export class PlayerModalManager {
     if (sourceBadge) {
       const remuxNote = plan.audio && plan.audio.willTranscode ? ' • AAC remux' : '';
       sourceBadge.textContent = `🟢 ${plan.mode === 'direct' ? 'DIRECT' : 'REMUX'}: ${shortTitle}${remuxNote}`;
+    }
+
+    // Replace the old hard-coded "4K HDR" pill with what the bridge actually probed.
+    const streamInfo = this.modal.querySelector('#player-stream-info');
+    if (streamInfo) {
+      const parts = [];
+      if (plan.video && plan.video.codec) parts.push(String(plan.video.codec).toUpperCase());
+      if (plan.audio && plan.audio.codec) {
+        parts.push(`${String(plan.audio.codec).toUpperCase()}${plan.audio.channels ? ` ${plan.audio.channels}ch` : ''}`);
+      }
+      parts.push(plan.mode === 'direct' ? 'Direct' : 'Remux');
+      streamInfo.textContent = parts.join(' · ');
+      streamInfo.title = `${plan.fileName || ''} — ${plan.reason || ''}`;
     }
 
     if (plan.mode === 'remux') {
@@ -880,12 +905,16 @@ export class PlayerModalManager {
 
   _play() {
     if (!this.videoElement || !this.videoElement.getAttribute('src')) return;
+
+    // Respect whatever the viewer last set. This used to slam volume back to 1.0 on every play,
+    // including the automatic re-loads after a source switch.
+    const volume = typeof this.userVolume === 'number' ? this.userVolume : 0.9;
     this.videoElement.muted = false;
-    this.videoElement.volume = 1.0;
-    this._updateVolIcon(1.0);
+    this.videoElement.volume = volume;
+    this._updateVolIcon(volume);
 
     const volSlider = this.modal ? this.modal.querySelector('#player-volume-slider') : null;
-    if (volSlider) volSlider.value = 1.0;
+    if (volSlider) volSlider.value = volume;
 
     this.videoElement.play().then(() => {
       this.isPlaying = true;
@@ -941,16 +970,6 @@ export class PlayerModalManager {
 
     this._updateProgressBar();
     this._updateTimeDisplay();
-  }
-
-  _scrub(e) {
-    const timeline = this.modal.querySelector('#player-timeline-wrap');
-    if (!timeline) return;
-    const rect = timeline.getBoundingClientRect();
-    const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const totalDur = this._totalDuration();
-    const targetSeconds = Math.floor(pos * totalDur);
-    this._seekTo(targetSeconds);
   }
 
   _updateProgressBar() {
@@ -1013,6 +1032,14 @@ export class PlayerModalManager {
     if (this._keydownHandler) {
       window.removeEventListener('keydown', this._keydownHandler);
       this._keydownHandler = null;
+    }
+    if (this._onTimelineMove) {
+      window.removeEventListener('mousemove', this._onTimelineMove);
+      this._onTimelineMove = null;
+    }
+    if (this._onTimelineUp) {
+      window.removeEventListener('mouseup', this._onTimelineUp);
+      this._onTimelineUp = null;
     }
 
     // Detaching the source stops the browser holding the bridge connection open after close.

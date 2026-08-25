@@ -1067,6 +1067,37 @@ const torrentRegistry = new Map();
 // IP Rate Limiting Map: ip -> { searchCount, searchReset, streamCount, streamReset }
 const rateLimitMap = new Map();
 
+// Sessions that have already logged their [Stream Start] line, so it appears once per playback
+// rather than once per range request.
+const loggedStreamStarts = new Set();
+
+/**
+ * Logs the torrent's LIVE download progress at the moment playback begins.
+ *
+ * This is the only way to tell "it streamed while downloading" from "it streamed because the file
+ * had already finished downloading" — by the time a small release plays, it is often complete, and
+ * the two are indistinguishable from the outside.
+ */
+function logStreamStart(sessionId, hash, torrentName, mode) {
+  const key = `${sessionId}:${hash}`;
+  if (loggedStreamStarts.has(key)) return;
+  loggedStreamStarts.add(key);
+  if (loggedStreamStarts.size > 500) loggedStreamStarts.clear();
+
+  qbt.getAllTorrents()
+    .then((list) => {
+      const t = Array.isArray(list) ? list.find(x => x.hash && x.hash.toLowerCase() === hash) : null;
+      if (!t) return;
+      const pct = ((t.progress || 0) * 100).toFixed(1);
+      console.log(
+        `[Stream Start] "${torrentName}" mode=${mode} ` +
+        `torrentProgress=${pct}% dl=${((t.dlspeed || 0) / 1048576).toFixed(1)}MB/s ` +
+        `${Number(pct) < 99.9 ? '<-- PROGRESSIVE: playing while still downloading' : '(file already complete)'}`
+      );
+    })
+    .catch(() => {});
+}
+
 // Loopback capability tokens handed to FFmpeg/ffprobe: token -> { filePath, hash, ..., expiresAt }
 // FFmpeg reads the file over HTTP rather than off disk so it can SEEK (see /internal/piece-file).
 const internalStreamTokens = new Map();
@@ -1812,6 +1843,8 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
       releaseTorrentReference(matchedHash, torrentName);
       registered = null;
     };
+
+    logStreamStart(sessionId, matchedHash, torrentName, mode);
 
     if (mode === 'direct') {
       const contentType = ext === '.webm' ? 'video/webm' : 'video/mp4';
