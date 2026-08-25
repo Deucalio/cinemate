@@ -61,6 +61,10 @@ const DISK_USAGE_OVERRIDE_PCT = process.env.DISK_USAGE_OVERRIDE_PCT
   ? parseInt(process.env.DISK_USAGE_OVERRIDE_PCT, 10)
   : null;
 
+// Derived representations (HLS segment sets) live OUTSIDE the torrent's download directory, so
+// qBittorrent never sees them, rechecks them, or moves them on completion.
+const HLS_DIR = process.env.HLS_DIR || '/var/lib/cinemate/hls';
+
 // Where LRU state survives restarts. Without this, every deploy resets the eviction order and a
 // rewatch after a restart re-downloads a file that is still sitting on disk.
 const LRU_STATE_PATH = process.env.LRU_STATE_PATH || path.join(process.cwd(), '.cache', 'torrent-lru.json');
@@ -1109,6 +1113,174 @@ function decideStreamMode(summary, ext) {
   };
 }
 
+// ----------------- CACHE ENTRIES & REPRESENTATIONS -----------------
+//
+// A cached title is a SOURCE (the torrent and its media file) plus zero or more REPRESENTATIONS
+// derived from it (currently just HLS). Modelling it this way rather than treating a derived
+// artifact as "the cache" means:
+//
+//   - eviction has a correct footprint: source + everything derived from it
+//   - evicting a title necessarily removes its derived files; there is no second cleanup path to
+//     forget about
+//   - deleting the source once a representation is complete becomes a POLICY (HLS_SOURCE_POLICY)
+//     rather than an architectural change
+//
+// See docs/phase5-hls-plan.md §3.
+
+const REPRESENTATION_KINDS = ['hls'];
+
+/**
+ * Retention policy for the source once a representation is complete.
+ *   retain             (default) keep both — needed to rebuild, re-probe, or derive again
+ *   delete-on-complete (not implemented) halve the footprint, stop seeding
+ */
+const HLS_SOURCE_POLICY = process.env.HLS_SOURCE_POLICY || 'retain';
+
+function representationDir(kind, hash) {
+  if (kind !== 'hls') throw new Error(`Unknown representation kind: ${kind}`);
+  return path.join(HLS_DIR, String(hash || '').toLowerCase());
+}
+
+/**
+ * Total bytes a directory occupies. Used for the eviction footprint, so it must not throw on a
+ * directory that is being written to concurrently.
+ */
+function directorySizeBytes(dir) {
+  let total = 0;
+  try {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      try {
+        total += entry.isDirectory() ? directorySizeBytes(full) : fs.statSync(full).size;
+      } catch {}
+    }
+  } catch {}
+  return total;
+}
+
+function createCacheEntry({ hash, name, lastActive, pinned }) {
+  return {
+    hash,
+    name,
+    // Entry-level: a viewer pins a title, not a particular representation.
+    refCount: 0,
+    lastActive: lastActive || Date.now(),
+    pinned: Boolean(pinned),
+    cleanTimer: null,
+    source: {
+      mediaPath: null,
+      sizeBytes: 0,
+      state: 'unknown'   // unknown | downloading | complete
+    },
+    // kind -> { state, dir, sizeBytes, startedAt, completedAt, error }
+    // state: absent | running | complete | failed
+    representations: {}
+  };
+}
+
+/**
+ * Normalises an entry that predates this model, or one restored from persisted state.
+ */
+function ensureCacheEntryShape(entry) {
+  if (!entry) return entry;
+  if (!entry.source) entry.source = { mediaPath: null, sizeBytes: 0, state: 'unknown' };
+  if (!entry.representations) entry.representations = {};
+  return entry;
+}
+
+function getRepresentation(entry, kind) {
+  if (!entry) return null;
+  ensureCacheEntryShape(entry);
+  return entry.representations[kind] || null;
+}
+
+/**
+ * Reads a representation's state from DISK, which is the source of truth. The in-memory job
+ * registry tracks live processes only and is never authoritative — the same lesson that made
+ * torrentRegistry's in-memory-only state wipe every torrent on restart.
+ */
+function readRepresentationFromDisk(kind, hash) {
+  const dir = representationDir(kind, hash);
+  if (!fs.existsSync(dir)) return { state: 'absent', dir, sizeBytes: 0 };
+
+  let manifest = null;
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'));
+  } catch {}
+
+  const sizeBytes = directorySizeBytes(dir);
+
+  if (!manifest) {
+    // A directory we cannot identify is not a representation; reconciliation removes it.
+    return { state: 'failed', dir, sizeBytes, error: 'missing or unreadable manifest.json' };
+  }
+
+  return {
+    state: manifest.hls && manifest.hls.completedAt ? 'complete' : 'running',
+    dir,
+    sizeBytes,
+    startedAt: manifest.hls ? manifest.hls.startedAt : null,
+    completedAt: manifest.hls ? manifest.hls.completedAt : null,
+    manifest
+  };
+}
+
+/**
+ * Refreshes every representation's on-disk state and size for one entry.
+ */
+function refreshRepresentations(entry) {
+  if (!entry) return;
+  ensureCacheEntryShape(entry);
+  for (const kind of REPRESENTATION_KINDS) {
+    const onDisk = readRepresentationFromDisk(kind, entry.hash);
+    if (onDisk.state === 'absent' && !entry.representations[kind]) continue;
+    entry.representations[kind] = { ...(entry.representations[kind] || {}), ...onDisk };
+  }
+}
+
+/**
+ * What evicting this title actually reclaims: the source plus everything derived from it.
+ */
+function entryFootprintBytes(entry) {
+  if (!entry) return 0;
+  ensureCacheEntryShape(entry);
+  let total = entry.source.sizeBytes || 0;
+  for (const rep of Object.values(entry.representations)) {
+    total += rep.sizeBytes || 0;
+  }
+  return total;
+}
+
+/**
+ * True while a representation is being produced. Such a title must never be evicted: transcoding
+ * GROWS disk usage, so it can trigger the very eviction that would delete what it is building.
+ */
+function hasRunningRepresentation(entry) {
+  if (!entry || !entry.representations) return false;
+  return Object.values(entry.representations).some(r => r && r.state === 'running');
+}
+
+/**
+ * Removes every derived representation for a title. Called on eviction so derived files can never
+ * outlive their source.
+ */
+function deleteRepresentations(hash, reason) {
+  for (const kind of REPRESENTATION_KINDS) {
+    const dir = representationDir(kind, hash);
+    if (!fs.existsSync(dir)) continue;
+    try {
+      const freed = directorySizeBytes(dir);
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log(
+        `[Cache] Removed ${kind} representation for ${hash} ` +
+        `(${(freed / 1048576).toFixed(1)} MB) — ${reason}`
+      );
+    } catch (err) {
+      console.warn(`[Cache] Could not remove ${kind} representation for ${hash}:`, err.message);
+    }
+  }
+}
+
 /**
  * Persists lastActive / pinned across restarts so eviction order and pinning survive a deploy.
  * Small file, written on the GC tick; losing it costs nothing but a reset eviction order.
@@ -1497,14 +1669,62 @@ function isTorrentInUse(hash, entry) {
  * Kept distinct from isTorrentInUse so a pinned-but-idle torrent is not reported as "in use".
  */
 function isEvictionProtected(hash, entry) {
-  return isTorrentInUse(hash, entry) || Boolean(entry && entry.pinned);
+  return (
+    isTorrentInUse(hash, entry) ||
+    Boolean(entry && entry.pinned) ||
+    // Transcoding grows disk usage, which can cross the eviction threshold and delete the very
+    // title being built. See docs/phase5-hls-plan.md §5.5.
+    hasRunningRepresentation(entry)
+  );
 }
 
 async function evictTorrent(entry, torrent, reason) {
-  console.log(`[Auto-GC] Evicting "${torrent.name}" — ${reason}`);
+  const hash = torrent.hash.toLowerCase();
+  const footprint = entryFootprintBytes(entry);
+
+  console.log(
+    `[Auto-GC] Evicting "${torrent.name}" — ${reason}` +
+    (footprint ? ` (reclaiming ${(footprint / 1048576).toFixed(1)} MB)` : '')
+  );
+
   if (entry && entry.cleanTimer) clearTimeout(entry.cleanTimer);
+
+  // Derived files must never outlive their source.
+  deleteRepresentations(hash, reason);
+
   await qbt.deleteTorrent(torrent.hash, true, reason).catch(() => {});
-  purgeTorrentCaches(torrent.hash.toLowerCase());
+  purgeTorrentCaches(hash);
+}
+
+/**
+ * Deletes representation directories with no corresponding torrent.
+ *
+ * Eviction walks the torrent list, so a representation whose source has gone is invisible to it and
+ * would sit on disk forever. Runs on the GC tick and therefore also covers the boot case.
+ */
+function reconcileOrphanRepresentations(liveHashes) {
+  if (!fs.existsSync(HLS_DIR)) return;
+
+  let entries;
+  try {
+    entries = fs.readdirSync(HLS_DIR, { withFileTypes: true });
+  } catch (err) {
+    console.warn('[Cache] Could not scan representation directory:', err.message);
+    return;
+  }
+
+  for (const dirent of entries) {
+    if (!dirent.isDirectory()) continue;
+    const hash = dirent.name.toLowerCase();
+    if (liveHashes.has(hash)) continue;
+
+    // Never remove one that is actively being produced — a job can legitimately start moments
+    // before its torrent appears in the listing.
+    const entry = torrentRegistry.get(hash);
+    if (hasRunningRepresentation(entry)) continue;
+
+    deleteRepresentations(hash, 'orphan — no matching torrent');
+  }
 }
 
 setInterval(async () => {
@@ -1535,21 +1755,24 @@ setInterval(async () => {
       if (!liveHashes.has(hash)) purgeTorrentCaches(hash);
     }
 
+    // Representations whose source torrent no longer exists are orphans. Without this sweep they
+    // would occupy disk indefinitely while being invisible to eviction, which only ever walks the
+    // torrent list.
+    reconcileOrphanRepresentations(liveHashes);
+
     // Make sure every live torrent is tracked, restoring persisted history where we have it.
     for (const t of allTorrents) {
       const hash = t.hash.toLowerCase();
       if (torrentRegistry.has(hash)) continue;
 
       const restored = persistedLru[hash];
-      torrentRegistry.set(hash, {
+      torrentRegistry.set(hash, createCacheEntry({
         hash,
         name: t.name,
-        refCount: 0,
         // Start the idle clock now unless we have a real playback time from before the restart.
         lastActive: restored && restored.lastActive ? restored.lastActive : now,
-        pinned: Boolean(restored && restored.pinned),
-        cleanTimer: null
-      });
+        pinned: Boolean(restored && restored.pinned)
+      }));
       console.log(
         `[Auto-GC] Now tracking "${t.name}"` +
         (restored ? ' (restored playback history)' : ' (idle timer starts now)')
@@ -1561,6 +1784,13 @@ setInterval(async () => {
       const hash = t.hash.toLowerCase();
       const entry = torrentRegistry.get(hash);
       if (!entry) continue;
+
+      // Keep the footprint current: the source grows while downloading, and representations grow
+      // while being produced.
+      ensureCacheEntryShape(entry);
+      if (!entry.source.sizeBytes) entry.source.sizeBytes = t.total_size || t.size || 0;
+      entry.source.state = (t.progress || 0) >= 1 ? 'complete' : 'downloading';
+      refreshRepresentations(entry);
 
       if (isEvictionProtected(hash, entry)) {
         // Only genuine activity refreshes the idle clock; pinning must not make a torrent look
@@ -2209,16 +2439,17 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
 
     // Register the connection BEFORE any slow work so Auto-GC cannot delete it mid-setup.
     if (!torrentRegistry.has(matchedHash)) {
-      torrentRegistry.set(matchedHash, {
-        hash: matchedHash,
-        name: torrentName,
-        refCount: 0,
-        lastActive: Date.now(),
-        cleanTimer: null
-      });
+      torrentRegistry.set(matchedHash, createCacheEntry({ hash: matchedHash, name: torrentName }));
     }
 
-    const regEntry = torrentRegistry.get(matchedHash);
+    const regEntry = ensureCacheEntryShape(torrentRegistry.get(matchedHash));
+    // Record what the source actually is, so the eviction footprint is real rather than inferred.
+    regEntry.source.mediaPath = targetFilePath;
+    regEntry.source.sizeBytes = fileSize;
+    // Derived from the resolved torrent, not from `isComplete` — that is computed further down,
+    // and referencing it here is a temporal-dead-zone ReferenceError.
+    regEntry.source.state = (prep.torrentInfo && (prep.torrentInfo.progress || 0) >= 1)
+      ? 'complete' : 'downloading';
     regEntry.refCount++;
     regEntry.lastActive = Date.now();
     regEntry.name = torrentName;
@@ -2668,13 +2899,39 @@ app.get('/api/cache', async (req, res) => {
     const rows = (Array.isArray(torrents) ? torrents : []).map((t) => {
       const hash = t.hash.toLowerCase();
       const entry = torrentRegistry.get(hash);
+      if (entry) refreshRepresentations(entry);
+
+      const sourceBytes = (entry && entry.source && entry.source.sizeBytes)
+        || t.total_size || t.size || 0;
+
+      // Read representations from DISK rather than from the in-memory registry. The registry is
+      // populated by the GC sweep, so for the first 15s after boot — and for any torrent the sweep
+      // has not reached — it is empty, and reporting {} would have understated the footprint of
+      // every title. The filesystem is the source of truth; this endpoint should say so too.
+      const representations = {};
+      for (const kind of REPRESENTATION_KINDS) {
+        const onDisk = readRepresentationFromDisk(kind, hash);
+        if (onDisk.state === 'absent') continue;
+        representations[kind] = {
+          state: onDisk.state,
+          sizeBytes: onDisk.sizeBytes || 0,
+          completedAt: onDisk.completedAt || null
+        };
+      }
+
+      const repBytes = Object.values(representations).reduce((n, r) => n + (r.sizeBytes || 0), 0);
+
       return {
         hash,
         name: t.name,
-        sizeBytes: t.total_size || t.size || 0,
         progress: t.progress || 0,
+        // What evicting this title actually reclaims.
+        footprintBytes: sourceBytes + repBytes,
+        source: { sizeBytes: sourceBytes, state: entry && entry.source ? entry.source.state : 'unknown' },
+        representations,
         pinned: Boolean(entry && entry.pinned),
         inUse: isTorrentInUse(hash, entry),
+        transcoding: Object.values(representations).some(r => r.state === 'running'),
         idleMinutes: entry ? Math.round((now - entry.lastActive) / 60000) : null
       };
     }).sort((a, b) => (a.idleMinutes || 0) - (b.idleMinutes || 0));
@@ -2690,7 +2947,9 @@ app.get('/api/cache', async (req, res) => {
         emergencyHaltPercent: DISK_EMERGENCY_PCT,
         idleTtlMinutes: IDLE_TTL_MINUTES
       },
-      // Eviction order is the reverse of this list, skipping pinned and in-use entries.
+      sourcePolicy: HLS_SOURCE_POLICY,
+      totalFootprintBytes: rows.reduce((n, r) => n + r.footprintBytes, 0),
+      // Eviction order is the reverse of this list, skipping pinned, in-use and transcoding entries.
       cached: rows
     });
   } catch (err) {
@@ -2746,6 +3005,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🎞️ Video Transcode:    ${ALLOW_VIDEO_TRANSCODE ? 'enabled' : 'disabled (set ALLOW_VIDEO_TRANSCODE=1)'}`);
   console.log(`📦 Delivery Mode:      ${REQUIRE_COMPLETE ? 'cache-first (wait for full download)' : 'progressive piece-aware'}`);
   console.log(`♻️ Eviction:           LRU by last playback · evict >${DISK_AGGRESSIVE_PCT}% down to ${DISK_TARGET_PCT}% · halt >${DISK_EMERGENCY_PCT}%`);
+  console.log(`🎞️ Representations:    ${HLS_DIR} · source policy: ${HLS_SOURCE_POLICY}`);
   console.log(`🩺 Health check:       http://localhost:${PORT}/health`);
   console.log(`====================================================`);
 });

@@ -317,13 +317,31 @@ running HLS job."*
 
 ## 6. Implementation
 
-### 6.1 Cache entries and representations
+### 6.1 Cache entries and representations — ✅ DONE
 
-- [ ] Extend the torrent registry into `CacheEntry { source, representations }`.
-- [ ] Footprint = source + representations; LRU sorts on it.
-- [ ] `isEvictionProtected()` gains "has a running representation job".
-- [ ] Eviction removes representation directories with the source.
-- [ ] `/api/cache` reports per-representation size and state.
+- [x] Torrent registry extended into `CacheEntry { source, representations }`.
+- [x] Footprint = source + representations; eviction reports what it reclaims.
+- [x] `isEvictionProtected()` includes "has a running representation".
+- [x] Eviction removes representation directories with the source.
+- [x] `/api/cache` reports per-representation size and state, plus `totalFootprintBytes`
+      and `sourcePolicy`.
+- [x] Orphan reconciliation — representations whose torrent is gone are reclaimed on the GC tick.
+- [x] `HLS_DIR` (default `/var/lib/cinemate/hls`) and `HLS_SOURCE_POLICY` (default `retain`).
+
+**Notes from implementation:**
+
+- `/api/cache` reads representation state **from disk**, not from the in-memory registry. The
+  registry is populated by the GC sweep, so for the first 15 s after boot — and for any torrent the
+  sweep has not yet reached — it is empty, and the endpoint would have understated every title's
+  footprint. Consistent with §5: the filesystem is the source of truth.
+- Orphan reclamation is genuinely necessary rather than defensive: eviction only ever walks the
+  **torrent list**, so a representation whose source is gone is invisible to it and would occupy
+  disk indefinitely.
+- Footprint counts the whole directory, `manifest.json` included.
+
+Covered by `server/test/cache-representations.test.mjs` (15 assertions), including the case that
+motivates §5.5: under disk pressure, an idle title is evicted with its representation while a
+**transcoding** title is spared.
 
 ### 6.2 Transcode manager
 
