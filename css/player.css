@@ -533,12 +533,37 @@
   margin-top: 6px;
 }
 
+/*
+ * Determinate by default: width is set from the real download percentage.
+ * The pulsing animation is now opt-in via .is-indeterminate, for the genuinely
+ * unknown phase (waiting on swarm metadata) rather than as a permanent fiction.
+ */
 .buffering-progress-bar-fill {
-  width: 30%;
+  width: 0%;
   height: 100%;
   background: linear-gradient(90deg, var(--accent-primary), var(--accent-letterboxd));
   border-radius: 2px;
+  transition: width 0.4s ease-out;
+}
+
+.buffering-progress-bar-fill.is-indeterminate {
   animation: bufferPulse 1.8s ease-in-out infinite alternate;
+  transition: none;
+}
+
+.buffering-stats {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.buffering-stats strong {
+  color: var(--text-secondary);
+  font-weight: 600;
 }
 
 @keyframes bufferPulse {

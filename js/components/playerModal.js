@@ -117,7 +117,12 @@ export class PlayerModalManager {
             <h3 class="buffering-title" id="buffering-title">Connecting to Swarm...</h3>
             <p class="buffering-subtext" id="buffering-subtext">Requesting sequential download pieces via VPS qBittorrent bridge...</p>
             <div class="buffering-progress-bar-wrap">
-              <div class="buffering-progress-bar-fill"></div>
+              <div class="buffering-progress-bar-fill is-indeterminate" id="buffering-bar-fill"></div>
+            </div>
+            <div class="buffering-stats" id="buffering-stats" style="display:none;">
+              <span id="buffering-stat-progress"></span>
+              <span id="buffering-stat-speed"></span>
+              <span id="buffering-stat-eta"></span>
             </div>
           </div>
         </div>
@@ -426,12 +431,20 @@ export class PlayerModalManager {
       if (!this.currentMagnet) return;
       this._showBufferingHUD(
         'Buffering Stream...',
-        'Waiting for qBittorrent to verify the next pieces from the swarm...'
+        'The player has caught up with the download. Waiting for more of the file...'
       );
+      // Stalling mid-playback is a download problem again — show the real numbers.
+      this._startStatusPolling();
     });
 
-    video.addEventListener('playing', () => this._hideBufferingHUD());
-    video.addEventListener('canplay', () => this._hideBufferingHUD());
+    video.addEventListener('playing', () => {
+      this._hideBufferingHUD();
+      this._stopStatusPolling();
+    });
+    video.addEventListener('canplay', () => {
+      this._hideBufferingHUD();
+      this._stopStatusPolling();
+    });
     video.addEventListener('progress', () => this._updateBufferedRange());
 
     // Single, state-aware handler. The old one blind-reloaded the element every 3.5s forever,
@@ -674,6 +687,8 @@ export class PlayerModalManager {
 
     // Start heart-beating immediately so Auto-GC never deletes the torrent while it resolves.
     this._startHeartbeat();
+    // Show real download progress from the first second, rather than an indeterminate spinner.
+    this._startStatusPolling();
 
     const plan = await streamingBridge.prepareStream(magnetLink, releaseTitle, this.sessionId);
 
@@ -710,15 +725,19 @@ export class PlayerModalManager {
       streamInfo.title = `${plan.fileName || ''} — ${plan.reason || ''}`;
     }
 
+    const stillDownloading = plan.readyState === 'downloading';
+
     if (plan.mode === 'remux') {
       this._showBufferingHUD(
-        'Remuxing for your browser...',
+        stillDownloading ? 'Downloading & Remuxing...' : 'Remuxing for your browser...',
         `${plan.reason} — FFmpeg is rewrapping this release with stereo AAC audio.`
       );
     } else {
       this._showBufferingHUD(
-        'Buffering first pieces...',
-        'Streaming verified pieces directly from qBittorrent — native seeking enabled.'
+        stillDownloading ? 'Downloading...' : 'Starting playback...',
+        stillDownloading
+          ? 'Playback begins as soon as enough of the file is on the server.'
+          : 'Streaming directly from the server — native seeking enabled.'
       );
     }
 
@@ -801,6 +820,7 @@ export class PlayerModalManager {
   _showStreamError(message, code = '') {
     console.warn('[Player] stream failed', code || '', message);
     this._stopHeartbeat();
+    this._stopStatusPolling();
     this._showBufferingHUD('⚠️ Stream Unavailable', message);
 
     const hud = this.modal ? this.modal.querySelector('#player-buffering-hud') : null;
@@ -837,6 +857,85 @@ export class PlayerModalManager {
       clearInterval(this._heartbeatTimer);
       this._heartbeatTimer = null;
     }
+  }
+
+  /**
+   * Polls the bridge for real download progress while the player is waiting.
+   *
+   * Replaces an indeterminate spinner over a permanently-animating fake bar, under which a
+   * legitimate 60-second download and a permanent hang looked identical.
+   */
+  _startStatusPolling() {
+    this._stopStatusPolling();
+    if (!this.currentMagnet) return;
+
+    const generation = this._streamGeneration;
+
+    const poll = async () => {
+      if (!this.modal || generation !== this._streamGeneration) return this._stopStatusPolling();
+
+      const status = await streamingBridge.getStreamStatus(this.currentMagnet, this.currentStreamTitle);
+      if (!this.modal || generation !== this._streamGeneration) return this._stopStatusPolling();
+      if (!status || !status.ok) return;
+
+      this._renderDownloadProgress(status);
+    };
+
+    poll();
+    this._statusTimer = setInterval(poll, 2000);
+  }
+
+  _stopStatusPolling() {
+    if (this._statusTimer) {
+      clearInterval(this._statusTimer);
+      this._statusTimer = null;
+    }
+  }
+
+  _renderDownloadProgress(status) {
+    if (!this.modal) return;
+
+    const bar = this.modal.querySelector('#buffering-bar-fill');
+    const stats = this.modal.querySelector('#buffering-stats');
+    const progressEl = this.modal.querySelector('#buffering-stat-progress');
+    const speedEl = this.modal.querySelector('#buffering-stat-speed');
+    const etaEl = this.modal.querySelector('#buffering-stat-eta');
+
+    // Still waiting on metadata: genuinely unknown, so the pulse is honest here.
+    if (status.state === 'resolving') {
+      if (bar) { bar.classList.add('is-indeterminate'); bar.style.width = ''; }
+      if (stats) stats.style.display = 'none';
+      return;
+    }
+
+    const percent = typeof status.progressPercent === 'number' ? status.progressPercent : 0;
+
+    if (bar) {
+      bar.classList.remove('is-indeterminate');
+      bar.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+    }
+
+    if (stats) stats.style.display = 'flex';
+    if (progressEl) progressEl.innerHTML = `<strong>${percent.toFixed(1)}%</strong> downloaded`;
+    if (speedEl) {
+      const mbps = (status.dlSpeed || 0) / 1048576;
+      speedEl.innerHTML = mbps > 0
+        ? `<strong>${mbps.toFixed(1)}</strong> MB/s · ${status.seeds || 0} seeds`
+        : `${status.seeds || 0} seeds`;
+    }
+    if (etaEl) {
+      etaEl.innerHTML = status.etaSeconds > 0
+        ? `~<strong>${this._formatDuration(status.etaSeconds)}</strong> left`
+        : '';
+    }
+  }
+
+  _formatDuration(seconds) {
+    if (!seconds || !isFinite(seconds)) return '—';
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    const m = Math.floor(seconds / 60);
+    const sec = Math.round(seconds % 60);
+    return sec > 0 ? `${m}m ${sec}s` : `${m}m`;
   }
 
   _showBufferingHUD(title = 'Connecting to Swarm...', subtext = 'Requesting sequential download pieces via VPS qBittorrent bridge...') {
@@ -1015,6 +1114,7 @@ export class PlayerModalManager {
     streamingBridge.sendLeave(this.sessionId, this.currentInfoHash);
 
     this._stopHeartbeat();
+    this._stopStatusPolling();
 
     if (this.progressTimer) {
       clearInterval(this.progressTimer);

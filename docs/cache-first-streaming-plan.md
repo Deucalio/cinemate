@@ -1,6 +1,6 @@
 # Cache-First Streaming — Implementation Plan & Change Log
 
-> **Status:** Phase 0 (approved, not started)
+> **Status:** Phase 1 complete · Phase 2 next
 > **Owner:** Deucalio
 > **Created:** 2026-08-25
 
@@ -67,15 +67,37 @@ The player currently shows an indeterminate "Buffering Stream…" spinner over a
 progress bar**. It conveys nothing, so a 60-second wait is indistinguishable from a permanent hang —
 which is precisely why every failure so far looked identical.
 
-- [ ] `GET /api/stream/status?magnet=…` → `{ state, progress, dlSpeed, etaSeconds, ready }`.
+- [x] `GET /api/stream/status?magnet=…` → `{ state, progress, dlSpeed, etaSeconds, ready }`.
       Cheap: one `torrents/info` call, no file resolution, no probe.
-- [ ] `prepare` gains `readyState: 'downloading' | 'ready'` and stops being the blocking step.
-- [ ] Player polls status every 2 s while waiting.
-- [ ] Buffering HUD renders the real figure: `Downloading 42% · 71 MB/s · ~40s remaining`.
-      Same element, truthful contents; delete the fake bar animation.
-- [ ] Load the stream URL exactly once, when `ready`.
+- [x] `prepare` gains `readyState: 'downloading' | 'ready'`.
+- [x] Player polls status every 2 s while waiting.
+- [x] Buffering HUD renders the real figure.
+- [x] Fake bar animation removed.
+- [ ] ~~Load the stream URL exactly once, when `ready`~~ — deferred to Phase 2, which is where
+      withholding the URL until complete actually belongs.
 
-**Outcome:** _(fill in when landed)_
+**Outcome** (`707d138` Vite, Phase 1 commit below):
+
+- `/api/stream/status` returns `state`, `progress`, `progressPercent`, `dlSpeed`, `etaSeconds`,
+  `seeds`, `peers`. An unresolved magnet reports `state: 'resolving'` rather than erroring, so the
+  client can distinguish "waiting on metadata" from "downloading".
+- **ETA is computed from `amount_left / dlspeed`, not passed through.** qBittorrent reports
+  `eta: 8640000` as its "no estimate" sentinel; forwarding that would have rendered "~100 days left".
+  Its own value is only used when it is present and below that sentinel.
+- The HUD bar is now determinate, driven by real percentage. The pulsing animation survives as an
+  opt-in `.is-indeterminate` class used *only* while waiting on swarm metadata — the one phase where
+  progress genuinely is unknown.
+- Polling starts the moment a source is chosen, stops on `playing`/`canplay`, and **restarts on
+  `waiting`** — a mid-playback stall is a download problem again, so the numbers come back.
+- Test coverage added to `session-lifecycle.test.mjs`, including the ETA-sentinel case. Suite is at
+  **64 assertions**, all green.
+
+Also folded in ahead of the phases (step 1 of the agreed order):
+
+- **Vite adopted for the frontend** (`707d138`), vanilla — no framework change. HMR,
+  `import.meta.env`, a real build step, and an opt-in `/bridge` dev proxy.
+- TMDB / Prowlarr / bridge-URL credentials moved out of source into `.env.local`
+  (see `.env.example`). **They remain in git history and should be rotated.**
 
 ---
 
@@ -166,6 +188,8 @@ Append one entry per landed change. Newest first.
 
 | Date | Commit | Phase | What changed |
 |---|---|---|---|
+| 2026-08-25 | _(this commit)_ | 1 | `/api/stream/status`, `readyState` on prepare, determinate progress HUD with speed and ETA |
+| 2026-08-25 | `707d138` | 0 | Vite adopted (vanilla); credentials moved to `.env.local` |
 | 2026-08-25 | `a955c7e` | pre | Enforce sequential download on pre-existing torrents; log every torrent deletion with its reason; one FFmpeg per playback session |
 | 2026-08-25 | `a236618` | pre | Drag-scrubbing no longer spawns an FFmpeg per mousemove; removed auto-resume; made player controls honest; `[Stream Start]` logs live download % |
 | 2026-08-25 | `f6417b5` | pre | `piece_size` read from `/torrents/properties` instead of guessing 2 MB |

@@ -1720,6 +1720,65 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
 }
 
 /**
+ * Cheap progress poll for the "waiting to start" state.
+ *
+ * The player used to show an indeterminate spinner over a FAKE animated bar, so a legitimate
+ * 60-second download was indistinguishable from a permanent hang — which is exactly why every
+ * failure so far looked identical to the user. This endpoint costs one torrents/info call: no file
+ * resolution, no ffprobe, no piece work, so it is safe to poll every couple of seconds.
+ */
+app.get('/api/stream/status', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000), async (req, res) => {
+  const magnet = req.query.magnet || req.query.link;
+  if (!magnet) {
+    return res.status(400).json({ ok: false, error: 'Missing magnet link parameter' });
+  }
+
+  const infoHash = qbt.extractInfoHash(magnet);
+
+  try {
+    const torrentInfo = await qbt.findTorrent(infoHash, req.query.title || '', magnet);
+
+    if (!torrentInfo) {
+      return res.json({
+        ok: true,
+        state: 'resolving',
+        ready: false,
+        progress: 0,
+        message: 'Waiting for torrent metadata from the swarm...'
+      });
+    }
+
+    const progress = torrentInfo.progress || 0;
+    const dlSpeed = torrentInfo.dlspeed || 0;
+    const amountLeft = torrentInfo.amount_left || 0;
+
+    // qBittorrent's own `eta` is 8640000 when it has no estimate; compute our own when it can.
+    let etaSeconds = 0;
+    if (dlSpeed > 0 && amountLeft > 0) {
+      etaSeconds = Math.round(amountLeft / dlSpeed);
+    } else if (torrentInfo.eta && torrentInfo.eta > 0 && torrentInfo.eta < 8640000) {
+      etaSeconds = torrentInfo.eta;
+    }
+
+    res.json({
+      ok: true,
+      state: torrentInfo.state || 'unknown',
+      ready: progress >= 1,
+      progress,
+      progressPercent: Math.round(progress * 1000) / 10,
+      dlSpeed,
+      etaSeconds,
+      seeds: torrentInfo.num_seeds || 0,
+      peers: torrentInfo.num_leechs || 0,
+      totalBytes: torrentInfo.total_size || torrentInfo.size || 0,
+      name: torrentInfo.name || ''
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
  * Resolve-and-describe endpoint. The client calls this BEFORE pointing <video> at a stream.
  *
  * An HTML5 <video> reports failures as an opaque MEDIA_ERR_* code and never exposes the HTTP status
@@ -1775,10 +1834,17 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
       });
     }
 
+    const progress = prep.torrentInfo.progress || 0;
+
     res.json({
       ok: true,
       mode: decision.mode,
       reason: decision.reason,
+      // Phase 1: reported so the client can show real progress instead of a fake bar. Phase 2 will
+      // additionally WITHHOLD the stream URL until this is 'ready'.
+      readyState: progress >= 1 ? 'ready' : 'downloading',
+      progress,
+      progressPercent: Math.round(progress * 1000) / 10,
       infoHash: prep.matchedHash,
       torrentName: prep.torrentName,
       fileName: path.basename(prep.mediaName),

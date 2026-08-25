@@ -207,6 +207,24 @@ export const streamingBridge = {
   },
 
   /**
+   * Cheap download-progress poll, safe to call every couple of seconds.
+   * Returns { ok, state, ready, progress, progressPercent, dlSpeed, etaSeconds, seeds, ... }.
+   */
+  async getStreamStatus(magnetOrLink, releaseTitle = '') {
+    const serverUrl = this.getStreamServerUrl();
+    let url = `${serverUrl}/api/stream/status?magnet=${encodeURIComponent(magnetOrLink)}`;
+    if (releaseTitle) url += `&title=${encodeURIComponent(releaseTitle)}`;
+
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const data = await res.json().catch(() => null);
+      return data || { ok: false, error: `Bridge returned HTTP ${res.status}` };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  },
+
+  /**
    * Construct the HTTP stream URL for an HTML5 <video>.
    * `mode` is 'direct' (native byte-range seeking) or 'remux' (progressive fMP4 from FFmpeg).
    */

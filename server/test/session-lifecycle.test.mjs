@@ -44,6 +44,10 @@ const mockQbt = http.createServer((req, res) => {
     return send([{
       hash: HASH, name: 'MockRelease', save_path: root, content_path: releaseDir,
       added_on: Math.floor(Date.now() / 1000) - 3600,
+      // Fields the /api/stream/status endpoint reports on.
+      state: 'downloading', progress: 0.423, dlspeed: 8 * 1048576,
+      amount_left: 40 * 1048576, eta: 8640000, num_seeds: 21, num_leechs: 4,
+      total_size: PAD_SIZE + MOVIE_SIZE,
       magnet_uri: `magnet:?xt=urn:btih:${HASH}`
     }]);
   }
@@ -104,10 +108,40 @@ check('reports the torrent-declared file size', prep.fileSizeBytes === MOVIE_SIZ
 check('reports the resolved infoHash', prep.infoHash === HASH, prep.infoHash);
 check('reports the media file it picked', prep.fileName === 'movie.mp4', prep.fileName);
 check('direct mode advertises native seeking', prep.seekable === true);
+check('prepare reports readyState so the client can show progress',
+  prep.readyState === 'downloading' && prep.progressPercent === 42.3,
+  `readyState=${prep.readyState} progress=${prep.progressPercent}`);
 
 const badPrep = await fetch(`${base}/api/stream/prepare`);
 check('missing magnet returns a JSON 400', badPrep.status === 400 &&
   (await badPrep.json()).ok === false);
+
+// ---- status endpoint --------------------------------------------------------
+console.log('\n--- /api/stream/status ---');
+const statusRes = await fetch(`${base}/api/stream/status?magnet=${magnet}&title=MockRelease`);
+const status = await statusRes.json();
+
+check('returns 200 with ok:true', statusRes.status === 200 && status.ok === true,
+  JSON.stringify(status).slice(0, 160));
+check('reports real download progress', status.progressPercent === 42.3, String(status.progressPercent));
+check('is not "ready" while still downloading', status.ready === false, String(status.ready));
+check('reports download speed', status.dlSpeed === 8 * 1048576, String(status.dlSpeed));
+check('reports swarm health', status.seeds === 21 && status.peers === 4,
+  `seeds=${status.seeds} peers=${status.peers}`);
+// qBittorrent reports eta=8640000 as "no estimate"; it must be computed, not passed through.
+check('computes ETA from bytes remaining rather than passing through qBittorrent sentinel',
+  status.etaSeconds === 5, `${status.etaSeconds}s`);
+
+const unknownRes = await fetch(
+  `${base}/api/stream/status?magnet=${encodeURIComponent('magnet:?xt=urn:btih:' + 'f'.repeat(40))}`
+);
+const unknown = await unknownRes.json();
+check('an unknown torrent reports "resolving", not an error',
+  unknown.ok === true && unknown.state === 'resolving' && unknown.ready === false,
+  JSON.stringify(unknown).slice(0, 120));
+
+const noMagnet = await fetch(`${base}/api/stream/status`);
+check('missing magnet returns 400', noMagnet.status === 400, String(noMagnet.status));
 
 // ---- torrent is NOT paused while a connection is live -----------------------
 console.log('\n--- lifecycle: no pause mid-playback ---');
