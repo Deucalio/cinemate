@@ -186,7 +186,12 @@ Suite total: **96 assertions across 6 suites**, all green.
 
 ---
 
-### Phase 4 — Optional fast start *(only after Phase 2 is solid)*
+### Phase 4 — Optional fast start — NOT STARTED, and probably should not be
+
+**Recommendation: leave this unbuilt.** It reintroduces exactly the piece-gating complexity Phase 2
+removed, to save roughly 60 seconds on a host that downloads at 12–70 MB/s. Phase 5 delivers a
+better experience than partial-file playback can. Revisit only if waiting becomes a real complaint —
+for example if 8 GB 4K releases off thin swarms become normal.
 
 Worth recording the insight even if we never build it:
 
@@ -260,7 +265,8 @@ exactly when playback was starting.
 `cinemate`). \*arr tools only manage their configured category. The bridge also warns once when it
 finds a torrent under a foreign category, since that means something else may be managing it.
 
-**Better long-term fix:** give the bridge its own qBittorrent instance. Sharing one means another
+**Better long-term fix:** give the bridge its own qBittorrent instance — runbook in
+[dedicated-qbittorrent.md](./dedicated-qbittorrent.md). Sharing one means another
 tool's retention policy can delete files mid-stream, our `filePrio` and sequential toggles alter its
 torrents, and `MAX_ACTIVE_TORRENTS` counts torrents we do not own. See
 [scaling-roadmap.md](./scaling-roadmap.md).
