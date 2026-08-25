@@ -146,6 +146,8 @@ class QBittorrentClient {
     this._warned = new Set();
     // hashes already switched to sequential mode (the qBt endpoints are toggles, not setters)
     this._sequentialEnsured = new Set();
+    // hashes already moved into our category
+    this._categoryEnsured = new Set();
   }
 
   warnOnce(key, message) {
@@ -305,6 +307,64 @@ class QBittorrentClient {
     } catch (err) {
       this._sequentialEnsured.delete(hash);
       console.warn('[Sequential] Could not set download order:', err.message);
+    }
+  }
+
+  /**
+   * Moves a torrent into our category if it is not already there.
+   *
+   * Setting the category at add-time is not enough: a torrent qBittorrent already has is never
+   * re-added (add is skipped for existing torrents), so pre-existing torrents kept their empty
+   * category and stayed visible to whatever else manages this instance. That is how a completed
+   * download was still being deleted after the add-time category fix shipped.
+   *
+   * The category is created with NO save path, so it resolves to the default and qBittorrent has no
+   * reason to relocate any files — important, since a category change can move data when a torrent
+   * has Automatic Torrent Management enabled.
+   */
+  async ensureCategory(torrentInfo) {
+    if (!QBT_CATEGORY) return;
+
+    const hash = String(torrentInfo.hash || '').toLowerCase();
+    if (!hash || this._categoryEnsured.has(hash)) return;
+
+    if (torrentInfo.category === QBT_CATEGORY) {
+      this._categoryEnsured.add(hash);
+      return;
+    }
+
+    this._categoryEnsured.add(hash);
+
+    const post = async (action, params) => this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+
+    try {
+      // Idempotent in effect: returns a conflict if the category already exists, which is fine.
+      const create = new URLSearchParams();
+      create.append('category', QBT_CATEGORY);
+      create.append('savePath', '');
+      await post('createCategory', create).catch(() => {});
+
+      const assign = new URLSearchParams();
+      assign.append('hashes', hash);
+      assign.append('category', QBT_CATEGORY);
+      const res = await post('setCategory', assign);
+
+      if (res.ok) {
+        console.log(
+          `[Category] Moved "${torrentInfo.name}" into "${QBT_CATEGORY}" ` +
+          `(was "${torrentInfo.category || 'none'}")` +
+          (torrentInfo.auto_tmm ? ' — note: this torrent has Automatic Torrent Management enabled' : '')
+        );
+      } else {
+        console.warn(`[Category] setCategory returned ${res.status} for "${torrentInfo.name}"`);
+      }
+    } catch (err) {
+      this._categoryEnsured.delete(hash);
+      console.warn('[Category] Could not set category:', err.message);
     }
   }
 
@@ -1703,16 +1763,10 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
       // Must happen for pre-existing torrents too, not just ones we just added.
       await qbt.ensureSequentialDownload(torrentInfo);
 
-      // A torrent under a different category is very likely managed by something else on this
-      // host (Sonarr/Radarr import-then-delete, for example). Say so once rather than letting the
-      // files disappear mid-playback with no explanation.
-      if (QBT_CATEGORY && torrentInfo.category && torrentInfo.category !== QBT_CATEGORY) {
-        qbt.warnOnce(
-          `category:${torrentInfo.category}`,
-          `[Category] "${torrentInfo.name}" is in qBittorrent category "${torrentInfo.category}", ` +
-          `not "${QBT_CATEGORY}". Another tool may be managing it and can delete it on completion.`
-        );
-      }
+      // Claim the torrent for our category, whatever it is currently in — INCLUDING no category at
+      // all, which is the state every pre-existing torrent was in and exactly what left them
+      // exposed to another tool's completed-download handling.
+      await qbt.ensureCategory(torrentInfo);
 
       // A torrent that was complete and is now not complete has been reset by something outside
       // this process (qBittorrent recheck, external removal, storage moved). Say so loudly —
