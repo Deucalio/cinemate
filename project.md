@@ -1,58 +1,88 @@
-# CineStream Pro (CineMate) — Production Technical Architecture & Specification
+# CineStream Pro (CineMate) — Technical Architecture & Specification
 
-> **Next-Generation Cinema Discovery & Piece-Aware Distributed Media Streaming Engine**
-> Built with vanilla JavaScript, modern CSS design tokens, TMDB metadata, Prowlarr Torznab indexer aggregation, native qBittorrent HTTP 206 piece-aware streaming, and a PostgreSQL database powered by Prisma ORM.
+> **Cinema Discovery + Cache-First BitTorrent Streaming**
+> Vite-bundled vanilla JavaScript client, TMDB metadata, Prowlarr Torznab indexer aggregation, a
+> dedicated qBittorrent instance driven over its WebUI API, FFmpeg remuxing, and PostgreSQL via
+> Prisma ORM.
+
+**Companion documents**
+
+| Document | Purpose |
+|---|---|
+| [docs/cache-first-streaming-plan.md](docs/cache-first-streaming-plan.md) | The architecture change from piece-aware to cache-first, phase by phase, with outcomes |
+| [docs/phase5-hls-plan.md](docs/phase5-hls-plan.md) | Next up — progressive HLS transcode |
+| [docs/dedicated-qbittorrent.md](docs/dedicated-qbittorrent.md) | Runbook for the bridge's own qBittorrent instance |
+| [docs/scaling-roadmap.md](docs/scaling-roadmap.md) | What breaks at 200 concurrent viewers, and in what order |
 
 ---
 
-## 1. Executive Architecture Overview
+## 1. Architecture Overview
 
-CineStream Pro bridges a cinematic web client with an on-demand, piece-aware BitTorrent streaming daemon and a persistent PostgreSQL database. Rather than waiting for full multi-gigabyte media downloads, the bridge maps HTTP byte-range requests directly to BitTorrent piece indices, dynamically prioritizes required chunks from the swarm, verifies piece readiness on disk, and pipes continuous media streams to the browser while synchronizing user accounts, watch progress, and social reviews.
+The bridge downloads a release to the VPS, waits for it to complete, then serves it — either as
+plain HTTP 206 byte ranges (when the browser can decode it) or through FFmpeg (when it cannot).
+
+**This is deliberately not progressive streaming.** The swarm runs at 12–70 MB/s on this host, so a
+2–3 GB release lands in about a minute. Paying that once buys a delivery path with no piece
+verification, no sparse reads, and native browser seeking. The piece-aware progressive engine is
+retained behind `REQUIRE_COMPLETE=0` and still feeds `ffprobe`. See
+[docs/cache-first-streaming-plan.md](docs/cache-first-streaming-plan.md) for why.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                CLIENT BROWSER (PORT 3000)                              │
-│                                                                                        │
-│   ┌─────────────────────┐    ┌─────────────────────┐    ┌──────────────────────────┐   │
-│   │   Discover / Home   │    │  User Auth & Modals │    │  Cinema Theater Player   │   │
-│   │   Trending, Genres  │    │  Diary & Reviews    │    │  Timeline, Buffering HUD │   │
-│   └──────────┬──────────┘    └──────────┬──────────┘    └────────────┬─────────────┘   │
-└──────────────┼──────────────────────────┼────────────────────────────┼─────────────────┘
-               │                          │                            │
-               ▼                          ▼                            ▼
-      ┌─────────────────┐        ┌───────────────────────────────────────────────────────┐
-      │    TMDB API     │        │              VPS BACKEND BRIDGE (:8899)               │
-      │  v3 / Discover  │        │       Express + Prisma ORM + Piece-Aware Engine       │
-      └─────────────────┘        └────────────┬─────────────────────────────┬────────────┘
-                                              │                             │
-                               ┌──────────────┴──────────────┐              │
-                               ▼                             ▼              ▼
-                  ┌─────────────────────────┐   ┌────────────────────────┐  │
-                  │     PostgreSQL :5432    │   │     Prowlarr :9696     │  │
-                  │   Prisma Managed DB     │   │ Torznab Community Feeds│  │
-                  │  Users, Progress, Lists │   │ (Loopback Protected)   │  │
-                  └─────────────────────────┘   └────────────────────────┘  │
-                                                                            │
-                                                                            ▼
-                                                               ┌─────────────────────────┐
-                                                               │   qBittorrent :18080    │
-                                                               │  Sequential C++ Engine  │
-                                                               └────────────┬────────────┘
-                                                                            │ (Piece Verification)
-                                                                            ▼
-                                                               ┌─────────────────────────┐
-                                                               │  HTTP 206 Piece Stream  │
-                                                               │  Heartbeat Auto-GC      │
-                                                               └─────────────────────────┘
+│                       CLIENT BROWSER — Vite dev server :3000                            │
+│                                                                                         │
+│   ┌─────────────────────┐   ┌─────────────────────┐   ┌──────────────────────────┐      │
+│   │  Discover / Home    │   │ User Auth & Modals  │   │  Cinema Theater Player   │      │
+│   │  Trending, Genres   │   │ Diary & Reviews     │   │  Timeline, Progress HUD  │      │
+│   └──────────┬──────────┘   └──────────┬──────────┘   └────────────┬─────────────┘      │
+└──────────────┼─────────────────────────┼───────────────────────────┼────────────────────┘
+               │                         │                           │
+               ▼                         ▼                           ▼
+      ┌─────────────────┐       ┌────────────────────────────────────────────────────────┐
+      │    TMDB API     │       │              VPS BACKEND BRIDGE :8899                  │
+      │  v3 / Discover  │       │   Express · Prisma ORM · Delivery-Mode Decision Engine │
+      └─────────────────┘       └───────────┬──────────────────────────────┬─────────────┘
+                                            │                              │
+                             ┌──────────────┴───────────┐                  │
+                             ▼                          ▼                  ▼
+                ┌─────────────────────────┐  ┌────────────────────────┐    │
+                │    PostgreSQL :5432     │  │     Prowlarr :9696     │    │
+                │   Prisma Managed DB     │  │ Torznab Community Feeds│    │
+                │  Users, Progress, Lists │  │  (Loopback Protected)  │    │
+                └─────────────────────────┘  └────────────────────────┘    │
+                                                                           ▼
+                                                    ┌──────────────────────────────────┐
+                                                    │  qBittorrent :18081 (DEDICATED)  │
+                                                    │  own profile · own storage       │
+                                                    │  category "cinemate"             │
+                                                    └───────────────┬──────────────────┘
+                                                                    │ download completes
+                                                                    ▼
+                                        ┌───────────────────────────────────────────────┐
+                                        │            DELIVERY MODE DECISION             │
+                                        │  ffprobe → container + codecs + channels      │
+                                        ├───────────────────────┬───────────────────────┤
+                                        │ DIRECT                │ REMUX                 │
+                                        │ MP4/WebM + H.264 +    │ everything else       │
+                                        │ AAC ≤ 2ch             │ FFmpeg → fMP4         │
+                                        │ HTTP 206, native seek │ video copy, AAC audio │
+                                        │ zero CPU              │ restart-on-seek       │
+                                        └───────────────────────┴───────────────────────┘
 ```
+
+**Why the qBittorrent instance is dedicated.** The bridge originally shared the host's
+`stream-download.service` with a Sonarr/Radarr stack, whose Completed Download Handling imported
+finished downloads and then deleted the torrent *and its data* — removing files the moment playback
+began. Full diagnosis in §9.3.
 
 ---
 
-## 2. Database Schema & User Account Architecture (Prisma + PostgreSQL)
+## 2. Database Schema (Prisma + PostgreSQL)
 
-The system utilizes PostgreSQL via **Prisma ORM** for persistent data, enforcing relational integrity, foreign key cascading, and type-safe transactions.
+Persistent data uses PostgreSQL via **Prisma ORM**, with relational integrity, foreign-key cascading
+and type-safe transactions.
 
-### Database Models ([server/prisma/schema.prisma](file:///d:/vscode/netflix/server/prisma/schema.prisma))
+### Models ([server/prisma/schema.prisma](server/prisma/schema.prisma))
 
 ```prisma
 model User {
@@ -167,73 +197,91 @@ model PlaybackSession {
 
 ---
 
-## 3. Complete REST API Specifications
+## 3. REST API
 
 ### 🔐 Authentication (`/api/auth`)
 
-| Method   | Endpoint               | Description                                                 | Auth Required          |
-| -------- | ---------------------- | ----------------------------------------------------------- | ---------------------- |
-| `POST` | `/api/auth/register` | Register a new user (`username`, `email`, `password`) | No                     |
-| `POST` | `/api/auth/login`    | Login with username/email & password, returns JWT           | No                     |
-| `GET`  | `/api/auth/me`       | Fetch authenticated user profile & count metrics            | Yes (`Bearer <JWT>`) |
+| Method | Endpoint | Description | Auth |
+|---|---|---|---|
+| `POST` | `/api/auth/register` | Register (`username`, `email`, `password`) | No |
+| `POST` | `/api/auth/login` | Login, returns JWT | No |
+| `GET` | `/api/auth/me` | Profile & count metrics | `Bearer <JWT>` |
 
 ### 📊 User Data & Sync (`/api/user`)
 
-| Method   | Endpoint                      | Description                                                 | Auth Required |
-| -------- | ----------------------------- | ----------------------------------------------------------- | ------------- |
-| `GET`  | `/api/user/progress`        | Fetch user's cross-device watch history & resume timestamps | Yes           |
-| `POST` | `/api/user/progress`        | Upsert playback timestamp, duration, and completion status  | Yes           |
-| `GET`  | `/api/user/reviews`         | Fetch personal watch diary & Letterboxd-style ratings       | Yes           |
-| `POST` | `/api/user/reviews`         | Add or update star rating, watch date, and review text      | Yes           |
-| `GET`  | `/api/user/lists`           | Fetch custom curated watchlists with included items         | Yes           |
-| `POST` | `/api/user/lists`           | Create a new named custom collection (public or private)    | Yes           |
-| `POST` | `/api/user/lists/:id/items` | Add title to a specific user collection                     | Yes           |
+| Method | Endpoint | Description | Auth |
+|---|---|---|---|
+| `GET` | `/api/user/progress` | Cross-device watch history & resume timestamps | Yes |
+| `POST` | `/api/user/progress` | Upsert playback timestamp, duration, completion | Yes |
+| `GET` | `/api/user/reviews` | Watch diary & Letterboxd-style ratings | Yes |
+| `POST` | `/api/user/reviews` | Add or update rating, watch date, review text | Yes |
+| `GET` | `/api/user/lists` | Custom watchlists with items | Yes |
+| `POST` | `/api/user/lists` | Create a named collection | Yes |
+| `POST` | `/api/user/lists/:id/items` | Add a title to a collection | Yes |
 
-### 📡 Streaming, Telemetry & Maintenance
+### 📡 Streaming
 
-| Method   | Endpoint                          | Description                                               | Auth Required           |
-| -------- | --------------------------------- | --------------------------------------------------------- | ----------------------- |
-| `GET`  | `/api/stream`                   | Piece-aware HTTP 206 Partial Content video streaming      | Optional / Session      |
-| `POST` | `/api/stream/session/heartbeat` | 10-second player heartbeat to maintain`ACTIVE` state    | No                      |
-| `GET`  | `/api/search`                   | Rate-limited (30/min) Prowlarr Torznab proxy search       | No                      |
-| `GET`  | `/api/status`                   | List active downloads, speeds, and state from qBittorrent | No                      |
-| `POST` | `/api/cleanup`                  | Trigger manual disk garbage collection                    | Yes (`X-Admin-Token`) |
-| `GET`  | `/health`                       | System health, RAM, Load Avg, Disk Usage & Bandwidth      | No                      |
+| Method | Endpoint | Description | Auth |
+|---|---|---|---|
+| `GET` | `/api/stream/prepare` | **Resolve a magnet and return the delivery plan** — mode, codecs, duration, readiness — or a typed error, *before* `<video>` sees a URL | No |
+| `GET` | `/api/stream/status` | Cheap download-progress poll: `progress`, `dlSpeed`, `etaSeconds`, `seeds`. One `torrents/info` call, safe every 2 s | No |
+| `GET` | `/api/stream` | The stream itself. HTTP 206 byte ranges (direct) or progressive fMP4 (remux) | Optional / Session |
+| `POST` | `/api/stream/session/heartbeat` | 10-second player heartbeat maintaining `ACTIVE` state | No |
+| `POST` | `/api/stream/session/leave` | Explicit teardown, sent on player close and tab close (`pagehide`) | No |
+
+`prepare` exists because a `<video>` element reports failures only as an opaque `MEDIA_ERR_*` code —
+"no seeders", "unsupported codec" and "disk full" were all indistinguishable, and every one of them
+presented as an endless spinner.
+
+### 🗄️ Cache & Maintenance
+
+| Method | Endpoint | Description | Auth |
+|---|---|---|---|
+| `GET` | `/api/cache` | Cached titles with `pinned` / `inUse` / `idleMinutes`, plus active thresholds. Eviction order is the reverse of the listing | No |
+| `POST` | `/api/torrent/pin` | Pin or unpin a title, exempting it from idle expiry and LRU eviction. Persisted | `X-Admin-Token` |
+| `POST` | `/api/cleanup` | Manual disk garbage collection | `X-Admin-Token` |
+| `GET` | `/api/search` | Rate-limited Prowlarr Torznab proxy search | No |
+| `GET` | `/api/status` | Raw qBittorrent torrent list | No |
+| `GET` | `/health` | Health, toolchain, telemetry, limits, cache stats | No |
+
+### 🔒 Internal
+
+| Method | Endpoint | Description | Access |
+|---|---|---|---|
+| `GET` | `/internal/piece-file` | Piece-verified file bytes with full Range support, for FFmpeg / ffprobe | **Loopback only**, capability token |
+
+This endpoint exists so FFmpeg can **seek**. A standard `.mp4` keeps its `moov` index at the end of
+the file; piping into `ffmpeg -i pipe:0` is non-seekable, so it had to read the entire
+multi-gigabyte file before emitting a frame. Over HTTP it issues a Range request and starts in
+seconds. Against a *complete* file FFmpeg now reads the path directly and this endpoint is used only
+by `ffprobe` and by the progressive path.
 
 ---
 
-## 4. The Piece-Aware Streaming Engine
+## 4. Delivery Modes
 
-A standard `fs.createReadStream()` call on an in-progress torrent file does not guarantee byte availability, because torrent clients pre-allocate sparse file boundaries on disk. CineStream Pro implements a **Byte-Range to Torrent-Piece Mapper & Availability Layer**:
+### 4.1 The decision
+
+`ffprobe` runs once per file and the result is cached:
 
 ```
-Browser Request
+container ∈ {mp4, m4v, webm}
+  AND video ∈ {h264, vp8, vp9, av1}
+  AND audio ∈ {aac, mp3, opus, vorbis}
+  AND channels ≤ 2
    │
-   │ Range: bytes=80,000,000 - 90,000,000
-   ▼
-Streaming Bridge
-   │
-   ├── 1. Compute Global Torrent Offset & File Piece Range
-   │      startPiece = firstPiece + floor(startByte / pieceSize)
-   │      endPiece   = firstPiece + floor(endByte / pieceSize)
-   │
-   ├── 2. Query qBittorrent Piece States (/api/v2/torrents/pieceStates)
-   │      [Piece 412: Have ✓] [Piece 413: Have ✓] [Piece 414: Missing ✗]
-   │
-   ├── 3. File-Level Prioritization
-   │      Target file -> Priority 7, all other files (samples/subs/extras) -> Priority 0
-   │      NOTE: qBittorrent's WebUI API v2 exposes no piece-level priority setter. Read-ahead is
-   │      driven by sequentialDownload + firstLastPiecePrio + filePrio. The bridge probes for a
-   │      piecePriority endpoint once at runtime and logs whether this build supports it.
-   │
-   ├── 4. Asynchronous Readiness Polling (250ms interval)
-   │      Wait until target piece is verified on disk
-   │
-   └── 5. Stream from Disk
-          fs.createReadStream(filePath, { start, end }) ──> HTTP 206 Partial Content
+   ├── yes ──> DIRECT : fs.createReadStream + HTTP 206. Native seeking, zero CPU.
+   └── no  ──> REMUX  : FFmpeg → progressive fMP4. Video copied, audio → stereo AAC 192k.
 ```
 
-### Byte Offset → Global Piece Index
+Override per request with `?mode=direct|remux`. The legacy `?remux=1` flag still works.
+
+While a torrent is incomplete, `prepare` returns `readyState: 'downloading'` with progress and
+**exits before ffprobe runs** — probing a sparse file is what produced the
+`probe unavailable → falling back on container extension` path that made every incomplete `.mkv`
+guess at its own codecs.
+
+### 4.2 Byte offset → global piece index *(progressive path only)*
 
 A piece index is relative to the **whole torrent**, not to one file. Most releases ship the movie
 alongside subtitles, samples and NFOs, so the video does not begin at piece 0:
@@ -242,283 +290,339 @@ alongside subtitles, samples and NFOs, so the video does not begin at piece 0:
 globalPiece = floor((fileOffsetInTorrent + byteOffsetInFile) / pieceSize)
 ```
 
-`fileOffsetInTorrent` comes from `/api/v2/torrents/files`, by summing the sizes of preceding files
-and cross-checking the result against qBittorrent's own `piece_range`. If the two disagree (libtorrent
-can hide padding files from the listing) the bridge rounds the offset **up** to the next piece
-boundary — waiting for one extra piece is safe; reading one piece too early serves sparse zero-bytes.
+- `pieceSize` comes from **`/api/v2/torrents/properties`** — it is *not* a field of `torrents/info`.
+- `fileOffsetInTorrent` comes from `/api/v2/torrents/files`, summing preceding file sizes and
+  cross-checking against qBittorrent's own `piece_range`. When the two disagree (libtorrent can hide
+  padding files) the offset is rounded **up** to the next piece boundary: waiting for one extra
+  piece is safe, reading one piece early serves sparse zeros.
 
-### Seeking Support
+### 4.3 Read-ahead control
 
-- **Direct mode** — the browser seeks natively with a normal `Range` request, and the bridge maps
-  the new offset onto piece indices and waits for verification.
-- **Remux mode** — progressive fMP4 carries no index, so seeking outside the buffered window
-  restarts FFmpeg at the new timestamp via `-ss` (`&startSec=`). Seeks *into* buffered territory
-  are served from the element's own buffer without restarting anything.
+qBittorrent's WebUI API v2 exposes **no piece-level priority setter**. Read-ahead comes from:
+
+- `sequentialDownload` and `firstLastPiecePrio` — set at add time, and **explicitly toggled on for
+  pre-existing torrents**, since `torrents/add` is a no-op for a torrent the client already has
+- `filePrio` — target file to 7, everything else to 0, but only while `progress < 1`
+
+The consequence is that **seeking ahead of the download head cannot be made instant.** The bridge
+cannot make the download head jump; it can only wait for sequential progress to reach the offset.
+Under cache-first this stops mattering, since playback only begins once the file is whole.
 
 ---
 
 ## 5. Defensive Security & Torrent Sanitization
 
-CineStream adheres to strict defensive security practices when processing third-party torrent swarms:
-
 ```
 Torrent Contents (Untrusted Swarm Data)
    │
-   ├── 1. Enumerate all file entries
+   ├── 1. Select from the torrent's FILE TABLE, not by scanning disk
+   │      Final names and sizes are valid the moment metadata lands
    │
-   ├── 2. Path Traversal Guard
-   │      Canonical check: path.resolve(filePath).startsWith(baseDownloadDir)
-   │      Reject any ../ or out-of-boundary references
+   ├── 2. Forbidden Extension Blacklist
+   │      Block .exe, .bat, .cmd, .scr, .vbs, .ps1, .sh, .iso, .msi
    │
-   ├── 3. Forbidden Extension Blacklist
-   │      Block .exe, .bat, .cmd, .scr, .vbs, .sh, .iso, .msi
+   ├── 3. Media Whitelist & Minimum Size Threshold
+   │      Allow .mp4, .mkv, .webm, .m4v, .avi, .ts  (size ≥ 5 MB)
+   │      Samples, trailers and featurettes lose to the feature
    │
-   ├── 4. Media Whitelist & Minimum Size Threshold
-   │      Allow only .mp4, .webm, .mkv, .m4v (Size >= 5 MB)
-   │      Filter out sample clips, trailers, and text/nfo junk
+   ├── 4. Path Traversal Guard
+   │      The resolved path must stay inside a directory qBittorrent itself reported
+   │      (save_path, download_path or content_path)
    │
    └── 5. Safe Candidate Selected for Streaming
 ```
 
+Extensions are matched against the **logical** filename with any `.!qB` incomplete suffix stripped —
+qBittorrent appends it while downloading, so `Movie.mp4` is `Movie.mp4.!qB` on disk and matches no
+whitelist.
+
+**Other guards:** the internal file endpoint is loopback-only with capability tokens; admin
+endpoints require `X-Admin-Token`; per-IP rate limiting on search and stream; a disk soft cap
+returning `507`.
+
+> **Not yet addressed:** `/api/stream` and `/api/search` have no authentication. Anyone who can
+> reach the host can use the bridge. Acceptable for single-user local use; see
+> [docs/scaling-roadmap.md](docs/scaling-roadmap.md) §5 before exposing it.
+
 ---
 
-## 6. Playback Session Architecture & Lifecycle
+## 6. Playback Session Lifecycle
 
-Browsers generate dozens of short-lived HTTP connections during single-stream playback. CineStream Pro separates **TCP connection state** from **Playback Session State**:
+Browsers open and abandon dozens of short-lived connections per video, so **TCP connection state**
+is kept separate from **playback session state**.
 
 ```
-                  ┌─────────────────────────────────────────────────────────┐
-                  │              ACTIVE (Viewer Watching)                   │
-                  │  Player sends POST /api/stream/session/heartbeat (10s)  │
-                  └────────────────────────────┬────────────────────────────┘
-                                               │
-                                               │ No open connection AND no heartbeat
-                                               │ for STREAM_IDLE_GRACE_MS (default 45s)
-                                               ▼
-                  ┌─────────────────────────────────────────────────────────┐
-                  │              IDLE (Bandwidth Saver)                     │
-                  │  Torrent download is paused in qBittorrent              │
-                  │  Saves VPS network bandwidth while keeping disk cache   │
-                  └────────────────────────────┬────────────────────────────┘
-                                               │
-                                               │ Idle TTL > 15 Minutes
-                                               │ (OR Disk Usage > 88%)
-                                               ▼
-                  ┌─────────────────────────────────────────────────────────┐
-                  │              CANDIDATE_FOR_DELETE (Auto-GC)             │
-                  │  Pre-Deletion Verification:                             │
-                  │  1. Check refCount == 0 (No open file descriptors)      │
-                  │  2. Re-verify activeSessions == 0                       │
-                  └────────────────────────────┬────────────────────────────┘
-                                               │
-                                               │ Safe to Purge
-                                               ▼
-                  ┌─────────────────────────────────────────────────────────┐
-                  │              DELETED & UNLINKED                         │
-                  │  qbt.deleteTorrent(hash, deleteFiles: true)             │
-                  │  Disk space fully reclaimed                             │
-                  └─────────────────────────────────────────────────────────┘
+        ┌──────────────────────────────────────────────────────────────┐
+        │                   ACTIVE (Viewer Watching)                   │
+        │  Player heartbeats every 10s, whether playing OR PAUSED      │
+        └───────────────────────────────┬──────────────────────────────┘
+                                        │  no open connection AND
+                                        │  no heartbeat for
+                                        │  STREAM_IDLE_GRACE_MS (45s)
+                                        ▼
+        ┌──────────────────────────────────────────────────────────────┐
+        │                   IDLE (Bandwidth Saver)                     │
+        │  Torrent paused in qBittorrent, files kept on disk           │
+        │  Re-checks itself while heartbeats remain fresh              │
+        └───────────────────────────────┬──────────────────────────────┘
+                                        │  idle > IDLE_TTL_MINUTES
+                                        │  OR disk ≥ DISK_AGGRESSIVE_PCT
+                                        ▼
+        ┌──────────────────────────────────────────────────────────────┐
+        │              EVICTION CANDIDATE (LRU by last playback)       │
+        │  Skipped when: refCount > 0 · fresh heartbeat · reserved     │
+        │               · pinned                                       │
+        └───────────────────────────────┬──────────────────────────────┘
+                                        ▼
+        ┌──────────────────────────────────────────────────────────────┐
+        │                     DELETED & UNLINKED                       │
+        │  deleteTorrent(hash, deleteFiles: true) — logged with reason │
+        └──────────────────────────────────────────────────────────────┘
 ```
 
+Three details that were each a bug:
+
+- **Heartbeats run while paused.** Gating them on `!video.paused` meant a paused viewer stopped
+  counting as active and Auto-GC deleted the torrent underneath them.
+- **A connection close only *arms* a pause timer**, and that check **re-arms itself** while a
+  heartbeat is fresh. Pausing on every close halted the download constantly mid-playback.
+- **Reservations** cover the ~25 s window where a stream is resolving swarm metadata and holds no
+  reference yet.
+
+`lastActive` is persisted to `server/.cache/torrent-lru.json`, so eviction order and pins survive a
+restart.
+
 ---
 
-## 7. Multi-Tier VPS Disk Protection & Quota System
+## 7. Disk Protection & Quota System
 
-To prevent disk starvation on production VPS hosts shared with other services:
+| Threshold | Condition | Action |
+|---|---|---|
+| **Normal** | usage < `DISK_TARGET_PCT` (80%) | Standard operation; idle Auto-GC at `IDLE_TTL_MINUTES` |
+| **Soft Cap** | usage ≥ `DISK_MAX_USAGE_PCT` (85%) | Reject new streams with `507 Insufficient Storage`; existing streams continue |
+| **LRU Eviction** | usage ≥ `DISK_AGGRESSIVE_PCT` (88%) | Evict **least-recently-played first, one at a time**, until back under `DISK_TARGET_PCT` |
+| **Emergency Halt** | usage ≥ `DISK_EMERGENCY_PCT` (95%) | Pause all *downloading* torrents to protect the host. Seeding and playback of completed files continue |
 
-| Threshold                  | Trigger Condition | System Action                                                                                                                 |
-| -------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| **Normal Operation** | Disk Usage < 80%  | Standard sequential streaming, 15-minute idle Auto-GC.                                                                        |
-| **Soft Cap**         | Disk Usage ≥ 85% | Rejects new incoming torrent stream additions (`507 Insufficient Storage`). Existing active streams continue uninterrupted. |
-| **Aggressive GC**    | Disk Usage ≥ 88% | Auto-GC immediately purges all idle torrents regardless of the 15-minute timer.                                               |
-| **Emergency Halt**   | Disk Usage ≥ 95% | Automatically pauses all background downloading daemons to protect host database and OS services.                             |
+Eviction is incremental by design. The previous policy deleted **every** idle torrent the instant
+the disk crossed 88 %, discarding the whole cache — including titles about to be rewatched — to
+reclaim space one or two files would have covered.
 
 ---
 
-## 8. Setup & Deployment Guide
+## 8. Setup & Deployment
 
-### Local Development (Frontend)
+### Local development (frontend)
 
 ```bash
-# 1. Clone repository
 git clone https://github.com/Deucalio/cinemate.git
 cd cinemate
-
-# 2. Install dependencies & start local dev server
 npm install
-npm run dev
-
-# 3. Open in browser
-http://localhost:3000/#home
+cp .env.example .env.local     # then fill in the TMDB key and bridge URL
+npm run dev                    # Vite on http://localhost:3000
 ```
 
-### VPS Production Setup (Ubuntu 22.04 LTS + PostgreSQL)
+`VITE_*` values are **inlined into the client bundle** at build time. They are configuration, not a
+secret store — the bridge's `ADMIN_TOKEN`, `JWT_SECRET` and `DATABASE_URL` belong in `server/.env`
+only.
+
+### VPS production
 
 ```bash
-# 1. Connect to VPS
-ssh rdpuser@<VPS_IP>
-
-# 2. Navigate to project root & pull latest code
 cd /opt/cinemate
-sudo git pull
-sudo chown -R $USER:$USER /opt/cinemate
+git pull
 
-# 3. Install backend dependencies & sync Prisma database
-cd /opt/cinemate/server
-npm install
-npx prisma db push
+# Dedicated qBittorrent (once) — see docs/dedicated-qbittorrent.md
+sudo bash deploy/install-qbt.sh
 
-# 4. Restart PM2 background daemon
-sudo pm2 restart cinestream-bridge
-
-# 5. Verify health & telemetry
-curl http://localhost:8899/health
-```
-
-Health endpoint response:
-
-```json
-{
-  "status": "online",
-  "service": "CineStream Piece-Aware Progressive Torrent & FFmpeg AAC Streaming Bridge",
-  "security": {
-    "rateLimitingActive": true,
-    "pathTraversalGuards": true,
-    "adminAuthEnabled": true,
-    "internalEndpointLoopbackOnly": true
-  },
-  "qBittorrentConnected": true,
-  "activeTorrentsCount": 1,
-  "activePlaybackSessions": 1,
-  "toolchain": {
-    "ffmpeg": true,
-    "ffprobe": true,
-    "videoTranscodeEnabled": false
-  },
-  "hostTelemetry": {
-    "loadAverage": [0.35, 0.40, 0.38],
-    "ramTotalMb": 7964,
-    "ramFreeMb": 4890,
-    "diskUsagePercent": "22%",
-    "diskFreeGb": "314.5 GB"
-  },
-  "limits": {
-    "maxActiveTorrents": 5,
-    "maxConcurrentStreams": 15,
-    "maxDiskUsagePercent": "85%",
-    "idleCleanupMinutes": 15
-  },
-  "uptime": 240.5
-}
-```
-
-> **FFmpeg is required.** `sudo apt install -y ffmpeg` installs both `ffmpeg` and `ffprobe`. The
-> bridge checks for them at boot, logs the result, and reports it under `toolchain` in `/health`.
-> Without them only already-browser-native releases (MP4 + H.264 + AAC stereo) can play.
-
-### Environment Variables
-
-| Variable                                  | Default                                               | Purpose                                                     |
-| ----------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------- |
-| `PORT`                                  | `8899`                                              | Bridge listen port                                          |
-| `QBT_URL` / `QBT_USER` / `QBT_PASS` | `http://127.0.0.1:18080`, `admin`, `adminadmin` | qBittorrent WebUI                                           |
-| `PROWLARR_URL` / `PROWLARR_KEY`       | `http://127.0.0.1:9696`                             | Torznab search proxy                                        |
-| `ALLOW_VIDEO_TRANSCODE`                 | `0`                                                 | Enable real-time HEVC→H.264 re-encoding (CPU-heavy)        |
-| `STREAM_IDLE_GRACE_MS`                  | `45000`                                             | Quiet period before an unwatched torrent is paused          |
-| `HEARTBEAT_FRESH_MS`                    | `45000`                                             | How long a heartbeat marks a session as active              |
-| `IDLE_TTL_MINUTES`                      | `1`                                                 | Idle time before Auto-GC deletes a torrent and its files    |
-| `PIECE_STATE_CACHE_MS`                  | `500`                                               | `pieceStates` cache TTL                                   |
-| `PIECE_WAIT_TIMEOUT_MS`                 | `120000`                                            | How long a read waits for a piece before failing the stream |
-| `STREAM_RATE_LIMIT_PER_MIN`             | `600`                                               | Per-IP`/api/stream` request cap                           |
-| `FFMPEG_BIN` / `FFPROBE_BIN`          | `ffmpeg` / `ffprobe`                              | Binary paths                                                |
-
-### Running the Test Suite
-
-```bash
 cd server
 npm install
-npm test
+npx prisma db push
+pm2 restart cinestream-bridge --update-env
+
+curl -s http://localhost:8899/health | python3 -m json.tool
 ```
 
-Both suites run the real bridge against a mock qBittorrent, so they need no swarm, no ffmpeg and
-no database:
+> **FFmpeg is required.** `sudo apt install -y ffmpeg` provides both `ffmpeg` and `ffprobe`. The
+> bridge checks at boot, logs the result, and reports it under `toolchain` in `/health`. Without
+> them only already-browser-native releases can play.
 
-- `test/piece-aware-stream.test.mjs` — piece gating on a **multi-file** torrent (the movie starts
-  at piece 2, not 0), byte-exact delivery, `pieceStates` cache pressure, `filePrio` focus, and
-  RFC 7233 range parsing (suffix / open-ended / unsatisfiable / HEAD).
-- `test/session-lifecycle.test.mjs` — `/api/stream/prepare` output, and the pause lifecycle:
-  never on a single connection close, never while heartbeats are fresh, always once genuinely idle.
-- `test/media-discovery.test.mjs` — file selection against the shapes qBittorrent presents
-  mid-download: the `.!qB` incomplete suffix, samples losing to the feature, `.mkv` never being
-  served direct, and an ISO/NFO-only torrent failing fast with `415` instead of polling for 24s.
-- `test/gc-and-resume.test.mjs` — Auto-GC leaving pre-existing torrents alone across a restart, and
-  resolution resuming a stopped torrent instead of polling it until timeout.
+### Environment variables (`server/.env`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `8899` | Bridge listen port |
+| `QBT_URL` | `http://127.0.0.1:18080` | qBittorrent WebUI — **set to `:18081`** for the dedicated instance |
+| `QBT_USER` / `QBT_PASS` | `admin` / `adminadmin` | Ignored when the instance sets `WebUI\LocalHostAuth=false` |
+| `QBT_CATEGORY` | `cinemate` | Keeps our torrents out of any \*arr stack sharing the client. `''` disables |
+| `PROWLARR_URL` / `PROWLARR_KEY` | `http://127.0.0.1:9696` | Torznab search proxy |
+| `REQUIRE_COMPLETE` | `1` | Cache-first. `0` restores progressive piece-aware streaming |
+| `ALLOW_VIDEO_TRANSCODE` | `0` | Real-time HEVC→H.264 re-encoding. Will not keep up on 8 cores at any concurrency |
+| `IDLE_TTL_MINUTES` | `30` | Idle time before a torrent and its files are deleted |
+| `STREAM_IDLE_GRACE_MS` | `45000` | Quiet period before an unwatched torrent is paused |
+| `HEARTBEAT_FRESH_MS` | `45000` | How long a heartbeat marks a session active |
+| `MAX_ACTIVE_TORRENTS` | `5` | Concurrent torrent cap |
+| `MAX_CONCURRENT_STREAMS` | `15` | Concurrent playback session cap |
+| `DISK_MAX_USAGE_PCT` | `85` | Soft cap — reject new streams |
+| `DISK_AGGRESSIVE_PCT` | `88` | Begin LRU eviction |
+| `DISK_TARGET_PCT` | `80` | Evict down to this |
+| `DISK_EMERGENCY_PCT` | `95` | Pause all downloads |
+| `LRU_STATE_PATH` | `<cwd>/.cache/torrent-lru.json` | Where playback history and pins persist |
+| `PREPARED_CACHE_MS` | `60000` | Resolved-stream descriptor cache TTL |
+| `PIECE_STATE_CACHE_MS` | `500` | `pieceStates` cache TTL |
+| `PIECE_POLL_MS` | `250` | Piece readiness poll interval |
+| `PIECE_WAIT_TIMEOUT_MS` | `120000` | How long a read waits for a piece before failing loudly |
+| `READ_CHUNK_BYTES` | `262144` | Piece-aware reader chunk size |
+| `STREAM_RATE_LIMIT_PER_MIN` | `600` | Per-IP `/api/stream` cap |
+| `FFMPEG_BIN` / `FFPROBE_BIN` | `ffmpeg` / `ffprobe` | Binary paths |
+| `DISK_USAGE_OVERRIDE_PCT` | — | **Test seam.** Forces a fixed disk percentage |
+
+### Client variables (`.env.local`)
+
+| Variable | Purpose |
+|---|---|
+| `VITE_TMDB_API_KEY` / `VITE_TMDB_TOKEN` | TMDB credentials |
+| `VITE_STREAM_SERVER` | Bridge base URL |
+| `VITE_PROWLARR_URL` / `VITE_PROWLARR_KEY` | Direct-to-Prowlarr fallback only |
+
+### Test suite
+
+```bash
+cd server && npm test        # 96 assertions across 6 suites
+```
+
+Every suite runs the **real bridge** against a mock qBittorrent — no swarm, no FFmpeg, no database.
+
+| Suite | Covers |
+|---|---|
+| `cache-first.test.mjs` | Incomplete torrents withheld; complete ones served **without consulting piece state at all** — asserted by reporting every piece as missing while the torrent reports 100 % |
+| `piece-aware-stream.test.mjs` | Piece gating on a **multi-file** torrent (movie starts at piece 2), byte-exact delivery, cache pressure, `filePrio`, RFC 7233 ranges |
+| `session-lifecycle.test.mjs` | `prepare` / `status` output including the ETA sentinel, and the pause lifecycle |
+| `media-discovery.test.mjs` | `.!qB` suffix, samples losing to the feature, `.mkv` never served direct, ISO-only torrents failing fast, refusing to guess a piece size |
+| `gc-and-resume.test.mjs` | Restart not wiping torrents; resuming stopped torrents; sequential mode forced on and never toggled twice |
+| `lru-eviction.test.mjs` | Eviction order, pinned survival, restart-restored history, `/api/cache`, the pin endpoint |
+
+Suites that exercise the **progressive** path set `REQUIRE_COMPLETE=0` explicitly, so they cannot
+pass for the wrong reason. Each uses its own `LRU_STATE_PATH`, since a shared default made them
+inherit playback history between runs.
 
 ---
 
-## 9. Fix Log — Progressive Streaming & Audio Playback
-
-The "stuck on *Buffering Stream...*" failure was not one bug but a chain of them. All of the
-following are now fixed in [server/index.js](file:///d:/vscode/netflix/server/index.js),
-[js/components/playerModal.js](file:///d:/vscode/netflix/js/components/playerModal.js) and
-[js/services/streamingBridge.js](file:///d:/vscode/netflix/js/services/streamingBridge.js).
+## 9. Fix Log
 
 ### 9.1 Why nothing ever played
 
-| #  | Root cause                                                                                                                                                                                                                                                       | Fix                                                                                                                         |
-| -- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| 1  | **The default path was not piece-aware at all.** `/api/stream` served ranges with a plain `fs.createReadStream`; the piece-aware reader ran only under `?remux=1`. Sparse regions of an in-progress file read as zero-bytes, so the demuxer stalled. | All delivery paths now go through`servePieceAwareRange()`.                                                                |
-| 2  | **Piece indices ignored the file's offset within the torrent.** `floor(byteOffset / pieceSize)` verified piece 0 while the movie actually began at piece 2, so "verified" bytes were still sparse zeros.                                                 | `resolveTorrentFileMapping()` computes the global offset from `/torrents/files`, cross-checked against `piece_range`. |
-| 3  | **FFmpeg read from a non-seekable pipe.** A standard `.mp4` keeps its `moov` index at the *end*, so `ffmpeg -i pipe:0` had to read the entire file before emitting a frame.                                                                        | FFmpeg now reads a**seekable loopback HTTP URL** (`/internal/piece-file`) and jumps straight to `moov`.           |
-| 4  | **The reader could deadlock.** `_read()` returned without pushing when a chunk computed to zero bytes or a check was in flight; Node then never called `_read()` again.                                                                                | Rewritten as a single async pump that always pushes, ends, or errors.                                                       |
-| 5  | **The torrent was paused on every connection close.** A browser opens and abandons dozens of connections per video, so the download was halted constantly while the user watched.                                                                          | Closing arms a grace timer; pausing needs no connection*and* no fresh heartbeat.                                          |
-| 6  | **The stream rate limit was 25/min.** Ordinary playback exceeded it within seconds and got `429`d.                                                                                                                                                       | Raised to 600/min (`STREAM_RATE_LIMIT_PER_MIN`).                                                                          |
-| 7  | **Heartbeats stopped whenever the player was paused**, so Auto-GC deleted the torrent mid-session.                                                                                                                                                         | Heartbeats now run for as long as the player is open.                                                                       |
-| 8  | **Auto-GC could delete a torrent during setup**, while the bridge was still waiting up to ~25s for swarm metadata.                                                                                                                                         | Reservations cover the whole setup window.                                                                                  |
-| 9  | **`refCount` was decremented twice per remux connection** (`req.close` *and* `res.finish`), tearing down torrents still in use.                                                                                                                    | Single guarded`cleanup()`.                                                                                                |
-| 10 | **`Content-Length` came from `stat().size`** — wrong on a sparse file, which hands the browser a truncated video.                                                                                                                                     | Uses the torrent-declared file size.                                                                                        |
-| 11 | **Range parsing was a naive split on `-`**, mishandling `bytes=-500` and `bytes=500-`, and never returning `416`.                                                                                                                                  | RFC 7233 parser with proper`416` + `Content-Range: bytes */size`.                                                       |
-| 12 | **`pieceStates` was fetched per 128 KB chunk** — tens of thousands of ints per read, saturating the qBittorrent WebUI.                                                                                                                                  | Cached (`PIECE_STATE_CACHE_MS`) with in-flight de-duplication.                                                            |
-| 13 | **The client's error handler fought its own fallback**, blind-reloading the element every 3.5s and reloading the *failed* direct URL over the remux attempt.                                                                                             | One state-aware handler that escalates direct → remux exactly once, then reports.                                          |
-| 14 | **The player auto-played a Google sample clip** (`TearsOfSteel.mp4`), so a completely broken bridge still looked like working playback.                                                                                                                  | Removed; the player prompts for a source instead.                                                                           |
-| 15 | **A `<video>` element only reports opaque `MEDIA_ERR_*` codes**, so "no seeders", "unsupported codec" and "disk full" were indistinguishable.                                                                                                          | New`GET /api/stream/prepare` returns the delivery plan or a typed error before `<video>` sees a URL.                    |
-| 16 | **`enrichMagnetWithTrackers()` was never called** — the tracker-injection feature was dead code, leaving bare magnets to stall on DHT bootstrap.                                                                                                        | Wired into`addTorrent()`.                                                                                                 |
-| 17 | **`server/node_modules` was stale** — `bcryptjs`, `jsonwebtoken` and `@prisma/client` were declared but absent, so a fresh checkout died on startup with `ERR_MODULE_NOT_FOUND`. An existing deployment with them already installed was unaffected. | `npm install`; `webtorrent` (unused since the qBittorrent migration) dropped. |
-| 18 | **Audio detection was inverted:** `isAAC = ...                                                                                                                                                                                                             |                                                                                                                             |
-| 19 | **qBittorrent 5.x renamed `pause`/`resume` to `stop`/`start`**, so bandwidth control silently no-opped on 5.x hosts.                                                                                                                               | Tries the modern name, falls back to the legacy one.                                                                        |
-| 26 | **Sequential download was never enabled on pre-existing torrents.** `sequentialDownload` and `firstLastPiecePrio` are set in `torrents/add`, but `add` is a **no-op** for a torrent qBittorrent already has. Those torrents kept downloading rarest-first, so the piece-aware reader waited on early pieces that arrive in arbitrary order — `Piece 1 was not verified` while the torrent sat at 27%. Playback only worked at 100%, when piece order stops mattering. | `ensureSequentialDownload()` reads `seq_dl` / `f_l_piece_prio` from `torrents/info` and calls the toggle endpoints when false, guarded per hash (they are toggles, not setters — firing twice turns it back off). |
-| 25 | **The piece size was a guess.** `piece_size` is NOT a field of `/api/v2/torrents/info` — it lives in `/torrents/properties`. So `torrentInfo.piece_size` was always `undefined` and fell back to a hard-coded 2 MB. When the real piece size is smaller, `floor(offset / 2MB)` resolves to a piece index *lower* than the true one — an already-downloaded piece — so the reader ran ahead of the download frontier and served sparse zeros. FFmpeg reported `0x00 … invalid as first byte of an EBML number` and nothing played until the torrent reached 100%, at which point no zeros remained. **This defeated piece-awareness entirely.** | Fetched from `/torrents/properties`, cross-checked against `pieces_num`, derived from `total_size / pieces_num` if absent, and the stream is **refused** if it cannot be established — guessing silently corrupts data. |
-| 23 | **Auto-GC deleted every torrent ~15s after any restart.** `torrentRegistry` is in-memory, so post-restart every torrent is unknown; the sweep back-dated `lastActive` to the torrent's `added_on`, already older than `IDLE_TTL`. Every deploy wiped all downloaded data, and a stream mid-resolution lost its files underneath it. | Newly-observed torrents start their idle clock at "now". |
-| 24 | **Nothing resumed a paused torrent during resolution.** `/api/stream` resumed only *after* resolving and `/api/stream/prepare` never did, and `torrents/add` does not resume an existing torrent — so anything the Bandwidth Saver had paused wrote no bytes, and resolution polled for its file until timeout on every retry. | Resolution detects `paused*`/`stopped*`/`queuedDL` and resumes before polling. |
-| 21 | **Media discovery scanned the DISK**, so it needed a file that already existed, was already ≥ 5 MB, and had a whitelisted extension. qBittorrent appends **`.!qB` to incomplete files** by default, so a downloading movie is `Movie.mp4.!qB` — extension `.!qb`, matching no whitelist. Healthy torrents reported "no playable media file". A separate incomplete-downloads directory broke it identically. | Selection now comes from the torrent's **file table** (final names and sizes, valid the moment metadata lands); the on-disk path is resolved separately across `save_path`, `download_path` and `content_path`, with or without the `.!qB` suffix. |
-| 22 | **Container decisions used the on-disk extension**, so a still-downloading `.mp4.!qB` looked like an unknown container and was forced through FFmpeg — burning CPU and losing native seeking on a browser-native file. | Mode selection and all user-facing names use the **logical** name with the suffix stripped. |
-| 20 | **`health.activeTorrents` did not exist** (the field is `activeTorrentsCount`), so the UI always showed `undefined`.                                                                                                                                 | Fixed, plus the volume-slider selector typo`#ctrl-vol-slider`.                                                            |
+The "stuck on *Buffering Stream…*" failure was a chain of independent defects, not one bug.
 
-### 9.2 How delivery mode is chosen
+| # | Root cause | Fix |
+|---|---|---|
+| 1 | **The default path was not piece-aware at all.** `/api/stream` served ranges with a plain `fs.createReadStream`; the piece-aware reader ran only under `?remux=1`. Sparse regions read as zero-bytes and the demuxer stalled | All delivery paths routed through one range server |
+| 2 | **Piece indices ignored the file's offset within the torrent.** `floor(byteOffset / pieceSize)` verified piece 0 while the movie began at piece 2 | Global offset computed from `/torrents/files`, cross-checked against `piece_range` |
+| 3 | **The piece size was a guess.** `piece_size` is not a field of `torrents/info` — it lives in `/torrents/properties`. It was always `undefined`, falling back to a hard-coded 2 MB. A smaller real piece size resolves to an index *lower* than the truth — an already-downloaded piece — so the reader ran ahead of the download frontier and served zeros. **This defeated piece-awareness entirely** | Read from `/torrents/properties`, cross-checked against `pieces_num`, and the stream **refused** if it cannot be established |
+| 4 | **Sequential download was never enabled on pre-existing torrents.** The flags are set in `torrents/add`, which is a **no-op** for a torrent the client already has. Those torrents downloaded rarest-first, so the reader waited on early pieces arriving in arbitrary order — `Piece 1 was not verified` at 27 % | `ensureSequentialDownload()` reads `seq_dl` / `f_l_piece_prio` and calls the toggles when false, guarded per hash (they are toggles, not setters) |
+| 5 | **FFmpeg read from a non-seekable pipe.** A `.mp4` keeps `moov` at the end, so `ffmpeg -i pipe:0` had to read the whole file before emitting a frame | FFmpeg reads a **seekable loopback HTTP URL**, or the local path once complete |
+| 6 | **The reader could deadlock.** `_read()` returned without pushing when a chunk computed to zero bytes; Node never called it again | Rewritten as an async pump that always pushes, ends, or errors |
+| 7 | **Media discovery scanned the DISK**, needing a file that already existed, was ≥ 5 MB, and had a whitelisted extension. qBittorrent appends **`.!qB`** to incomplete files, so a downloading movie matched nothing | Selection from the torrent's **file table**; the disk path resolved separately across every directory qBittorrent reports |
+| 8 | **Container decisions used the on-disk extension**, so `.mp4.!qB` looked like an unknown container and was forced through FFmpeg | Mode selection uses the **logical** name |
+| 9 | **`Content-Length` came from `stat().size`** — wrong on a sparse file, handing the browser a truncated video | Uses the torrent-declared size |
+| 10 | **Range parsing was a naive split on `-`**, mishandling `bytes=-500` and `bytes=500-`, never returning `416` | RFC 7233 parser with `416` + `Content-Range: bytes */size` |
 
-`ffprobe` runs once per file, over the loopback piece-aware URL so it can seek to `moov`:
+### 9.2 Why it kept destroying itself
 
-```
-container ∈ {mp4, m4v, webm}  AND  video ∈ {h264, vp8, vp9, av1}
-                             AND  audio ∈ {aac, mp3, opus, vorbis}  AND  channels ≤ 2
-   ├── yes ──> DIRECT : HTTP 206 byte ranges, native seeking, zero CPU
-   └── no  ──> REMUX  : FFmpeg -> progressive fMP4, video copied, audio -> stereo AAC 192k
-```
+| # | Root cause | Fix |
+|---|---|---|
+| 11 | **The torrent was paused on every connection close.** A browser opens dozens per video, so the download halted constantly while the user watched | A close only arms a grace timer, which **re-arms** while heartbeats are fresh |
+| 12 | **Heartbeats stopped whenever the player was paused**, so Auto-GC deleted the torrent mid-session | Heartbeats run while the player is open, playing or not |
+| 13 | **Auto-GC deleted every torrent ~15 s after any restart.** The in-memory registry back-dated `lastActive` to `added_on`, already older than the TTL. Every deploy wiped all downloaded data | Newly-observed torrents start their idle clock now; history persists across restarts |
+| 14 | **Nothing resumed a paused torrent during resolution**, and `torrents/add` does not resume. Anything the Bandwidth Saver had paused wrote no bytes, so resolution polled until timeout every time | Resolution detects `paused*`/`stopped*`/`queuedDL` and resumes first |
+| 15 | **Auto-GC could delete a torrent during setup**, in the ~25 s metadata window where it holds no reference | Reservations cover the whole setup window |
+| 16 | **`refCount` was decremented twice per remux connection** (`req.close` *and* `res.finish`) | Single guarded cleanup |
+| 17 | **`IDLE_TTL_MINUTES` defaulted to 1.** Pausing for a phone call deleted the torrent and its data | Default 30, with LRU eviction under pressure |
+| 18 | **Eviction deleted the entire cache at 88 % disk**, to reclaim space one or two files covered | Least-recently-played first, one at a time, down to a target |
+| 19 | **The 95 % emergency halt was documented but never implemented** | Implemented |
+| 20 | **`pieceStates` was fetched per 128 KB chunk** — tens of thousands of ints per read, saturating the WebUI | Cached with in-flight de-duplication |
+| 21 | **The stream rate limit was 25/min.** Ordinary playback exceeded it in seconds and got `429`d | Raised to 600/min |
+| 22 | **Full metadata resolution ran on every range request** | Resolved descriptors cached for 60 s with in-flight sharing |
 
-Override per request with `?mode=direct|remux`. The legacy `?remux=1` flag still works.
+### 9.3 The disappearing files — RESOLVED
 
-### 9.3 Known limitations
+Completed downloads were deleted seconds after playback began. Established by elimination:
 
-- **HEVC / x265 releases cannot play in a browser.** Real-time HEVC→H.264 transcoding does not keep
-  up on a small VPS, so it is **off by default**; `/api/stream/prepare` returns `415`
-  `UNSUPPORTED_VIDEO_CODEC` and the UI flags those releases. Set `ALLOW_VIDEO_TRANSCODE=1` to
-  enable it anyway.
-- **Seeking in remux mode restarts the FFmpeg process**, costing a few seconds. Direct mode seeks
-  natively. An HLS pipeline (segmented VOD playlist) would give indexed seeking over remuxed
-  content — the frontend's `hls.js` dependency was removed since nothing used it, so re-add it if
-  that route is taken.
-- **Seeking far ahead of the download head still waits for the swarm.** qBittorrent's WebUI API has
-  no piece-priority setter, so the bridge cannot make the download head jump to an arbitrary
-  offset; it can only wait for sequential progress to reach it.
-- **Piece waits fail loudly after `PIECE_WAIT_TIMEOUT_MS`** (default 120s) rather than ending the
-  stream silently, since a silent EOF is indistinguishable from the original hang.
+1. qBittorrent's log said `was removed from the transfer list and hard disk` — its exact wording for
+   an API delete with `deleteFiles=true`. Nothing was lost or reset; something **asked**.
+2. **Zero** `error`/`fail` lines in that log.
+3. The bridge logged nothing at those timestamps — every deletion path logs `[Delete] … reason: …`,
+   added precisely so this could be answered rather than argued.
+4. No stray bridge process; both unexplained `node index.js` processes were unrelated backends.
+5. `[AutoRun]` empty, ruling out a completion script.
+6. `stream-download.service` carried `Documentation=file:///opt/stream/SONARR-SETUP.md`, and the
+   download directory held `Lanterns - S01E01 - Pilot.mkv` and `Stand by Me (1986)/` — **\*arr
+   naming conventions, not release names.**
+
+**Cause:** a Sonarr/Radarr stack sharing the qBittorrent instance. Its Completed Download Handling
+imports a finished download and then removes the torrent and its data — firing the instant a
+download completes, which is exactly when playback started.
+
+**Fix:** a **dedicated qBittorrent instance** (`:18081`, own profile, own storage, own systemd unit
+— [docs/dedicated-qbittorrent.md](docs/dedicated-qbittorrent.md)), plus a `cinemate` category
+applied to new *and* pre-existing torrents as a second line of defence.
+
+**Worth recording:** four wrong theories preceded the right one — ratio-limit removal, a failed
+move-on-completion, our own `filePrio` calls, and a stale bridge process. What settled it was making
+the bridge log every deletion with a reason, then reading the *other* system's log. Neither of those
+is guesswork.
+
+### 9.4 Client-side defects
+
+| # | Root cause | Fix |
+|---|---|---|
+| 23 | **Drag-scrubbing called `_seekTo` on every mousemove.** In remux mode each seek restarts FFmpeg, so one drag spawned dozens of concurrent transcodes competing for the same pieces | Dragging previews only; the seek commits once, on release |
+| 24 | **Those `mousemove`/`mouseup` listeners were never removed**, so every re-open stacked another live handler | Removed on close |
+| 25 | **The error handler fought its own fallback**, blind-reloading every 3.5 s and reloading the *failed* direct URL over the remux attempt | One state-aware handler: escalate direct → remux exactly once, then report |
+| 26 | **The player auto-played a Google sample clip** (`TearsOfSteel.mp4`), so a completely broken bridge still looked like working playback | Removed |
+| 27 | **Auto-resume restored a timestamp on a fresh torrent**, requiring download up to that point before anything played — presenting as a jump to a random time, then a hang | Playback always starts at 0; progress still recorded for the library |
+| 28 | **A `<video>` reports only opaque `MEDIA_ERR_*` codes**, so "no seeders", "unsupported codec" and "disk full" were indistinguishable | `GET /api/stream/prepare` returns a plan or a typed error first |
+| 29 | **The buffering HUD animated a bar wired to nothing**, so a legitimate 60-second download and a permanent hang looked identical | Real percentage, speed, seeds and ETA; the pulse survives only for the genuinely unknown metadata phase |
+| 30 | **Closing the tab never sent the leave beacon** — `close()` only ran on in-app dismissal | `pagehide` listener |
+| 31 | **Controls lied**: a hardcoded `4K HDR` pill, a quality selector that switched nothing, a CC button with no subtitle pipeline. `_play()` also reset volume to 1.0 on every play | Pill shows probed codecs and mode; dead controls removed; volume respected |
+| 32 | **Audio detection was inverted** — `isAAC = … \|\| !isEAC3` badged every untagged 5.1 release as "AAC Stereo ✓" and ranked it browser-safe | Corrected; HEVC ranked last and flagged in the sources list |
+| 33 | **`health.activeTorrents` did not exist** (the field is `activeTorrentsCount`) | Fixed, plus the `#ctrl-vol-slider` selector typo |
+
+### 9.5 Environment & tooling
+
+| # | Root cause | Fix |
+|---|---|---|
+| 34 | **`enrichMagnetWithTrackers()` was never called** — tracker injection was dead code, leaving bare magnets to stall on DHT bootstrap | Wired into `addTorrent()` |
+| 35 | **qBittorrent 5.x renamed `pause`/`resume` to `stop`/`start`**, so bandwidth control silently no-opped on 5.x hosts | Tries the modern name, falls back |
+| 36 | **`server/node_modules` was stale** — `bcryptjs`, `jsonwebtoken`, `@prisma/client` declared but absent, so a fresh checkout died with `ERR_MODULE_NOT_FOUND` | `npm install`; unused `webtorrent` dropped |
+| 37 | **`fs.existsSync` returns false for permission errors identically to "not found"**, so an unreadable download directory looked like a torrent that had not started writing. The bridge said "retry in a few seconds" while reporting 71 % downloaded at 71 MB/s | `EACCES`/`EPERM` captured separately, retry loop stopped, and the running user and unreadable directory named |
+| 38 | **qBittorrent's queueing parked torrents in `queuedDL`** and they downloaded nothing | Disabled in the dedicated instance's config |
+| 39 | **Credentials were hardcoded in client source** and committed to git history | Moved to `.env.local` via `import.meta.env`. **The exposed TMDB and Prowlarr keys should still be rotated** |
+
+### 9.6 Known limitations
+
+- **Cold start waits for the full download** (~60 s for 2–3 GB). Deliberate. A rewatch is instant.
+  [Phase 5′](docs/phase5-hls-plan.md) reduces this to ~10 s.
+- **Seeking in remux mode restarts FFmpeg**, costing seconds. Direct mode seeks natively.
+  [Phase 5′](docs/phase5-hls-plan.md) removes this entirely.
+- **HEVC / x265 cannot play in a browser.** Real-time transcoding will not keep up on this VPS, so
+  `prepare` returns `415 UNSUPPORTED_VIDEO_CODEC` and the UI flags those releases.
+- **Seeking ahead of the download head waits for the swarm** on the progressive path — qBittorrent
+  exposes no piece-priority setter.
+- **No authentication on the streaming endpoints.** See §5.
+
+---
+
+## 10. Status
+
+| Phase | State |
+|---|---|
+| Vite adoption, credentials out of source | ✅ Complete |
+| Phase 1 — real download progress | ✅ Complete |
+| Phase 2 — cache-first delivery | ✅ Complete |
+| Phase 3 — LRU retention, pinning, emergency halt | ✅ Complete |
+| Dedicated qBittorrent instance | ✅ Complete |
+| Phase 4 — progressive fast start | ❌ Not recommended — would reinstate the complexity Phase 2 removed |
+| **Phase 5′ — progressive HLS transcode** | 📋 **Planned — next** |
+| UI polish pass | 📋 Pending |
+| React + Vite migration | 📋 Pending — after the player shrinks |
+| Authentication | 📋 Pending — wants HTTPS first |
