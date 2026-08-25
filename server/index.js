@@ -387,6 +387,111 @@ const ALLOWED_MEDIA_EXTS = new Set(['.mp4', '.mkv', '.webm', '.m4v', '.avi', '.t
 const FORBIDDEN_EXTS = new Set(['.exe', '.bat', '.scr', '.vbs', '.cmd', '.ps1', '.sh', '.msi', '.iso']);
 const MIN_MEDIA_FILE_BYTES = 5 * 1024 * 1024; // 5 MB minimum to ignore junk / samples
 
+// qBittorrent appends ".!qB" to files that are still downloading (Options > Downloads >
+// "Append .!qB extension to incomplete files", ON by default). On disk the movie is therefore
+// "Movie.mp4.!qB" until it completes -- an extension no media whitelist will ever match.
+const INCOMPLETE_SUFFIX_RE = /\.!qB$/i;
+
+function stripIncompleteSuffix(name) {
+  return String(name || '').replace(INCOMPLETE_SUFFIX_RE, '');
+}
+
+function isSampleName(name) {
+  const lower = path.basename(String(name || '')).toLowerCase();
+  return lower.includes('sample') || lower.includes('trailer') || lower.includes('featurette');
+}
+
+/**
+ * Picks the media file to stream from the TORRENT'S OWN FILE TABLE rather than by scanning disk.
+ *
+ * The table carries final names and final sizes and is valid the instant metadata arrives, so this
+ * works before a single byte has been written. Disk scanning could not: it needed the file to
+ * already exist, to already be >= 5 MB, and to not be wearing a ".!qB" suffix.
+ *
+ * Returns { index, name, size } or null.
+ */
+function selectMediaFileFromTable(files) {
+  if (!Array.isArray(files) || files.length === 0) return null;
+
+  let best = null;
+  let sampleFallback = null;
+
+  files.forEach((f, i) => {
+    const index = typeof f.index === 'number' ? f.index : i;
+    const name = stripIncompleteSuffix(f.name || '');
+    const ext = path.extname(name).toLowerCase();
+    const size = f.size || 0;
+
+    if (FORBIDDEN_EXTS.has(ext)) return;
+    if (!ALLOWED_MEDIA_EXTS.has(ext)) return;
+    if (size < MIN_MEDIA_FILE_BYTES) return;
+
+    const entry = { index, name, size };
+
+    if (isSampleName(name)) {
+      if (!sampleFallback || size > sampleFallback.size) sampleFallback = entry;
+      return;
+    }
+    if (!best || size > best.size) best = entry;
+  });
+
+  return best || sampleFallback;
+}
+
+/**
+ * Finds where a torrent file currently lives on disk.
+ *
+ * qBittorrent moves and renames files as a torrent progresses, so the same logical file may be at
+ * `save_path/name`, at `download_path/name` (the "keep incomplete torrents in" directory), or under
+ * `content_path` -- and while incomplete it carries a ".!qB" suffix. Every plausible location is
+ * tried, and the winner is checked to be inside a directory qBittorrent itself reported.
+ */
+function resolveMediaFileOnDisk(torrentInfo, relName) {
+  const savePath = torrentInfo.save_path || '';
+  const contentPath = torrentInfo.content_path || '';
+  const downloadPath = torrentInfo.download_path || '';
+  const torrentName = torrentInfo.name || '';
+  const baseName = path.basename(relName);
+
+  const candidates = [];
+  const push = (candidate) => {
+    if (!candidate) return;
+    candidates.push(candidate);
+    candidates.push(`${candidate}.!qB`);
+  };
+
+  if (savePath) push(path.resolve(savePath, relName));
+  if (downloadPath) push(path.resolve(downloadPath, relName));
+
+  if (contentPath) {
+    // Single-file torrent: content_path IS the file.
+    push(contentPath);
+    // Multi-file torrent: content_path is the root folder.
+    push(path.resolve(contentPath, baseName));
+    if (torrentName && relName.startsWith(`${torrentName}/`)) {
+      push(path.resolve(contentPath, relName.slice(torrentName.length + 1)));
+    }
+  }
+
+  const roots = [savePath, downloadPath, contentPath]
+    .filter(Boolean)
+    .map(r => path.resolve(r));
+
+  for (const candidate of candidates) {
+    try {
+      const resolved = path.resolve(candidate);
+
+      // Path traversal guard: never serve anything outside a qBittorrent-declared directory.
+      const inside = roots.some(root => resolved === root || resolved.startsWith(root + path.sep));
+      if (!inside) continue;
+
+      if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) return resolved;
+    } catch {}
+  }
+
+  return null;
+}
+
 function findSafeMediaFileCandidate(targetPath) {
   if (!targetPath) return null;
   const resolvedTarget = path.resolve(targetPath);
@@ -395,7 +500,7 @@ function findSafeMediaFileCandidate(targetPath) {
   try {
     const stat = fs.statSync(resolvedTarget);
     if (!stat.isDirectory()) {
-      const ext = path.extname(resolvedTarget).toLowerCase();
+      const ext = path.extname(stripIncompleteSuffix(resolvedTarget)).toLowerCase();
       if (FORBIDDEN_EXTS.has(ext)) return null;
       return ALLOWED_MEDIA_EXTS.has(ext) && stat.size >= MIN_MEDIA_FILE_BYTES ? resolvedTarget : null;
     }
@@ -412,11 +517,11 @@ function findSafeMediaFileCandidate(targetPath) {
           if (s.isDirectory()) {
             scanDir(fullPath);
           } else {
-            const ext = path.extname(entry).toLowerCase();
-            const lowerName = entry.toLowerCase();
+            const cleanEntry = stripIncompleteSuffix(entry);
+            const ext = path.extname(cleanEntry).toLowerCase();
             if (FORBIDDEN_EXTS.has(ext)) continue;
 
-            const isSample = lowerName.includes('sample') || lowerName.includes('trailer') || lowerName.includes('featurette');
+            const isSample = isSampleName(cleanEntry);
             if (ALLOWED_MEDIA_EXTS.has(ext) && s.size >= MIN_MEDIA_FILE_BYTES) {
               if (!isSample && s.size > maxBytes) {
                 maxBytes = s.size;
@@ -447,58 +552,34 @@ function findSafeMediaFileCandidate(targetPath) {
  *
  * Returns { fileIndex, fileOffsetInTorrent, fileSize, otherIndexes, exact }.
  */
-async function resolveTorrentFileMapping(hash, torrentInfo, targetFilePath, pieceSize) {
+function computeFileMapping(files, chosen, pieceSize) {
   const result = {
-    fileIndex: null,
+    fileIndex: chosen.index,
     fileOffsetInTorrent: 0,
-    fileSize: 0,
+    fileSize: chosen.size || 0,
     otherIndexes: [],
     exact: false
   };
-
-  const files = await qbt.getFiles(hash);
-  if (!Array.isArray(files) || files.length === 0) return result;
-
-  const savePath = (torrentInfo && torrentInfo.save_path) ? torrentInfo.save_path : '';
-  const resolvedTarget = path.resolve(targetFilePath);
-  const targetBase = path.basename(resolvedTarget);
 
   const ordered = files
     .map((f, i) => ({ ...f, index: (typeof f.index === 'number' ? f.index : i) }))
     .sort((a, b) => a.index - b.index);
 
-  // Pass 1: exact absolute-path match, accumulating the running byte offset.
   let running = 0;
   let match = null;
   let matchOffset = 0;
+
   for (const f of ordered) {
-    if (!match) {
-      const abs = path.resolve(savePath, f.name || '');
-      if (abs === resolvedTarget) {
-        match = f;
-        matchOffset = running;
-      }
+    if (f.index === chosen.index) {
+      match = f;
+      matchOffset = running;
     }
     running += (f.size || 0);
   }
 
-  // Pass 2: fall back to basename match (save_path can differ from the served content_path).
-  if (!match) {
-    running = 0;
-    for (const f of ordered) {
-      if (!match && path.basename(f.name || '') === targetBase) {
-        match = f;
-        matchOffset = running;
-      }
-      running += (f.size || 0);
-    }
-  }
-
   if (!match) return result;
 
-  result.fileIndex = match.index;
-  result.fileSize = match.size || 0;
-  result.otherIndexes = ordered.filter(f => f.index !== match.index).map(f => f.index);
+  result.otherIndexes = ordered.filter(f => f.index !== chosen.index).map(f => f.index);
 
   // Cross-check the summed offset against qBittorrent's own piece_range. If libtorrent hid padding
   // files from the listing the sum is wrong, and trusting it would UNDER-estimate the offset --
@@ -1304,21 +1385,34 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
 
   await qbt.addTorrent(magnet);
 
-  // Poll for metadata and a safe media candidate.
+  // Poll for metadata, then for the chosen file to appear on disk.
+  //
+  // Selection is driven by the torrent's FILE TABLE, not by scanning the disk. The table has final
+  // names and sizes as soon as metadata lands, whereas on disk the movie is still "Movie.mp4.!qB"
+  // (qBittorrent's incomplete-file suffix) and may be zero bytes or in a different directory
+  // entirely -- which is why disk scanning reported "no playable media file" on healthy torrents.
   let torrentInfo = null;
+  let files = [];
+  let chosen = null;
   let targetFilePath = null;
 
   for (let i = 0; i < 30; i++) {
     torrentInfo = await qbt.findTorrent(infoHash, nameHint, magnet);
+
     if (torrentInfo) {
-      if (torrentInfo.content_path) {
-        targetFilePath = findSafeMediaFileCandidate(torrentInfo.content_path);
+      const hash = (torrentInfo.hash || infoHash || '').toLowerCase();
+      files = await qbt.getFiles(hash);
+      chosen = selectMediaFileFromTable(files);
+
+      if (chosen) {
+        targetFilePath = resolveMediaFileOnDisk(torrentInfo, chosen.name);
+        if (targetFilePath) break;
+      } else if (files.length > 0) {
+        // Metadata is complete and genuinely contains no streamable media — polling will not help.
+        break;
       }
-      if (!targetFilePath && torrentInfo.save_path && torrentInfo.name) {
-        targetFilePath = findSafeMediaFileCandidate(path.join(torrentInfo.save_path, torrentInfo.name));
-      }
-      if (targetFilePath && fs.existsSync(targetFilePath)) break;
     }
+
     await new Promise(r => setTimeout(r, 800));
   }
 
@@ -1330,11 +1424,27 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
     };
   }
 
-  if (!targetFilePath || !fs.existsSync(targetFilePath)) {
+  if (!chosen) {
+    const listed = files.length
+      ? files.slice(0, 5).map(f => path.basename(f.name || '')).join(', ')
+      : 'none reported';
+    console.warn(`[Media Select] No streamable file in "${torrentInfo.name}". Files: ${listed}`);
+    return {
+      ok: false,
+      status: 415,
+      message:
+        `This torrent contains no streamable video file (looked for ` +
+        `${[...ALLOWED_MEDIA_EXTS].join(', ')} of at least 5 MB). It may be an archive or disc image release.`
+    };
+  }
+
+  if (!targetFilePath) {
     return {
       ok: false,
       status: 503,
-      message: 'Torrent metadata arrived but no playable media file was found in it yet. Retry in a few seconds.'
+      message:
+        `qBittorrent has not created "${path.basename(chosen.name)}" on disk yet. ` +
+        `It is still connecting to the swarm — retry in a few seconds.`
     };
   }
 
@@ -1342,7 +1452,13 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
   reserveTorrent(matchedHash);
   const pieceSize = torrentInfo.piece_size || 2 * 1024 * 1024;
 
-  const mapping = await resolveTorrentFileMapping(matchedHash, torrentInfo, targetFilePath, pieceSize);
+  const mapping = computeFileMapping(files, chosen, pieceSize);
+
+  console.log(
+    `[Media Select] "${torrentInfo.name}" -> ${path.basename(chosen.name)} ` +
+    `(${(chosen.size / 1048576).toFixed(1)} MB, file #${chosen.index}, ` +
+    `offset ${mapping.fileOffsetInTorrent}${mapping.exact ? '' : ' approx'}) at ${targetFilePath}`
+  );
 
   // Spend swarm bandwidth and disk only on the file we are actually serving.
   if (mapping.fileIndex !== null) {
@@ -1377,6 +1493,11 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
     torrentName: torrentInfo.name || nameHint || 'Media Stream',
     matchedHash,
     targetFilePath,
+    // The LOGICAL name, i.e. with any ".!qB" incomplete-suffix removed. Container decisions and
+    // anything user-facing must use this: the on-disk path of a still-downloading MP4 ends in
+    // ".!qB", whose extension matches no container and would force a pointless FFmpeg remux.
+    mediaName: chosen.name,
+    mediaExt: path.extname(chosen.name).toLowerCase(),
     pieceSize,
     fileSize,
     fileOffsetInTorrent: mapping.fileOffsetInTorrent,
@@ -1415,7 +1536,7 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
       return res.status(prep.status).json({ ok: false, code: 'NO_MEDIA', error: prep.message });
     }
 
-    const ext = path.extname(prep.targetFilePath).toLowerCase();
+    const ext = prep.mediaExt;
     const summary = await getProbeSummary(prep.matchedHash, prep.targetFilePath, prep.token);
     const decision = decideStreamMode(summary, ext);
 
@@ -1446,7 +1567,7 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
       reason: decision.reason,
       infoHash: prep.matchedHash,
       torrentName: prep.torrentName,
-      fileName: path.basename(prep.targetFilePath),
+      fileName: path.basename(prep.mediaName),
       fileSizeBytes: prep.fileSize,
       durationSec: summary && summary.durationSec ? Math.round(summary.durationSec) : 0,
       seekable: decision.mode === 'direct',
@@ -1546,8 +1667,8 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
       ip: req.ip
     });
 
-    // Decide how to deliver this specific file.
-    const ext = path.extname(targetFilePath).toLowerCase();
+    // Decide how to deliver this specific file, from its LOGICAL extension.
+    const ext = prep.mediaExt;
     const summary = await getProbeSummary(matchedHash, targetFilePath, token);
     const auto = decideStreamMode(summary, ext);
     const mode = (requestedMode === 'direct' || requestedMode === 'remux') ? requestedMode : auto.mode;

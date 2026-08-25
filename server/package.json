@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node test/piece-aware-stream.test.mjs && node test/session-lifecycle.test.mjs"
+    "test": "node test/piece-aware-stream.test.mjs && node test/session-lifecycle.test.mjs && node test/media-discovery.test.mjs"
   },
   "dependencies": {
     "@prisma/client": "^5.18.0",

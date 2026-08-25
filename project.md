@@ -448,6 +448,9 @@ no database:
   RFC 7233 range parsing (suffix / open-ended / unsatisfiable / HEAD).
 - `test/session-lifecycle.test.mjs` — `/api/stream/prepare` output, and the pause lifecycle:
   never on a single connection close, never while heartbeats are fresh, always once genuinely idle.
+- `test/media-discovery.test.mjs` — file selection against the shapes qBittorrent presents
+  mid-download: the `.!qB` incomplete suffix, samples losing to the feature, `.mkv` never being
+  served direct, and an ISO/NFO-only torrent failing fast with `415` instead of polling for 24s.
 
 ---
 
@@ -481,6 +484,8 @@ following are now fixed in [server/index.js](file:///d:/vscode/netflix/server/in
 | 17 | **`server/node_modules` was stale** — `bcryptjs`, `jsonwebtoken` and `@prisma/client` were declared but absent, so a fresh checkout died on startup with `ERR_MODULE_NOT_FOUND`. An existing deployment with them already installed was unaffected. | `npm install`; `webtorrent` (unused since the qBittorrent migration) dropped. |
 | 18 | **Audio detection was inverted:** `isAAC = ...                                                                                                                                                                                                             |                                                                                                                             |
 | 19 | **qBittorrent 5.x renamed `pause`/`resume` to `stop`/`start`**, so bandwidth control silently no-opped on 5.x hosts.                                                                                                                               | Tries the modern name, falls back to the legacy one.                                                                        |
+| 21 | **Media discovery scanned the DISK**, so it needed a file that already existed, was already ≥ 5 MB, and had a whitelisted extension. qBittorrent appends **`.!qB` to incomplete files** by default, so a downloading movie is `Movie.mp4.!qB` — extension `.!qb`, matching no whitelist. Healthy torrents reported "no playable media file". A separate incomplete-downloads directory broke it identically. | Selection now comes from the torrent's **file table** (final names and sizes, valid the moment metadata lands); the on-disk path is resolved separately across `save_path`, `download_path` and `content_path`, with or without the `.!qB` suffix. |
+| 22 | **Container decisions used the on-disk extension**, so a still-downloading `.mp4.!qB` looked like an unknown container and was forced through FFmpeg — burning CPU and losing native seeking on a browser-native file. | Mode selection and all user-facing names use the **logical** name with the suffix stripped. |
 | 20 | **`health.activeTorrents` did not exist** (the field is `activeTorrentsCount`), so the UI always showed `undefined`.                                                                                                                                 | Fixed, plus the volume-slider selector typo`#ctrl-vol-slider`.                                                            |
 
 ### 9.2 How delivery mode is chosen
