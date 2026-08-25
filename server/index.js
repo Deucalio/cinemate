@@ -477,69 +477,64 @@ function resolveMediaFileOnDisk(torrentInfo, relName) {
     .filter(Boolean)
     .map(r => path.resolve(r));
 
-  for (const candidate of candidates) {
+  // Path traversal guard: never serve anything outside a qBittorrent-declared directory.
+  const insideRoot = (resolved) =>
+    roots.some(root => resolved === root || resolved.startsWith(root + path.sep));
+
+  // fs.existsSync() returns false for BOTH "no such file" and "permission denied", which made an
+  // unreadable download directory look identical to a torrent that had not started writing yet --
+  // the bridge told users to "retry in a few seconds" forever. EACCES is captured separately.
+  let permissionError = null;
+
+  const tryFile = (resolved) => {
     try {
-      const resolved = path.resolve(candidate);
+      return fs.statSync(resolved).isFile();
+    } catch (err) {
+      if (err.code === 'EACCES' || err.code === 'EPERM') permissionError = err;
+      return false;
+    }
+  };
 
-      // Path traversal guard: never serve anything outside a qBittorrent-declared directory.
-      const inside = roots.some(root => resolved === root || resolved.startsWith(root + path.sep));
-      if (!inside) continue;
-
-      if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) return resolved;
-    } catch {}
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    if (!insideRoot(resolved)) continue;
+    if (tryFile(resolved)) return { path: resolved, reason: 'found' };
   }
 
-  return null;
-}
+  // Fallback: qBittorrent may have sanitised or renamed the file. Scan the directories it told us
+  // about for an entry matching the basename once any ".!qB" suffix is stripped.
+  const searchDirs = [];
+  if (savePath) searchDirs.push(path.resolve(savePath, path.dirname(relName)));
+  if (downloadPath) searchDirs.push(path.resolve(downloadPath, path.dirname(relName)));
+  if (contentPath) {
+    searchDirs.push(path.resolve(contentPath));
+    searchDirs.push(path.dirname(path.resolve(contentPath)));
+  }
 
-function findSafeMediaFileCandidate(targetPath) {
-  if (!targetPath) return null;
-  const resolvedTarget = path.resolve(targetPath);
-  if (!fs.existsSync(resolvedTarget)) return null;
+  const wanted = stripIncompleteSuffix(baseName).toLowerCase();
 
-  try {
-    const stat = fs.statSync(resolvedTarget);
-    if (!stat.isDirectory()) {
-      const ext = path.extname(stripIncompleteSuffix(resolvedTarget)).toLowerCase();
-      if (FORBIDDEN_EXTS.has(ext)) return null;
-      return ALLOWED_MEDIA_EXTS.has(ext) && stat.size >= MIN_MEDIA_FILE_BYTES ? resolvedTarget : null;
-    }
-
-    let largestMediaFile = null;
-    let maxBytes = 0;
-
-    function scanDir(currentDir) {
-      const entries = fs.readdirSync(currentDir);
-      for (const entry of entries) {
-        const fullPath = path.resolve(currentDir, entry);
-        try {
-          const s = fs.statSync(fullPath);
-          if (s.isDirectory()) {
-            scanDir(fullPath);
-          } else {
-            const cleanEntry = stripIncompleteSuffix(entry);
-            const ext = path.extname(cleanEntry).toLowerCase();
-            if (FORBIDDEN_EXTS.has(ext)) continue;
-
-            const isSample = isSampleName(cleanEntry);
-            if (ALLOWED_MEDIA_EXTS.has(ext) && s.size >= MIN_MEDIA_FILE_BYTES) {
-              if (!isSample && s.size > maxBytes) {
-                maxBytes = s.size;
-                largestMediaFile = fullPath;
-              } else if (isSample && !largestMediaFile) {
-                largestMediaFile = fullPath;
-              }
-            }
-          }
-        } catch {}
+  for (const dir of searchDirs) {
+    if (!insideRoot(dir)) continue;
+    try {
+      for (const entry of fs.readdirSync(dir)) {
+        if (stripIncompleteSuffix(entry).toLowerCase() !== wanted) continue;
+        const full = path.resolve(dir, entry);
+        if (insideRoot(full) && tryFile(full)) return { path: full, reason: 'found' };
       }
+    } catch (err) {
+      if (err.code === 'EACCES' || err.code === 'EPERM') permissionError = err;
     }
-
-    scanDir(resolvedTarget);
-    return largestMediaFile;
-  } catch {
-    return null;
   }
+
+  if (permissionError) {
+    return {
+      path: null,
+      reason: 'permission-denied',
+      detail: `${permissionError.code} on ${permissionError.path || savePath || contentPath}`
+    };
+  }
+
+  return { path: null, reason: 'not-created' };
 }
 
 /**
@@ -1403,6 +1398,7 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
   let targetFilePath = null;
 
   let resumeAttempted = false;
+  let lastResolution = null;
 
   for (let i = 0; i < 30; i++) {
     torrentInfo = await qbt.findTorrent(infoHash, nameHint, magnet);
@@ -1436,8 +1432,11 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
       chosen = selectMediaFileFromTable(files);
 
       if (chosen) {
-        targetFilePath = resolveMediaFileOnDisk(torrentInfo, chosen.name);
+        lastResolution = resolveMediaFileOnDisk(torrentInfo, chosen.name);
+        targetFilePath = lastResolution.path;
         if (targetFilePath) break;
+        // No amount of waiting fixes a permissions problem.
+        if (lastResolution.reason === 'permission-denied') break;
       } else if (files.length > 0) {
         // Metadata is complete and genuinely contains no streamable media — polling will not help.
         break;
@@ -1466,6 +1465,24 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
       message:
         `This torrent contains no streamable video file (looked for ` +
         `${[...ALLOWED_MEDIA_EXTS].join(', ')} of at least 5 MB). It may be an archive or disc image release.`
+    };
+  }
+
+  if (!targetFilePath && lastResolution && lastResolution.reason === 'permission-denied') {
+    const runAs = (() => { try { return os.userInfo().username; } catch { return 'the bridge user'; } })();
+    const dir = torrentInfo.save_path || torrentInfo.content_path || 'the download directory';
+    console.error(
+      `[Resolve] Permission denied reading qBittorrent's downloads (${lastResolution.detail}). ` +
+      `Bridge runs as "${runAs}".`
+    );
+    return {
+      ok: false,
+      status: 500,
+      message:
+        `The bridge cannot read qBittorrent's download directory (${lastResolution.detail}). ` +
+        `It runs as "${runAs}", which needs read access to the files and execute (traverse) ` +
+        `permission on ${dir} and every directory above it. ` +
+        `Typically: add "${runAs}" to qBittorrent's group and make the download directory group-readable.`
     };
   }
 
