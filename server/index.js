@@ -1255,9 +1255,15 @@ setInterval(async () => {
 
       let entry = torrentRegistry.get(hash);
       if (!entry) {
-        const addedMs = (t.added_on && t.added_on > 0) ? (t.added_on * 1000) : now;
-        entry = { hash, name: t.name, refCount: 0, lastActive: addedMs, cleanTimer: null };
+        // Start the idle clock NOW, not at the torrent's original added_on.
+        //
+        // torrentRegistry lives in memory, so after any restart every existing torrent is unknown.
+        // Back-dating to added_on made them all instantly older than IDLE_TTL, so the first sweep
+        // 15s after boot deleted every torrent AND its downloaded data — a full re-download on
+        // every deploy, and a stream that was mid-resolution lost the files underneath it.
+        entry = { hash, name: t.name, refCount: 0, lastActive: now, cleanTimer: null };
         torrentRegistry.set(hash, entry);
+        console.log(`[Auto-GC] Now tracking pre-existing torrent "${t.name}" (idle timer starts now)`);
       }
 
       // In use if a connection holds a reference, a player is heart-beating, or a stream is
@@ -1396,11 +1402,36 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
   let chosen = null;
   let targetFilePath = null;
 
+  let resumeAttempted = false;
+
   for (let i = 0; i < 30; i++) {
     torrentInfo = await qbt.findTorrent(infoHash, nameHint, magnet);
 
     if (torrentInfo) {
       const hash = (torrentInfo.hash || infoHash || '').toLowerCase();
+      const state = String(torrentInfo.state || 'unknown');
+
+      // A paused torrent will never write a byte, so polling for its files just times out.
+      // Nothing else resumes it at this point: /api/stream resumes only AFTER this function
+      // returns, and /api/stream/prepare never did at all — so a torrent the Bandwidth Saver or a
+      // previous session had paused could never be restarted, and every retry timed out the same way.
+      // torrents/add does not resume an existing paused torrent either.
+      if (!resumeAttempted && (/^(paused|stopped)/i.test(state) || state === 'queuedDL')) {
+        resumeAttempted = true;
+        console.log(`[Resolve] "${torrentInfo.name}" was ${state} — resuming it.`);
+        await qbt.resumeTorrents([hash]);
+      }
+
+      if (state === 'missingFiles') {
+        return {
+          ok: false,
+          status: 503,
+          message:
+            'qBittorrent reports missing files for this torrent — its data was deleted underneath it. ' +
+            'Remove it from qBittorrent and start the stream again.'
+        };
+      }
+
       files = await qbt.getFiles(hash);
       chosen = selectMediaFileFromTable(files);
 
@@ -1439,12 +1470,24 @@ async function prepareTorrentStreamInner(magnet, nameHint, infoHash) {
   }
 
   if (!targetFilePath) {
+    // Report the swarm state rather than a generic "retry" — this is the difference between
+    // "no peers have this release" and "it is downloading, just be patient".
+    const seeds = torrentInfo.num_seeds !== undefined ? torrentInfo.num_seeds : '?';
+    const peers = torrentInfo.num_leechs !== undefined ? torrentInfo.num_leechs : '?';
+    const diag =
+      `state=${torrentInfo.state} progress=${((torrentInfo.progress || 0) * 100).toFixed(1)}% ` +
+      `seeds=${seeds} peers=${peers} dl=${((torrentInfo.dlspeed || 0) / 1024).toFixed(0)}KB/s`;
+
+    console.warn(`[Resolve] "${chosen.name}" still absent from disk — ${diag} (save_path=${torrentInfo.save_path})`);
+
     return {
       ok: false,
       status: 503,
       message:
-        `qBittorrent has not created "${path.basename(chosen.name)}" on disk yet. ` +
-        `It is still connecting to the swarm — retry in a few seconds.`
+        `qBittorrent has not written "${path.basename(chosen.name)}" to disk yet (${diag}). ` +
+        (seeds === 0
+          ? 'No seeders have this release — pick a different source.'
+          : 'It is still connecting to the swarm — retry in a few seconds.')
     };
   }
 
