@@ -1,6 +1,6 @@
 # Cache-First Streaming — Implementation Plan & Change Log
 
-> **Status:** Phases 0–3 complete · Phases 4–5 optional
+> **Status:** Phases 0–3 complete · Phase 4 not recommended · Phase 5 superseded by [Phase 5′](./phase5-hls-plan.md)
 > **Owner:** Deucalio
 > **Created:** 2026-08-25
 
@@ -209,7 +209,12 @@ missing piece, not from `progress`.
 
 ---
 
-### Phase 5 — Per-title transcode cache
+### Phase 5 — Per-title transcode cache — SUPERSEDED
+
+> Replaced by **[Phase 5′ — Progressive HLS](./phase5-hls-plan.md)**, which delivers everything
+> below *and* removes the cold-start wait. Building the MP4 version first would mean doing the same
+> work twice. The reasoning here is kept because it still explains why per-title transcoding is the
+> right shape.
 
 *The single highest-leverage change available, and only possible because of cache-first.*
 
