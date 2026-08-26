@@ -179,6 +179,12 @@ const first = await prepare();
 
 check('prepare still answers', first.body.ok === true, JSON.stringify(first.body).slice(0, 160));
 check('reports the title as still downloading', first.body.readyState === 'downloading', first.body.readyState);
+// Without this the client cannot tell a temporary hold from cache-first's "wait for 100%", so it
+// sits on its status poll and fast start never engages however quickly the head arrives.
+check('marks the hold as retryable so the client re-asks',
+  first.body.fastStartPending === true, `fastStartPending=${first.body.fastStartPending}`);
+check('does not tell the user playback needs the whole file',
+  !/once the file is complete/i.test(first.body.message || ''), first.body.message);
 check('answers promptly instead of burning the probe timeout',
   first.ms < 4000, `took ${first.ms}ms`);
 

@@ -8,6 +8,11 @@ import { store } from '../state/store.js';
 import { streamingBridge } from '../services/streamingBridge.js';
 import { toast } from './toast.js';
 
+// How often to re-ask the bridge for a plan while a fast-start title is waiting on its first few
+// MB. Slower than the 2 s status poll: `prepare` re-resolves the torrent and selects the media
+// file, so asking on every tick would be wasteful and noisy in the bridge log.
+const PREPARE_RETRY_MS = 5000;
+
 export class PlayerModalManager {
   constructor() {
     this.modal = null;
@@ -26,6 +31,8 @@ export class PlayerModalManager {
     this._streamGeneration = 0;
     this._remuxAttempted = false;
     this._pendingLoad = null;   // { generation, startSec } while waiting for the download
+    this._lastPrepareRetryAt = 0;      // throttles the fast-start prepare retry
+    this._prepareRetryInFlight = false;
     this._hls = null;           // hls.js instance, when playing a segmented representation
     this._transcodedDurationSec = 0;
     this._transcodeComplete = false;
@@ -709,6 +716,8 @@ export class PlayerModalManager {
     this.probedDuration = 0;
     this._remuxAttempted = false;
     this._pendingLoad = null;
+    this._lastPrepareRetryAt = 0;
+    this._prepareRetryInFlight = false;
     this._transcodedDurationSec = 0;
     this._transcodeComplete = false;
     this._seekWaitingForSec = null;
@@ -766,8 +775,16 @@ export class PlayerModalManager {
     if (plan.infoHash) this.currentInfoHash = plan.infoHash;
 
     // Still downloading to the server — park until the poller reports ready.
+    //
+    // `fastStartPending` means the bridge could not probe the file yet, usually because the first
+    // few MB have not landed. That resolves in seconds, and only another `prepare` can discover it
+    // — so the poller re-asks rather than waiting for the download to finish.
     if (plan.readyState === 'downloading') {
-      this._pendingLoad = { generation, startSec, kind: 'download' };
+      this._pendingLoad = {
+        generation, startSec,
+        kind: 'download',
+        retryPrepare: plan.fastStartPending === true
+      };
       this._showBufferingHUD(
         'Downloading to the server...',
         plan.message || 'Playback starts once the file is complete.'
@@ -1098,6 +1115,15 @@ export class PlayerModalManager {
           this._pendingLoad = null;
           this._showBufferingHUD('Download complete', 'Preparing playback...');
           this._resolveAndLoad(generation, pending.startSec);
+        } else if (pending.retryPrepare && !this._prepareRetryInFlight &&
+                   Date.now() - this._lastPrepareRetryAt >= PREPARE_RETRY_MS) {
+          // Fast start: a plan becomes available once the head of the file is downloaded, which is
+          // long before the file is complete. `status` reports download progress and cannot tell us
+          // the probe would now succeed, so ask `prepare` again on its own cadence.
+          this._lastPrepareRetryAt = Date.now();
+          this._prepareRetryInFlight = true;
+          this._resolveAndLoad(generation, pending.startSec)
+            .finally(() => { this._prepareRetryInFlight = false; });
         }
       }
 

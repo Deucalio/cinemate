@@ -487,7 +487,7 @@ curl -s http://localhost:8899/health | python3 -m json.tool
 ### Test suite
 
 ```bash
-cd server && npm test        # 185 assertions across 11 suites
+cd server && npm test        # 187 assertions across 11 suites
 ```
 
 Every suite runs the **real bridge** against a mock qBittorrent — no swarm, no database. Most need
@@ -639,6 +639,7 @@ after the torrent was added and before a single piece had been verified.
 | 41 | **`probeCache` had no TTL**, so that null latched under `hash:filePath`. Every later `prepare` reused the failure without re-probing, and the title reported `downloading` for the life of the process — *this is why nothing played until the download finished* | Successes are still cached indefinitely; failures expire after `PROBE_FAILURE_TTL_MS` (15 s), because “could not probe” is not a conclusion |
 | 42 | **A complete source was probed through the loopback piece-aware endpoint**, routing a local read back through piece gating and stalling whenever piece states were unavailable or stale | Read the file directly when the source is complete, exactly as the transcode input already does |
 | 43 | **`maxBytes` was documented with a rationale that does not hold.** It does nothing for Matroska | Kept, with its real justification: it bounds the one shape that *does* seek to the tail — an MP4 whose `moov` atom sits at the end — turning a full-timeout hang into a prompt failure. Verified: such a file requests the last ~90 KB and blocks at every frontier below complete |
+| 44 | **Nothing ever retried the deferred probe.** The client polls `/api/stream/status` every 2 s but only re-calls `prepare` once the download reports 100 %, and only `prepare` can attempt a probe. So the gate correctly deferred, the head landed seconds later — and the plan was not asked for again until the file was complete. Fast start could never engage on the very path built for it | `prepare` returns `fastStartPending: true` for a temporary hold, and the poller re-asks every 5 s while parked on one. Cache-first holds are unaffected: they carry no such flag and still wait for `status.ready` |
 
 Regression coverage: `server/test/probe-head-gate.test.mjs` (10 assertions) drives the real bridge
 against a mock qBittorrent whose download frontier it moves between calls, and uses real ffprobe —

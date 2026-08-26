@@ -3174,7 +3174,12 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
         torrentName: prep.torrentName,
         fileName: path.basename(prep.mediaName),
         fileSizeBytes: prep.fileSize,
-        message: 'Downloading to the server. Playback starts once the file is complete.'
+        // Tells the client this hold is temporary and worth re-asking about. `status` cannot report
+        // it — only another `prepare` can attempt the probe — so without this the client sits on its
+        // status poll until the download hits 100%, which is the very wait fast start exists to
+        // avoid.
+        fastStartPending: true,
+        message: 'Buffering the start of the file. Playback begins while the rest downloads.'
       });
     }
 
