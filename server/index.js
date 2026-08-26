@@ -505,11 +505,25 @@ class QBittorrentClient {
 
     const inflight = this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/pieceStates?hash=${key}`)
       .then(async (res) => {
-        if (!res.ok) return prevStates;
+        if (!res.ok) {
+          // Silence here is what made an unreachable endpoint look identical to a torrent with
+          // nothing downloaded: both surface as an empty array, and every caller reads that as
+          // "not verified yet". Throttled so a polling reader cannot flood the log.
+          this._warnPieceStates(key, `HTTP ${res.status}`);
+          return prevStates;
+        }
         const states = await res.json();
-        return Array.isArray(states) ? states : prevStates;
+        if (!Array.isArray(states)) {
+          this._warnPieceStates(key, `expected an array, got ${typeof states}`);
+          return prevStates;
+        }
+        if (states.length === 0) this._warnPieceStates(key, 'returned an EMPTY array');
+        return states;
       })
-      .catch(() => prevStates)
+      .catch((err) => {
+        this._warnPieceStates(key, err.message);
+        return prevStates;
+      })
       .then((states) => {
         this._pieceCache.set(key, { at: Date.now(), states, inflight: null });
         return states;
@@ -521,6 +535,18 @@ class QBittorrentClient {
 
   invalidatePieceCache(hash) {
     this._pieceCache.delete(String(hash || '').toLowerCase());
+  }
+
+  /** At most one piece-state complaint per torrent per 30 s — readers poll several times a second. */
+  _warnPieceStates(hash, detail) {
+    if (!this._pieceWarnAt) this._pieceWarnAt = new Map();
+    const last = this._pieceWarnAt.get(hash) || 0;
+    if (Date.now() - last < 30000) return;
+    this._pieceWarnAt.set(hash, Date.now());
+    console.warn(
+      `[qBittorrent] pieceStates for ${hash.slice(0, 8)} unusable: ${detail}. ` +
+      `Every piece will read as unverified, so nothing will stream.`
+    );
   }
 
   /**
@@ -2194,25 +2220,41 @@ function probeOverrideFor(filePath) {
  * nothing. Checking the piece states first costs one cached API call.
  */
 async function headBytesVerified(desc, bytes) {
-  if (!desc || !desc.pieceSize) return false;
+  if (!desc || !desc.pieceSize) return { ready: false, reason: 'no piece size for this torrent' };
 
   const firstPiece = Math.floor(desc.fileOffsetInTorrent / desc.pieceSize);
   const lastByte = Math.min(desc.fileSize, bytes) - 1;
-  if (lastByte < 0) return false;
+  if (lastByte < 0) return { ready: false, reason: 'empty file' };
   const lastPiece = Math.floor((desc.fileOffsetInTorrent + lastByte) / desc.pieceSize);
 
   let states;
   try {
     states = await qbt.getPieceStates(desc.hash);
-  } catch {
-    return false;
+  } catch (err) {
+    return { ready: false, reason: `piece states unavailable (${err.message})` };
   }
-  if (!Array.isArray(states) || states.length === 0) return false;
+  if (!Array.isArray(states) || states.length === 0) {
+    // Distinguishing this from "downloaded nothing yet" matters: it does not resolve by waiting,
+    // and reporting it as progress would hide a broken qBittorrent connection behind a spinner.
+    return { ready: false, reason: 'qBittorrent returned NO piece states — not a download delay' };
+  }
 
+  const missing = [];
   for (let p = firstPiece; p <= lastPiece; p++) {
-    if (states[p] !== 2) return false;
+    if (states[p] !== 2) missing.push(`${p}=${states[p] === undefined ? 'absent' : states[p]}`);
   }
-  return true;
+  if (missing.length === 0) return { ready: true, reason: '' };
+
+  // The verified total tells us whether the swarm is delivering out of order — pieces landing
+  // everywhere except the head means sequential download is not actually in effect.
+  let verified = 0;
+  for (let i = 0; i < states.length; i++) if (states[i] === 2) verified++;
+
+  return {
+    ready: false,
+    reason: `head pieces ${firstPiece}-${lastPiece} not verified [${missing.join(' ')}] ` +
+            `while ${verified}/${states.length} pieces are verified overall`
+  };
 }
 
 async function getProbeSummary(hash, filePath, token, { quick = false, sourceComplete = false } = {}) {
@@ -2236,10 +2278,11 @@ async function getProbeSummary(hash, filePath, token, { quick = false, sourceCom
   // ask again. This is the difference between a 15-second block and an immediate answer.
   if (quick) {
     const desc = internalStreamTokens.get(token);
-    if (!(await headBytesVerified(desc, PROBE_HEAD_READY_BYTES))) {
+    const head = await headBytesVerified(desc, PROBE_HEAD_READY_BYTES);
+    if (!head.ready) {
       console.log(
-        `[Probe] Head of "${path.basename(filePath)}" not downloaded yet ` +
-        `(need first ${Math.round(PROBE_HEAD_READY_BYTES / (1024 * 1024))} MB verified) — deferring the probe.`
+        `[Probe] Head of "${path.basename(filePath)}" not ready ` +
+        `(need first ${Math.round(PROBE_HEAD_READY_BYTES / (1024 * 1024))} MB verified) — ${head.reason}`
       );
       return null;
     }
