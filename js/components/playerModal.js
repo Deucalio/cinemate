@@ -26,6 +26,10 @@ export class PlayerModalManager {
     this._streamGeneration = 0;
     this._remuxAttempted = false;
     this._pendingLoad = null;   // { generation, startSec } while waiting for the download
+    this._hls = null;           // hls.js instance, when playing a segmented representation
+    this._transcodedDurationSec = 0;
+    this._hlsStartBufferSec = 8;
+    this._seekWaitingForSec = null;  // a seek accepted beyond the transcode head
   }
 
   open(movie, options = {}) {
@@ -197,6 +201,8 @@ export class PlayerModalManager {
         <div class="player-bottom-controls animate-fade-in" id="player-bottom-controls">
           <!-- Timeline / Scrubber -->
           <div class="player-timeline-wrap" id="player-timeline-wrap">
+            <!-- How much has been transcoded. Seeking inside this is instant; beyond it waits. -->
+            <div class="player-timeline-transcoded" id="player-timeline-transcoded" style="width: 0%;"></div>
             <div class="player-timeline-buffered" style="width: 0%;"></div>
             <div class="player-timeline-progress" id="player-timeline-progress" style="width: 0%;"></div>
             <div class="player-timeline-handle" id="player-timeline-handle" style="left: 0%;"></div>
@@ -446,7 +452,10 @@ export class PlayerModalManager {
       this._hideBufferingHUD();
       this._stopStatusPolling();
     });
-    video.addEventListener('progress', () => this._updateBufferedRange());
+    video.addEventListener('progress', () => {
+      this._updateBufferedRange();
+      this._updateTranscodedRange();
+    });
 
     // Single, state-aware handler. The old one blind-reloaded the element every 3.5s forever,
     // which both hid the real failure and raced the remux fallback by reloading the failed
@@ -682,6 +691,10 @@ export class PlayerModalManager {
     this.probedDuration = 0;
     this._remuxAttempted = false;
     this._pendingLoad = null;
+    this._transcodedDurationSec = 0;
+    this._seekWaitingForSec = null;
+    this._hlsPlaylistUrl = null;
+    this._destroyHls();
 
     // Guards against a slow prepare for an abandoned source overwriting a newer selection.
     const generation = ++this._streamGeneration;
@@ -735,7 +748,7 @@ export class PlayerModalManager {
 
     // Still downloading to the server — park until the poller reports ready.
     if (plan.readyState === 'downloading') {
-      this._pendingLoad = { generation, startSec };
+      this._pendingLoad = { generation, startSec, kind: 'download' };
       this._showBufferingHUD(
         'Downloading to the server...',
         plan.message || 'Playback starts once the file is complete.'
@@ -746,6 +759,26 @@ export class PlayerModalManager {
     this._pendingLoad = null;
     this.probedDuration = plan.durationSec || 0;
     if (plan.durationSec > 300) this.duration = plan.durationSec;
+
+    if (plan.mode === 'hls') {
+      this._hlsPlaylistUrl = plan.playlistUrl;
+      this._hlsStartBufferSec = plan.startBufferSec || 8;
+      this._transcodedDurationSec = (plan.transcode && plan.transcode.transcodedDurationSec) || 0;
+
+      const enough = this._transcodedDurationSec >= this._hlsStartBufferSec;
+      const done = plan.transcode && plan.transcode.state === 'complete';
+
+      if (!enough && !done) {
+        // Park until the transcoder is far enough ahead; the status poller calls back.
+        this._pendingLoad = { generation, startSec, kind: 'transcode' };
+        this._showBufferingHUD(
+          'Preparing playback...',
+          `${plan.reason} — converting to a browser-playable stream. Playback starts shortly.`
+        );
+        this._startStatusPolling();
+        return;
+      }
+    }
 
     const shortTitle = this.currentStreamTitle.length > 40
       ? `${this.currentStreamTitle.substring(0, 40)}...`
@@ -793,6 +826,20 @@ export class PlayerModalManager {
 
     this.currentStreamMode = mode;
 
+    if (mode === 'hls') {
+      // Segments carry their own timeline, so there is no offset to track and no restart on seek.
+      this.currentStartSec = 0;
+      this._pendingSeekSec = startSec > 0 ? startSec : 0;
+      this._attachHls(this._hlsPlaylistUrl).catch((err) => {
+        console.warn('[Player] could not load the HLS engine', err);
+        this._showStreamError('Could not load the playback engine for this stream.', 'HLS_LOAD_FAILED');
+      });
+      return;
+    }
+
+    // Any previous segmented playback must be torn down before a plain <video> src is used.
+    this._destroyHls();
+
     if (mode === 'direct') {
       this.currentStartSec = 0;
       this._pendingSeekSec = startSec > 0 ? startSec : 0;
@@ -813,6 +860,89 @@ export class PlayerModalManager {
     this.videoElement.src = url;
     this.videoElement.load();
     this._play();
+  }
+
+  /**
+   * Attaches a segmented (HLS) representation.
+   *
+   * Safari plays HLS natively and hls.js explicitly recommends deferring to it there rather than
+   * driving Media Source Extensions.
+   */
+  async _attachHls(playlistUrl) {
+    this._destroyHls();
+
+    const video = this.videoElement;
+    if (!video) return;
+
+    const url = `${streamingBridge.getStreamServerUrl()}${playlistUrl}`;
+
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+      video.load();
+      this._play();
+      return;
+    }
+
+    // Loaded on demand: hls.js is ~400 kB and irrelevant to browser-native releases, so it should
+    // not be in the bundle every visitor downloads.
+    const generation = this._streamGeneration;
+    const { default: Hls } = await import('hls.js');
+    if (generation !== this._streamGeneration || !this.modal) return;
+    this._Hls = Hls;
+
+    if (!Hls.isSupported()) {
+      this._showStreamError('This browser cannot play segmented streams (no MSE support).', 'HLS_UNSUPPORTED');
+      return;
+    }
+
+    const hls = new Hls({
+      enableWorker: true,
+      lowLatencyMode: false,
+      // The playlist grows while transcoding, so hls.js must keep re-reading it rather than
+      // treating the current end as the end of the asset.
+      liveSyncDurationCount: 3,
+      backBufferLength: 90
+    });
+
+    this._hls = hls;
+    hls.on(Hls.Events.ERROR, (_evt, data) => this._handleHlsError(hls, data));
+    hls.on(Hls.Events.MANIFEST_PARSED, () => this._play());
+    hls.loadSource(url);
+    hls.attachMedia(video);
+  }
+
+  _destroyHls() {
+    if (!this._hls) return;
+    try { this._hls.destroy(); } catch {}
+    this._hls = null;
+  }
+
+  /**
+   * hls.js reports many non-fatal errors that it recovers from itself; only fatal ones need us.
+   *
+   * A network error is expected here rather than exceptional: while transcoding, the player can
+   * reach the end of the segments that exist and ask for one that has not been written yet.
+   * Reloading is the correct response, not an error message.
+   */
+  _handleHlsError(hls, data) {
+    const Hls = this._Hls;
+    if (!Hls || !data || !data.fatal) return;
+
+    console.warn('[Player] fatal HLS error', data.type, data.details);
+
+    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      this._showBufferingHUD('Waiting for more of the film...', 'The transcoder has not reached this point yet.');
+      this._startStatusPolling();
+      try { hls.startLoad(); } catch {}
+      return;
+    }
+
+    if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+      try { hls.recoverMediaError(); return; } catch {}
+    }
+
+    this._destroyHls();
+    this._showStreamError(`Playback failed (${data.details}). Try a different source.`, data.details);
   }
 
   /**
@@ -920,12 +1050,36 @@ export class PlayerModalManager {
 
       this._renderDownloadProgress(status);
 
-      // Cache-first: the file just finished downloading, so a plan is now available.
-      if (status.ready && this._pendingLoad && this._pendingLoad.generation === generation) {
-        const { startSec } = this._pendingLoad;
-        this._pendingLoad = null;
-        this._showBufferingHUD('Download complete', 'Preparing playback...');
-        this._resolveAndLoad(generation, startSec);
+      if (status.transcode) {
+        this._transcodedDurationSec = status.transcode.transcodedDurationSec || 0;
+        this._updateTranscodedRange();
+      }
+
+      const pending = this._pendingLoad;
+      if (pending && pending.generation === generation) {
+        if (pending.kind === 'transcode') {
+          // Enough transcoded video exists to start, or the whole thing is done.
+          const t = status.transcode;
+          const ready = t && (t.state === 'complete' || t.transcodedDurationSec >= this._hlsStartBufferSec);
+          if (ready) {
+            this._pendingLoad = null;
+            this._loadStreamUrl('hls', pending.startSec);
+          }
+        } else if (status.ready) {
+          // Cache-first: the file finished downloading, so a plan is now available.
+          this._pendingLoad = null;
+          this._showBufferingHUD('Download complete', 'Preparing playback...');
+          this._resolveAndLoad(generation, pending.startSec);
+        }
+      }
+
+      // A seek was accepted beyond the transcode head; perform it once that point exists.
+      if (this._seekWaitingForSec !== null &&
+          this._transcodedDurationSec >= this._seekWaitingForSec) {
+        const target = this._seekWaitingForSec;
+        this._seekWaitingForSec = null;
+        this._hideBufferingHUD();
+        try { this.videoElement.currentTime = target; } catch {}
       }
     };
 
@@ -1013,6 +1167,9 @@ export class PlayerModalManager {
    * The film's full duration, preferring the element, then ffprobe, then the TMDB runtime.
    */
   _totalDuration() {
+    // For a segmented stream the element only knows about what has been transcoded so far, so the
+    // probed duration is authoritative — otherwise the scrubber would shrink to the transcode head.
+    if (this.currentStreamMode === 'hls' && this.probedDuration > 300) return this.probedDuration;
     if (this.duration && this.duration > 300) return this.duration;
     if (this.probedDuration && this.probedDuration > 300) return this.probedDuration;
     return this.totalRuntimeSeconds || 3300;
@@ -1025,6 +1182,23 @@ export class PlayerModalManager {
       if (elementTime >= buf.start(i) && elementTime <= buf.end(i)) return true;
     }
     return false;
+  }
+
+  /**
+   * Draws how much of the film has been transcoded. The boundary matters to the viewer: seeking
+   * inside it is instant, beyond it waits — so it has to be visible rather than implied.
+   */
+  _updateTranscodedRange() {
+    const el = this.modal ? this.modal.querySelector('#player-timeline-transcoded') : null;
+    if (!el) return;
+
+    if (this.currentStreamMode !== 'hls' || !this._transcodedDurationSec) {
+      el.style.width = '0%';
+      return;
+    }
+
+    const percent = Math.min(100, Math.max(0, (this._transcodedDurationSec / this._totalDuration()) * 100));
+    el.style.width = `${percent}%`;
   }
 
   _updateBufferedRange() {
@@ -1099,7 +1273,26 @@ export class PlayerModalManager {
     const totalDur = this._totalDuration();
     const clamped = Math.max(0, Math.min(totalDur, targetSeconds));
 
-    if (!this.currentMagnet || this.currentStreamMode === 'direct') {
+    if (this.currentStreamMode === 'hls') {
+      // Inside the transcoded range this is an ordinary seek — hls.js fetches the segment that
+      // covers it. Beyond the head the segment does not exist yet, so the seek is ACCEPTED and
+      // deferred rather than refused: the scrubber should not lie about where you can go.
+      const head = this._transcodedDurationSec;
+      const complete = head > 0 && head >= this._totalDuration() - 1;
+
+      if (!complete && head > 0 && clamped > head) {
+        this._seekWaitingForSec = clamped;
+        try { video.currentTime = Math.max(0, head - 1); } catch {}
+        this._showBufferingHUD(
+          'Waiting for the transcoder...',
+          `Seeking to ${this._formatTime(clamped)} — transcoded up to ${this._formatTime(head)} so far.`
+        );
+        this._startStatusPolling();
+      } else {
+        this._seekWaitingForSec = null;
+        try { video.currentTime = clamped; } catch {}
+      }
+    } else if (!this.currentMagnet || this.currentStreamMode === 'direct') {
       // Byte-range backed: seek natively and let the bridge map the offset onto torrent pieces.
       try { video.currentTime = clamped; } catch {}
     } else {
@@ -1163,6 +1356,7 @@ export class PlayerModalManager {
 
     this._stopHeartbeat();
     this._stopStatusPolling();
+    this._destroyHls();
 
     if (this.progressTimer) {
       clearInterval(this.progressTimer);

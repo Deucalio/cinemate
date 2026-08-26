@@ -429,15 +429,55 @@ original "why won't this play" failure — could not be tested on a machine with
 }
 ```
 
-### 6.4 Client
+### 6.4 Client — ✅ DONE
 
-- [ ] `hls.js` as an npm dependency bundled by Vite — not a CDN tag.
-- [ ] `mode: 'hls'` → attach `Hls`; native HLS on Safari via
-      `canPlayType('application/vnd.apple.mpegurl')`.
-- [ ] Start once `transcodedDurationSec >= HLS_START_BUFFER_SEC`.
-- [ ] Scrubber spans the **full** duration, with the un-transcoded region visually distinct.
-- [ ] Seeks beyond the head accepted, with the waiting message from §4.9.
-- [ ] `Hls.Events.ERROR` surfaced through the existing error HUD.
+- [x] `hls.js` as an npm dependency, **dynamically imported** so it is code-split.
+- [x] `mode: 'hls'` → attach `Hls`; native HLS on Safari via `canPlayType(...)`.
+- [x] Start once `transcodedDurationSec >= HLS_START_BUFFER_SEC` (server publishes the threshold).
+- [x] Scrubber spans the full duration; the transcoded region is drawn distinctly.
+- [x] Seeks beyond the head accepted and deferred, with the §4.9 waiting message.
+- [x] `Hls.Events.ERROR` handled, with recovery before reporting.
+
+**Notes from implementation:**
+
+- **hls.js is loaded on demand.** Bundling it eagerly took the main chunk from 174 kB to **767 kB**
+  — a cost every visitor pays, including those who only ever watch browser-native releases. A
+  dynamic `import()` splits it into its own 592 kB chunk fetched only when a segmented stream
+  actually plays.
+- **A fatal `NETWORK_ERROR` is expected, not exceptional.** While transcoding, the player can reach
+  the end of the segments that exist and request one not yet written. The correct response is to
+  show progress and `startLoad()` again, not to surface an error. `MEDIA_ERROR` attempts
+  `recoverMediaError()` first. Only what survives both is reported.
+- **`_totalDuration()` prefers the probed duration in HLS mode.** The element only knows about what
+  has been transcoded, so without this the scrubber would shrink to the transcode head and grow as
+  it advanced.
+- A seek beyond the head parks in `_seekWaitingForSec`, moves playback to just before the head, and
+  is performed by the status poller once that point exists — accepted and deferred, per §4.9,
+  rather than refused.
+
+**`HLS_ENABLED` still defaults to off.** The client is ready, but flipping the default is a
+behavioural change for a running deployment; it should be enabled explicitly (`HLS_ENABLED=1`) and
+verified against a real release before it becomes the default.
+
+---
+
+### 6.6 Fast start — NOT YET DONE
+
+§6.4 delivers **instant seeking** and **one transcode per title**, but *not* the ~10 s cold start:
+`prepare` still refuses to probe or plan until the download is complete (Phase 2's
+`REQUIRE_COMPLETE` gate), so the transcode begins only afterwards.
+
+Removing that gate for the HLS path is what delivers fast start. The design is sound — FFmpeg reads
+the piece-aware loopback URL, which blocks and now has progress-based waiting (§5.4) — but it means
+probing a file that is still downloading, which is what produced the old
+`probe unavailable → falling back on container extension` noise.
+
+Likely shape: use the **container extension** as a cheap pre-check. A non-native container
+(`.mkv` etc.) is known to need HLS without probing, so its transcode can start immediately; a
+`.mp4` needs the probe to decide and can wait for completion, where `direct` is the right answer
+anyway.
+
+Deliberately a separate step so §6.4 is verifiable on its own.
 
 ### 6.5 Deletions this enables
 

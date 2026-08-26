@@ -45,7 +45,11 @@ export default defineConfig(({ mode }) => {
       emptyOutDir: true,
       // Torrent/stream URLs are built at runtime; nothing here needs a legacy target.
       target: 'es2020',
-      sourcemap: true
+      sourcemap: true,
+      // hls.js is ~575 kB and lands in its own chunk, fetched only when a segmented stream plays.
+      // The default 500 kB warning would fire on it every build, which just trains people to
+      // ignore build warnings.
+      chunkSizeWarningLimit: 700
     }
   };
 });

@@ -69,6 +69,9 @@ const HLS_SEGMENT_SECONDS = parseInt(process.env.HLS_SEGMENT_SECONDS || '4', 10)
 const HLS_MAX_CONCURRENT = parseInt(
   process.env.HLS_MAX_CONCURRENT || String(Math.max(1, os.cpus().length - 2)), 10);
 const HLS_MANIFEST_VERSION = 1;
+// How much transcoded video must exist before playback may begin. Expressed in SECONDS rather than
+// segments, so changing HLS_SEGMENT_SECONDS cannot silently change what "ready" means.
+const HLS_START_BUFFER_SEC = parseInt(process.env.HLS_START_BUFFER_SEC || '8', 10);
 // Off until the client can consume a playlist (Phase 5' §6.4). With it off, non-native releases
 // keep taking the live remux path.
 const HLS_ENABLED = process.env.HLS_ENABLED === '1';
@@ -2999,6 +3002,7 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
         fileSizeBytes: prep.fileSize,
         durationSec: Math.round(durationSec),
         playlistUrl: `/api/stream/hls/${prep.matchedHash}/playlist.m3u8`,
+        startBufferSec: HLS_START_BUFFER_SEC,
         transcode: {
           state: hls.state,
           segmentsReady: hls.segmentsReady,
@@ -3421,6 +3425,7 @@ app.get('/health', async (req, res) => {
     hls: {
       enabled: HLS_ENABLED,
       segmentSeconds: HLS_SEGMENT_SECONDS,
+      startBufferSec: HLS_START_BUFFER_SEC,
       maxConcurrent: HLS_MAX_CONCURRENT,
       activeJobs: hlsJobs.size,
       sourcePolicy: HLS_SOURCE_POLICY
