@@ -146,13 +146,17 @@ function assessBrowserPlayability(summary, ext) {
     : { ok: false, reason: `container ${ext || 'unknown'}` };
 
   if (!summary) {
-    // No probe: the extension is all we have. Trusting it is a guess, but a conservative one —
-    // a non-native container still routes away from direct.
+    // No probe. The extension tells us whether the CONTAINER is playable and nothing else, so
+    // neither stream may be assumed copyable.
+    //
+    // Assuming otherwise is how an E-AC-3 track ended up copied verbatim into HLS segments: the
+    // container was known bad, the audio was assumed fine, and the result was a stream no browser
+    // could decode — which presented as playback stalling rather than as an error.
     return {
       playable: container.ok,
       container,
       video: { ok: true, assumed: true },
-      audio: { ok: true, assumed: true },
+      audio: { ok: false, assumed: true, reason: 'audio codec unknown (no probe)' },
       probed: false
     };
   }
@@ -1115,15 +1119,22 @@ function servePieceAwareRange(req, res, ctx) {
  * (rather than the raw path) means ffprobe can SEEK, so it can reach a `moov` atom parked at the
  * end of the file -- the exact case that made piped FFmpeg hang forever.
  */
-function probeMedia(url, timeoutMs = 30000) {
+function probeMedia(url, { timeoutMs = 30000, quick = false, label = '' } = {}) {
   return new Promise((resolve) => {
+    // A quick probe reads only the head. Codec identification needs the container header, not the
+    // whole file — and against a still-downloading source every megabyte is a piece-gated read, so
+    // asking for 10 MB is what made this time out and block `prepare` for its full 30 seconds.
+    const depth = quick ? '2M' : '10M';
+
     const args = [
       '-hide_banner', '-loglevel', 'error',
       '-print_format', 'json',
       '-show_format', '-show_streams',
-      '-analyzeduration', '10M', '-probesize', '10M',
+      '-analyzeduration', depth, '-probesize', depth,
       url
     ];
+
+    const startedAt = Date.now();
 
     let proc;
     try {
@@ -1147,10 +1158,16 @@ function probeMedia(url, timeoutMs = 30000) {
 
     proc.on('close', () => {
       clearTimeout(timer);
+      const elapsed = Date.now() - startedAt;
       if (stderr.trim()) console.warn('[ffprobe]', stderr.trim().split('\n')[0]);
       try {
-        resolve(JSON.parse(stdout));
+        const parsed = JSON.parse(stdout);
+        console.log(`[ffprobe] ${label || 'probe'} ok in ${elapsed}ms${quick ? ' (quick)' : ''}`);
+        resolve(parsed);
       } catch {
+        // Timing matters here: a probe that took the whole timeout blocked prepare for that long,
+        // which is a very different problem from one that failed instantly.
+        console.warn(`[ffprobe] ${label || 'probe'} FAILED after ${elapsed}ms${quick ? ' (quick)' : ''}`);
         resolve(null);
       }
     });
@@ -2140,7 +2157,7 @@ function probeOverrideFor(filePath) {
   }
 }
 
-async function getProbeSummary(hash, filePath, token) {
+async function getProbeSummary(hash, filePath, token, quick = false) {
   const override = probeOverrideFor(filePath);
   if (override) return summarizeProbe(override);
 
@@ -2149,7 +2166,7 @@ async function getProbeSummary(hash, filePath, token) {
   if (cached && cached.inflight) return cached.inflight;
   if (cached) return cached.summary;
 
-  const inflight = probeMedia(internalUrlFor(token))
+  const inflight = probeMedia(internalUrlFor(token), { quick, timeoutMs: quick ? 12000 : 30000, label: path.basename(filePath) })
     .then((probe) => {
       const summary = summarizeProbe(probe);
       probeCache.set(key, { at: Date.now(), summary, inflight: null });
@@ -3020,7 +3037,38 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
     }
 
     const ext = prep.mediaExt;
-    const summary = await getProbeSummary(prep.matchedHash, prep.targetFilePath, prep.token);
+    const summary = await getProbeSummary(
+      prep.matchedHash, prep.targetFilePath, prep.token, /* quick */ !sourceComplete
+    );
+
+    // Fast start must not proceed on guesses. Without a probe we do not know whether the video can
+    // be stream-copied or the audio needs converting, and building a representation on the wrong
+    // assumption produces segments that play silently, or not at all — while reporting success.
+    // Waiting for the download is slower but correct; the transcode then runs against a complete
+    // file and probes reliably.
+    // Scoped to the FAST-START case specifically. An unprobed browser-native container falling
+    // back to `direct` is fine: nothing durable is built, and a wrong guess just fails the way it
+    // always did. A wrong guess that becomes a transcoded representation is a different matter.
+    if (!summary && !sourceComplete && needsHlsByContainer) {
+      const live = await qbt.findTorrent(prep.matchedHash, nameHint, magnet);
+      const progress = live ? (live.progress || 0) : 0;
+      console.warn(
+        `[Prepare] Could not probe "${prep.torrentName}" while downloading — waiting for the ` +
+        `full file rather than guessing its codecs.`
+      );
+      return res.json({
+        ok: true,
+        readyState: 'downloading',
+        progress,
+        progressPercent: Math.round(progress * 1000) / 10,
+        infoHash: prep.matchedHash,
+        torrentName: prep.torrentName,
+        fileName: path.basename(prep.mediaName),
+        fileSizeBytes: prep.fileSize,
+        message: 'Downloading to the server. Playback starts once the file is complete.'
+      });
+    }
+
     const decision = decideStreamMode(summary, ext);
 
     if (!decision.copyVideo && !ALLOW_VIDEO_TRANSCODE) {
@@ -3063,6 +3111,11 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
       });
 
       const durationSec = (summary && summary.durationSec) || hls.durationSec || 0;
+      if (!durationSec) {
+        // Progress divides by this, so a zero renders as "0.0% converted" beside a perfectly
+        // healthy "51m 33s ready to watch".
+        console.warn(`[HLS] No duration known for "${prep.torrentName}" — progress will read 0%.`);
+      }
 
       return res.json({
         ok: true,
