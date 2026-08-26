@@ -487,7 +487,7 @@ curl -s http://localhost:8899/health | python3 -m json.tool
 ### Test suite
 
 ```bash
-cd server && npm test        # 187 assertions across 11 suites
+cd server && npm test        # 192 assertions across 11 suites
 ```
 
 Every suite runs the **real bridge** against a mock qBittorrent — no swarm, no database. Most need
@@ -640,6 +640,7 @@ after the torrent was added and before a single piece had been verified.
 | 42 | **A complete source was probed through the loopback piece-aware endpoint**, routing a local read back through piece gating and stalling whenever piece states were unavailable or stale | Read the file directly when the source is complete, exactly as the transcode input already does |
 | 43 | **`maxBytes` was documented with a rationale that does not hold.** It does nothing for Matroska | Kept, with its real justification: it bounds the one shape that *does* seek to the tail — an MP4 whose `moov` atom sits at the end — turning a full-timeout hang into a prompt failure. Verified: such a file requests the last ~90 KB and blocks at every frontier below complete |
 | 44 | **Nothing ever retried the deferred probe.** The client polls `/api/stream/status` every 2 s but only re-calls `prepare` once the download reports 100 %, and only `prepare` can attempt a probe. So the gate correctly deferred, the head landed seconds later — and the plan was not asked for again until the file was complete. Fast start could never engage on the very path built for it | `prepare` returns `fastStartPending: true` for a temporary hold, and the poller re-asks every 5 s while parked on one. Cache-first holds are unaffected: they carry no such flag and still wait for `status.ready` |
+| 45 | **The download was never sequential, whatever the flags said.** `torrents/add` sets `sequentialDownload` and `firstLastPiecePrio`, but a magnet is added *before its metadata exists* — there is no piece map for the setting to apply to. The flags are recorded and reported back as `true`, so `ensureSequentialDownload` correctly skipped, while the torrent downloaded rarest-first. Measured: **376 of 1025 pieces verified with pieces 0 and 1 still untouched**, the head arriving around 58 %. Every earlier symptom follows from this — the `Piece 14 was not verified within 120000ms` stalls were never a slow swarm | Detected from the piece states themselves (a tenth of the torrent verified while the head is missing is not a delay, it is proof of ordering), then re-applied by cycling each flag off and on, since the API offers only toggles. The result is read back and logged |
 
 Regression coverage: `server/test/probe-head-gate.test.mjs` (10 assertions) drives the real bridge
 against a mock qBittorrent whose download frontier it moves between calls, and uses real ffprobe —

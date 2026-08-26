@@ -40,7 +40,7 @@ import os from 'os';
 import { spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
-const PIECE_SIZE = 1048576;              // 1 MB
+const PIECE_SIZE = 512 * 1024;           // small enough that the fixture spans ~19 pieces
 const HASH = 'c'.repeat(40);
 const MOCK_QBT_PORT = 18103;
 const BRIDGE_PORT = 8976;
@@ -88,6 +88,10 @@ check('fixture spans enough pieces to distinguish head from tail', PIECES >= 4, 
 let verifiedUpTo = -1;
 let reportedProgress = 0.05;
 let pieceStateRequests = 0;
+const orderToggles = [];
+// Overridable so a test can express a NON-sequential download, where pieces land everywhere except
+// the head. `verifiedUpTo` alone can only describe a contiguous front, which is the healthy case.
+let stateFor = (i) => (i <= verifiedUpTo ? 2 : 0);
 
 const mockQbt = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -111,10 +115,15 @@ const mockQbt = http.createServer((req, res) => {
   }
   if (url.pathname === '/api/v2/torrents/pieceStates') {
     pieceStateRequests++;
-    return send(Array.from({ length: PIECES }, (_, i) => (i <= verifiedUpTo ? 2 : 0)));
+    return send(Array.from({ length: PIECES }, (_, i) => stateFor(i)));
   }
   if (url.pathname === '/api/v2/torrents/files') {
     return send([{ index: 0, name: `${HASH}/movie.mkv`, size: SIZE, priority: 1, piece_range: [0, PIECES - 1] }]);
+  }
+  if (url.pathname === '/api/v2/torrents/toggleSequentialDownload' ||
+      url.pathname === '/api/v2/torrents/toggleFirstLastPiecePrio') {
+    orderToggles.push(url.pathname.split('/').pop());
+    res.writeHead(200); return res.end('Ok.');
   }
   res.writeHead(url.pathname === '/api/v2/torrents/piecePriority' ? 404 : 200);
   res.end('Ok.');
@@ -193,11 +202,41 @@ check('no doomed ffprobe was spawned against the unavailable head',
   !/\[ffprobe\].*FAILED/.test(firstLog),
   (firstLog.match(/\[ffprobe\].*/) || ['(none)'])[0]);
 
+// ---- Test 4: a non-sequential download is detected, not waited out -----------
+// The failure this pins down: qBittorrent reported seq_dl=true (the mock's torrents/info says so)
+// while the head stayed untouched as the rest of the torrent filled in — measured in production as
+// 376 of 1025 pieces verified with pieces 0 and 1 still missing. Waiting cannot fix that, so the
+// bridge must re-apply the setting rather than report progress forever.
+console.log('\n--- Test 4: pieces landing out of order re-applies sequential download ---');
+orderToggles.length = 0;
+stateFor = (i) => (i < 8 ? 0 : 2);        // head missing, everything after it verified
+reportedProgress = 0.55;
+await sleep(500);                          // outlast the piece-state cache
+
+const logBefore4 = log.length;
+const fourth = await prepare();
+await sleep(800);                          // the re-apply is fire-and-forget
+const fourthLog = log.slice(logBefore4);
+
+check('still refuses to probe an unavailable head',
+  fourth.body.readyState === 'downloading', fourth.body.readyState);
+check('names the out-of-order download instead of blaming the swarm',
+  /out of order/.test(fourthLog),
+  (fourthLog.match(/\[Probe\].*/) || ['(none)'])[0].slice(0, 150));
+check('re-applied sequential download',
+  orderToggles.includes('toggleSequentialDownload'), JSON.stringify(orderToggles));
+check('re-applied first/last piece priority',
+  orderToggles.includes('toggleFirstLastPiecePrio'), JSON.stringify(orderToggles));
+check('cycled the flag off and on, since the API offers only toggles',
+  orderToggles.filter(t => t === 'toggleSequentialDownload').length === 2,
+  JSON.stringify(orderToggles));
+
 // ---- Test 2: the head lands, and the earlier failure must not latch ---------
 // Sequential download has delivered the first pieces. The source is still incomplete, so this is
 // exactly the fast-start case: probe the head, decide the codecs, begin transcoding.
 console.log('\n--- Test 2: once the head is verified, the probe runs and is not latched off ---');
-verifiedUpTo = Math.min(PIECES - 1, 5);   // ~6 MB, comfortably past the ~1.6 MB ffprobe consumes
+verifiedUpTo = Math.min(PIECES - 1, 11);  // ~6 MB, comfortably past the ~1.6 MB ffprobe consumes
+stateFor = (i) => (i <= verifiedUpTo ? 2 : 0);   // back to an orderly download front
 reportedProgress = 0.45;
 // Outlast the piece-state cache. Now that a deferred probe returns immediately, back-to-back
 // prepares would otherwise both read the same cached states; a real client retries seconds apart.

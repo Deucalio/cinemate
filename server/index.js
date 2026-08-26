@@ -393,17 +393,14 @@ class QBittorrentClient {
     if (!hash || this._sequentialEnsured.has(hash)) return;
     this._sequentialEnsured.add(hash);
 
-    const toggle = async (action) => {
-      const body = new URLSearchParams();
-      body.append('hashes', hash);
-      await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/${action}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString()
-      });
-    };
+    const toggle = (action) => this._toggleOrderFlag(hash, action);
 
     try {
+      console.log(
+        `[Sequential] "${torrentInfo.name}" reports seq_dl=${torrentInfo.seq_dl} ` +
+        `f_l_piece_prio=${torrentInfo.f_l_piece_prio} state=${torrentInfo.state}`
+      );
+
       if (!torrentInfo.seq_dl) {
         await toggle('toggleSequentialDownload');
         console.log(`[Sequential] Enabled sequential download for "${torrentInfo.name}"`);
@@ -412,9 +409,95 @@ class QBittorrentClient {
         await toggle('toggleFirstLastPiecePrio');
         console.log(`[Sequential] Enabled first/last piece priority for "${torrentInfo.name}"`);
       }
+
+      // Trusting the toggle is how this stayed invisible: the flags are reported by the same API
+      // that ignores them if the toggle did not apply, and a torrent downloading rarest-first looks
+      // identical to one that simply has not reached the head yet. Read the flags back and say so.
+      const after = await this.readOrderFlags(hash);
+      if (after && (!after.seq_dl || !after.f_l_piece_prio)) {
+        console.warn(
+          `[Sequential] "${torrentInfo.name}" still reports seq_dl=${after.seq_dl} ` +
+          `f_l_piece_prio=${after.f_l_piece_prio} after being set. The head of the file will ` +
+          `arrive in arbitrary order, so playback cannot start before the download completes.`
+        );
+        this._sequentialEnsured.delete(hash);   // let a later attempt try again
+      }
     } catch (err) {
       this._sequentialEnsured.delete(hash);
       console.warn('[Sequential] Could not set download order:', err.message);
+    }
+  }
+
+  async _toggleOrderFlag(hash, action) {
+    const body = new URLSearchParams();
+    body.append('hashes', hash);
+    await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    });
+  }
+
+  /**
+   * Re-applies download order to a torrent that reports it is sequential but demonstrably is not.
+   *
+   * `torrents/add` sets sequentialDownload and firstLastPiecePrio, but a magnet is added before its
+   * metadata exists — there is no piece map yet for the setting to apply to. The flag is recorded
+   * and reported back as true, while the torrent that eventually materialises downloads
+   * rarest-first. Measured on a 1025-piece release: 376 pieces verified with pieces 0 and 1 still
+   * untouched, the head finally arriving around 58%.
+   *
+   * Since the API exposes only toggles, re-applying means cycling the flag off and back on. That is
+   * safe only if the second call lands, so the result is read back and the caller is told.
+   */
+  async forceSequentialDownload(hash, name = '') {
+    const key = String(hash || '').toLowerCase();
+    if (!key) return false;
+
+    if (!this._forcedSequentialAt) this._forcedSequentialAt = new Map();
+    const last = this._forcedSequentialAt.get(key) || 0;
+    if (Date.now() - last < 20000) return false;
+    this._forcedSequentialAt.set(key, Date.now());
+
+    try {
+      const before = await this.readOrderFlags(key);
+      if (!before) return false;
+
+      for (const [flag, action] of [['seq_dl', 'toggleSequentialDownload'],
+                                    ['f_l_piece_prio', 'toggleFirstLastPiecePrio']]) {
+        if (before[flag]) await this._toggleOrderFlag(key, action);  // off, so the next call re-applies
+        await this._toggleOrderFlag(key, action);                    // on
+      }
+
+      const after = await this.readOrderFlags(key);
+      const ok = Boolean(after && after.seq_dl && after.f_l_piece_prio);
+      console.log(
+        `[Sequential] Re-applied download order to "${name || key.slice(0, 8)}" — ` +
+        `now seq_dl=${after && after.seq_dl} f_l_piece_prio=${after && after.f_l_piece_prio}`
+      );
+      if (!ok) {
+        console.warn(
+          `[Sequential] "${name || key.slice(0, 8)}" would not accept sequential download. ` +
+          `Playback cannot start before the download completes.`
+        );
+      }
+      return ok;
+    } catch (err) {
+      console.warn('[Sequential] Could not re-apply download order:', err.message);
+      return false;
+    }
+  }
+
+  /** Reads just the download-order flags back from qBittorrent, to confirm a toggle took effect. */
+  async readOrderFlags(hash) {
+    try {
+      const res = await this.fetchWithAuth(`${this.baseUrl}/api/v2/torrents/info?hashes=${hash}`);
+      if (!res.ok) return null;
+      const list = await res.json();
+      const t = Array.isArray(list) ? list.find(x => String(x.hash || '').toLowerCase() === hash) : null;
+      return t ? { seq_dl: Boolean(t.seq_dl), f_l_piece_prio: Boolean(t.f_l_piece_prio) } : null;
+    } catch {
+      return null;
     }
   }
 
@@ -2250,10 +2333,19 @@ async function headBytesVerified(desc, bytes) {
   let verified = 0;
   for (let i = 0; i < states.length; i++) if (states[i] === 2) verified++;
 
+  // A tenth of the torrent verified while the very first pieces are untouched is not a slow swarm;
+  // it is proof the download is not sequential, whatever the flags claim. Re-apply the setting
+  // rather than waiting out a wait that will not end (throttled inside forceSequentialDownload).
+  const outOfOrder = verified > Math.max(8, states.length * 0.1);
+  if (outOfOrder) {
+    qbt.forceSequentialDownload(desc.hash, path.basename(desc.filePath)).catch(() => {});
+  }
+
   return {
     ready: false,
     reason: `head pieces ${firstPiece}-${lastPiece} not verified [${missing.join(' ')}] ` +
-            `while ${verified}/${states.length} pieces are verified overall`
+            `while ${verified}/${states.length} pieces are verified overall` +
+            (outOfOrder ? ' — that is out of order, re-applying sequential download' : '')
   };
 }
 
