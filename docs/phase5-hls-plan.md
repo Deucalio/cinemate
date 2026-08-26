@@ -388,14 +388,36 @@ the actual code path, not a re-implementation. Nothing spawns FFmpeg.
 <dir>/playlist.m3u8
 ```
 
-### 6.3 Serving
+### 6.3 Serving — ✅ DONE
 
-- [ ] `GET /api/stream/hls/:hash/playlist.m3u8` — static read, `no-store`.
-- [ ] `GET /api/stream/hls/:hash/:segment` — filename validated against `/^seg\d{5}\.ts$/`, and the
-      resolved path confirmed inside the job directory.
-- [ ] `prepare` gains `mode: 'hls'` with `playlistUrl`, `transcodedDurationSec`, `durationSec`,
-      `transcodeProgress`, `ready`.
-- [ ] `/api/stream/status` reports download **and** transcode progress:
+- [x] `GET /api/stream/hls/:hash/playlist.m3u8` — static read, `no-store`.
+- [x] `GET /api/stream/hls/:hash/:segment` — filename validated, resolved path confirmed inside the
+      directory. Segments are served `immutable` (they never change once written), which is what
+      makes a CDN in front of this trivial.
+- [x] `prepare` gains `mode: 'hls'` with `playlistUrl`, `transcode{}`, `seekableUntilSec`.
+- [x] `/api/stream/status` reports download **and** transcode progress in one payload.
+- [x] §4.1 codec policy: `assessBrowserPlayability()` with the h264 profile / `pix_fmt` check.
+- [x] `HLS_ENABLED` (default off until §6.4 lands the client).
+
+**Two findings worth recording:**
+
+1. **A High 10 / 4:2:2 release is *rejected*, not routed to HLS** — and that is correct. Its video
+   stream cannot be **copied** into anything a browser plays, so segmenting it would produce
+   segments that still will not decode. Only a full re-encode helps, and that stays opt-in behind
+   `ALLOW_VIDEO_TRANSCODE`. **HLS only helps when the video can be stream-copied.**
+
+2. The `415` said *"This release is encoded with h264, which browsers cannot decode"* — wrong and
+   misleading, since h264 **is** decodable and it is the profile that is not. It now reports the
+   precise reason the policy computed (`H.264 High 10 profile`, `pixel format yuv422p`).
+
+Covered by `server/test/hls-serving.test.mjs` (27 assertions): serving, six rejection cases
+including path traversal, and the codec policy across native / High 10 / 4:2:2 / 6-channel EAC3 /
+Matroska / HEVC.
+
+**Test seams added** (each explicitly marked test-only, alongside `DISK_USAGE_OVERRIDE_PCT`):
+`PROBE_OVERRIDE_PATH` supplies ffprobe output keyed by filename, and `TOOLCHAIN_OVERRIDE` reports
+binaries as present. Without them the codec policy — the place where a bug silently reproduces the
+original "why won't this play" failure — could not be tested on a machine with no FFmpeg.
 
 ```json
 {

@@ -186,7 +186,7 @@ check('reconciliation summarises what it kept',
 // ---- 2. Configuration is reported ------------------------------------------
 console.log('\n--- Configuration ---');
 check('the boot banner reports segment length and concurrency',
-  /HLS Transcode:\s+4s segments · max 2 concurrent/.test(log),
+  /HLS Transcode:.*4s segments · max 2 concurrent/.test(log),
   (log.match(/HLS Transcode[^\n]*/g) || []).join(' | '));
 check('the boot banner reports the source retention policy',
   /source policy: retain/.test(log),

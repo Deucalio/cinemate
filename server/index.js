@@ -69,6 +69,9 @@ const HLS_SEGMENT_SECONDS = parseInt(process.env.HLS_SEGMENT_SECONDS || '4', 10)
 const HLS_MAX_CONCURRENT = parseInt(
   process.env.HLS_MAX_CONCURRENT || String(Math.max(1, os.cpus().length - 2)), 10);
 const HLS_MANIFEST_VERSION = 1;
+// Off until the client can consume a playlist (Phase 5' §6.4). With it off, non-native releases
+// keep taking the live remux path.
+const HLS_ENABLED = process.env.HLS_ENABLED === '1';
 
 // Where LRU state survives restarts. Without this, every deploy resets the eviction order and a
 // rewatch after a restart re-downloads a file that is still sitting on disk.
@@ -113,10 +116,73 @@ const FFPROBE_BIN = process.env.FFPROBE_BIN || 'ffprobe';
 // Realtime HEVC->H.264 encoding does not keep up on a small VPS, so it is opt-in.
 const ALLOW_VIDEO_TRANSCODE = process.env.ALLOW_VIDEO_TRANSCODE === '1';
 
-// What an HTML5 <video> element can actually decode without help
+// What an HTML5 <video> element can actually decode without help.
+//
+// Deliberately expressed as a policy with named rules rather than plain set membership, so
+// browser-matrix quirks have somewhere to live as they are discovered.
 const BROWSER_SAFE_VIDEO = new Set(['h264', 'vp8', 'vp9', 'av1']);
 const BROWSER_SAFE_AUDIO = new Set(['aac', 'mp3', 'opus', 'vorbis']);
 const BROWSER_SAFE_CONTAINERS = new Set(['.mp4', '.m4v', '.webm']);
+
+// codec_name alone is NOT sufficient for h264. A High 10 / 4:2:2 / 4:4:4 release probes as "h264"
+// and no browser can decode it — declaring it direct would reproduce the original bug exactly.
+const H264_SAFE_PROFILES = new Set(['baseline', 'constrained baseline', 'main', 'high']);
+const BROWSER_SAFE_PIX_FMTS = new Set(['yuv420p', 'yuvj420p']);
+
+/**
+ * Assesses whether a browser can play this file as-is, and says why not when it cannot.
+ * Returns { playable, container, video, audio } with a `reason` on each failing part.
+ */
+function assessBrowserPlayability(summary, ext) {
+  const container = BROWSER_SAFE_CONTAINERS.has(ext)
+    ? { ok: true }
+    : { ok: false, reason: `container ${ext || 'unknown'}` };
+
+  if (!summary) {
+    // No probe: the extension is all we have. Trusting it is a guess, but a conservative one —
+    // a non-native container still routes away from direct.
+    return {
+      playable: container.ok,
+      container,
+      video: { ok: true, assumed: true },
+      audio: { ok: true, assumed: true },
+      probed: false
+    };
+  }
+
+  let video = { ok: true };
+  if (summary.videoCodec !== null) {
+    if (!BROWSER_SAFE_VIDEO.has(summary.videoCodec)) {
+      video = { ok: false, reason: `video ${summary.videoCodec}` };
+    } else if (summary.videoCodec === 'h264') {
+      const profile = String(summary.videoProfile || '').toLowerCase();
+      const pixFmt = String(summary.pixFmt || '').toLowerCase();
+      if (profile && !H264_SAFE_PROFILES.has(profile)) {
+        video = { ok: false, reason: `H.264 ${summary.videoProfile} profile` };
+      } else if (pixFmt && !BROWSER_SAFE_PIX_FMTS.has(pixFmt)) {
+        // 10-bit and 4:2:2 are the common traps here.
+        video = { ok: false, reason: `pixel format ${summary.pixFmt}` };
+      }
+    }
+  }
+
+  let audio = { ok: true };
+  if (summary.audioCodec !== null) {
+    if (!BROWSER_SAFE_AUDIO.has(summary.audioCodec)) {
+      audio = { ok: false, reason: `audio ${summary.audioCodec}` };
+    } else if (summary.audioChannels > 2) {
+      audio = { ok: false, reason: `audio ${summary.audioCodec} ${summary.audioChannels}ch` };
+    }
+  }
+
+  return {
+    playable: container.ok && video.ok && audio.ok,
+    container,
+    video,
+    audio,
+    probed: true
+  };
+}
 
 // Top Tier High-Speed BitTorrent Trackers (Auto-injected into bare magnets)
 const DEFAULT_TRACKERS = [
@@ -1111,36 +1177,31 @@ function summarizeProbe(probe) {
  * an HTML5 <video>. Otherwise FFmpeg remuxes into progressive fragmented MP4.
  */
 function decideStreamMode(summary, ext) {
-  const containerOk = BROWSER_SAFE_CONTAINERS.has(ext);
+  const assessment = assessBrowserPlayability(summary, ext);
 
-  if (!summary) {
+  if (assessment.playable) {
     return {
-      mode: containerOk ? 'direct' : 'remux',
-      reason: 'ffprobe unavailable — falling back on container extension',
+      mode: 'direct',
+      reason: assessment.probed ? 'browser-native container and codecs'
+                                : 'ffprobe unavailable — falling back on container extension',
       copyVideo: true,
-      copyAudio: false
+      copyAudio: true,
+      assessment
     };
   }
 
-  const videoOk = summary.videoCodec === null || BROWSER_SAFE_VIDEO.has(summary.videoCodec);
-  const audioOk = summary.audioCodec === null || BROWSER_SAFE_AUDIO.has(summary.audioCodec);
-  const audioChannelsOk = summary.audioChannels <= 2;
-
-  if (containerOk && videoOk && audioOk && audioChannelsOk) {
-    return { mode: 'direct', reason: 'browser-native container and codecs', copyVideo: true, copyAudio: true };
-  }
-
   const reasons = [];
-  if (!containerOk) reasons.push(`container ${ext || 'unknown'}`);
-  if (!videoOk) reasons.push(`video ${summary.videoCodec}`);
-  if (!audioOk) reasons.push(`audio ${summary.audioCodec}`);
-  else if (!audioChannelsOk) reasons.push(`audio ${summary.audioCodec} ${summary.audioChannels}ch`);
+  if (!assessment.container.ok) reasons.push(assessment.container.reason);
+  if (!assessment.video.ok) reasons.push(assessment.video.reason);
+  if (!assessment.audio.ok) reasons.push(assessment.audio.reason);
 
   return {
-    mode: 'remux',
-    reason: reasons.join(', '),
-    copyVideo: videoOk,
-    copyAudio: audioOk && audioChannelsOk
+    // HLS supersedes live remux: one transcode per title instead of one per viewer per seek.
+    mode: HLS_ENABLED ? 'hls' : 'remux',
+    reason: reasons.join(', ') || 'not browser-native',
+    copyVideo: assessment.video.ok,
+    copyAudio: assessment.audio.ok,
+    assessment
   };
 }
 
@@ -1643,6 +1704,45 @@ function startHlsJob({ hash, name, sourcePath, sourceStat, summary, inputUrl, co
   return { joined: false, state: 'running' };
 }
 
+/**
+ * Makes sure a usable HLS representation exists (or is being produced) for a title, and reports
+ * where it has got to. Idempotent — safe to call on every prepare.
+ */
+function ensureHlsRepresentation({ hash, name, sourcePath, summary, token, copyVideo, copyAudio }) {
+  const key = String(hash || '').toLowerCase();
+  const dir = representationDir('hls', key);
+
+  // A completed representation is used as-is; nothing is re-derived.
+  if (fs.existsSync(dir) && !hlsJobs.has(key)) {
+    let liveSource = null;
+    try {
+      const st = fs.statSync(sourcePath);
+      liveSource = { path: sourcePath, sizeBytes: st.size, mtimeMs: Math.round(st.mtimeMs) };
+    } catch {}
+
+    const verdict = validateHlsDirectory(dir, liveSource);
+    if (verdict.state === 'complete') {
+      return hlsStatus(key, summary ? summary.durationSec : 0);
+    }
+    // Anything else is rebuilt — startHlsJob clears the directory first.
+    console.log(`[HLS] Rebuilding ${key}: ${verdict.reason}`);
+  }
+
+  let sourceStat = null;
+  try { sourceStat = fs.statSync(sourcePath); } catch {}
+
+  const started = startHlsJob({
+    hash: key, name, sourcePath, sourceStat, summary,
+    inputUrl: internalUrlFor(token), copyVideo, copyAudio
+  });
+
+  const status = hlsStatus(key, summary ? summary.durationSec : 0);
+  if (started.state === 'queued') {
+    return { ...status, state: 'queued', error: started.reason };
+  }
+  return status;
+}
+
 function stopHlsJob(hash, reason) {
   const key = String(hash || '').toLowerCase();
   const job = hlsJobs.get(key);
@@ -1970,7 +2070,26 @@ function internalUrlFor(token) {
 /**
  * ffprobe the file once per torrent/file and cache it. Concurrent callers share one probe.
  */
+const PROBE_OVERRIDE_PATH = process.env.PROBE_OVERRIDE_PATH || null;
+
+/**
+ * Test seam: probe results supplied from a JSON file keyed by media basename, so the codec policy
+ * can be exercised without ffprobe present. Never consulted unless the env var is set.
+ */
+function probeOverrideFor(filePath) {
+  if (!PROBE_OVERRIDE_PATH) return null;
+  try {
+    const table = JSON.parse(fs.readFileSync(PROBE_OVERRIDE_PATH, 'utf8'));
+    return table[path.basename(filePath)] || null;
+  } catch {
+    return null;
+  }
+}
+
 async function getProbeSummary(hash, filePath, token) {
+  const override = probeOverrideFor(filePath);
+  if (override) return summarizeProbe(override);
+
   const key = `${hash}:${filePath}`;
   const cached = probeCache.get(key);
   if (cached && cached.inflight) return cached.inflight;
@@ -2321,6 +2440,61 @@ app.get('/internal/piece-file', (req, res) => {
     fileSize: desc.fileSize,
     contentType: 'application/octet-stream'
   });
+});
+
+// ----------------- HLS PLAYLIST & SEGMENTS -----------------
+//
+// Both routes are static file reads. Every segment named in a playlist is already complete on disk
+// (FFmpeg writes .tmp then renames), so nothing here can serve a partial file — which is the whole
+// reason this delivery path is simpler than the one it replaces.
+
+const HLS_HASH_RE = /^[a-f0-9]{40}$/i;
+const HLS_SEGMENT_RE = /^seg\d{5}\.ts$/;
+
+/**
+ * Resolves a request into a file inside a representation directory, or null.
+ * Rejects anything that is not an exact expected filename, then confirms the resolved path really
+ * is inside the directory — belt and braces against traversal.
+ */
+function resolveHlsAsset(hash, filename) {
+  if (!HLS_HASH_RE.test(String(hash || ''))) return null;
+  if (filename !== 'playlist.m3u8' && !HLS_SEGMENT_RE.test(String(filename || ''))) return null;
+
+  const dir = representationDir('hls', hash);
+  const resolvedDir = path.resolve(dir);
+  const target = path.resolve(dir, filename);
+
+  if (target !== resolvedDir && !target.startsWith(resolvedDir + path.sep)) return null;
+  if (!fs.existsSync(target)) return null;
+
+  return target;
+}
+
+app.get('/api/stream/hls/:hash/playlist.m3u8', (req, res) => {
+  const target = resolveHlsAsset(req.params.hash, 'playlist.m3u8');
+  if (!target) return res.status(404).json({ error: 'No HLS playlist for this title' });
+
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.apple.mpegurl',
+    // The playlist grows while transcoding, so it must never be cached.
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*'
+  });
+  fs.createReadStream(target).pipe(res);
+});
+
+app.get('/api/stream/hls/:hash/:segment', (req, res) => {
+  const target = resolveHlsAsset(req.params.hash, req.params.segment);
+  if (!target) return res.status(404).json({ error: 'Unknown segment' });
+
+  res.writeHead(200, {
+    'Content-Type': 'video/mp2t',
+    // A segment never changes once written, so it is safe to cache hard. This is also what makes
+    // the CDN path in docs/scaling-roadmap.md work without further thought.
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'Access-Control-Allow-Origin': '*'
+  });
+  fs.createReadStream(target).pipe(res);
 });
 
 // ----------------- PRIMARY STREAMING ENDPOINT -----------------
@@ -2689,6 +2863,10 @@ app.get('/api/stream/status', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN
       etaSeconds = torrentInfo.eta;
     }
 
+    // A title can be downloading, transcoding, or both. The client's progress HUD covers all of it
+    // from this one payload — no new UI for the transcode phase.
+    const hls = hlsStatus(torrentInfo.hash);
+
     res.json({
       ok: true,
       state: torrentInfo.state || 'unknown',
@@ -2700,7 +2878,16 @@ app.get('/api/stream/status', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN
       seeds: torrentInfo.num_seeds || 0,
       peers: torrentInfo.num_leechs || 0,
       totalBytes: torrentInfo.total_size || torrentInfo.size || 0,
-      name: torrentInfo.name || ''
+      name: torrentInfo.name || '',
+      transcode: hls.state === 'absent' ? null : {
+        state: hls.state,
+        segmentsReady: hls.segmentsReady,
+        transcodedDurationSec: hls.transcodedDurationSec,
+        durationSec: hls.durationSec,
+        progress: hls.transcodeProgress,
+        progressPercent: Math.round(hls.transcodeProgress * 1000) / 10,
+        error: hls.error
+      }
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -2762,13 +2949,74 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
     const decision = decideStreamMode(summary, ext);
 
     if (!decision.copyVideo && !ALLOW_VIDEO_TRANSCODE) {
+      // The video stream cannot be COPIED into anything a browser will play, so neither remuxing
+      // nor HLS helps — only a full re-encode would, and that is opt-in.
       return res.status(415).json({
         ok: false,
         code: 'UNSUPPORTED_VIDEO_CODEC',
         videoCodec: summary ? summary.videoCodec : null,
+        videoProfile: summary ? summary.videoProfile : null,
+        pixFmt: summary ? summary.pixFmt : null,
+        reason: decision.assessment ? decision.assessment.video.reason : decision.reason,
         error:
-          `This release is encoded with ${summary ? summary.videoCodec : 'an unsupported codec'}, which ` +
-          `browsers cannot decode. Choose an H.264 / x264 release instead.`
+          `This release cannot be played in a browser (${decision.reason}). ` +
+          `Re-encoding would be required, which is disabled — choose an 8-bit H.264 / x264 release, ` +
+          `or start the bridge with ALLOW_VIDEO_TRANSCODE=1.`
+      });
+    }
+
+    if (decision.mode === 'hls') {
+      if (!toolchain.ffmpeg) {
+        return res.status(503).json({
+          ok: false,
+          code: 'FFMPEG_MISSING',
+          error:
+            `This release needs transcoding (${decision.reason}) but FFmpeg is not installed on ` +
+            `the bridge. Run "sudo apt install -y ffmpeg", or pick an MP4 / H.264 / AAC release.`
+        });
+      }
+
+      const hls = ensureHlsRepresentation({
+        hash: prep.matchedHash,
+        name: prep.torrentName,
+        sourcePath: prep.targetFilePath,
+        summary,
+        token: prep.token,
+        copyVideo: decision.copyVideo,
+        copyAudio: decision.copyAudio
+      });
+
+      const durationSec = (summary && summary.durationSec) || hls.durationSec || 0;
+
+      return res.json({
+        ok: true,
+        mode: 'hls',
+        reason: decision.reason,
+        readyState: 'ready',
+        infoHash: prep.matchedHash,
+        torrentName: prep.torrentName,
+        fileName: path.basename(prep.mediaName),
+        fileSizeBytes: prep.fileSize,
+        durationSec: Math.round(durationSec),
+        playlistUrl: `/api/stream/hls/${prep.matchedHash}/playlist.m3u8`,
+        transcode: {
+          state: hls.state,
+          segmentsReady: hls.segmentsReady,
+          transcodedDurationSec: hls.transcodedDurationSec,
+          progress: hls.transcodeProgress,
+          error: hls.error
+        },
+        // Seeking is instant inside the transcoded range and waits beyond it — the client draws the
+        // boundary from transcodedDurationSec. See docs/phase5-hls-plan.md §4.9.
+        seekable: true,
+        seekableUntilSec: hls.transcodedDurationSec,
+        video: { codec: summary ? summary.videoCodec : null, profile: summary ? summary.videoProfile : null },
+        audio: {
+          codec: summary ? summary.audioCodec : null,
+          channels: summary ? summary.audioChannels : 0,
+          willTranscode: !decision.copyAudio
+        },
+        probed: Boolean(summary)
       });
     }
 
@@ -3107,10 +3355,20 @@ function checkBinary(bin) {
   });
 }
 
+// Test seam, in the same spirit as DISK_USAGE_OVERRIDE_PCT and PROBE_OVERRIDE_PATH: report these
+// binaries as present without probing for them, so paths that merely REQUIRE FFmpeg can be tested
+// on a machine that has none. Never consulted unless set.
+const TOOLCHAIN_OVERRIDE = (process.env.TOOLCHAIN_OVERRIDE || '')
+  .split(',').map(x => x.trim()).filter(Boolean);
+
 async function verifyToolchain() {
-  toolchain.ffmpeg = await checkBinary(FFMPEG_BIN);
-  toolchain.ffprobe = await checkBinary(FFPROBE_BIN);
+  toolchain.ffmpeg = TOOLCHAIN_OVERRIDE.includes('ffmpeg') || await checkBinary(FFMPEG_BIN);
+  toolchain.ffprobe = TOOLCHAIN_OVERRIDE.includes('ffprobe') || await checkBinary(FFPROBE_BIN);
   toolchain.checked = true;
+
+  if (TOOLCHAIN_OVERRIDE.length) {
+    console.warn(`[Toolchain] OVERRIDE active for: ${TOOLCHAIN_OVERRIDE.join(', ')} — test seam`);
+  }
 
   if (!toolchain.ffmpeg || !toolchain.ffprobe) {
     console.warn(
@@ -3159,6 +3417,13 @@ app.get('/health', async (req, res) => {
       ffmpeg: toolchain.ffmpeg,
       ffprobe: toolchain.ffprobe,
       videoTranscodeEnabled: ALLOW_VIDEO_TRANSCODE
+    },
+    hls: {
+      enabled: HLS_ENABLED,
+      segmentSeconds: HLS_SEGMENT_SECONDS,
+      maxConcurrent: HLS_MAX_CONCURRENT,
+      activeJobs: hlsJobs.size,
+      sourcePolicy: HLS_SOURCE_POLICY
     },
     hostTelemetry: {
       loadAverage: os.loadavg(),
@@ -3434,7 +3699,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📦 Delivery Mode:      ${REQUIRE_COMPLETE ? 'cache-first (wait for full download)' : 'progressive piece-aware'}`);
   console.log(`♻️ Eviction:           LRU by last playback · evict >${DISK_AGGRESSIVE_PCT}% down to ${DISK_TARGET_PCT}% · halt >${DISK_EMERGENCY_PCT}%`);
   console.log(`🎞️ Representations:    ${HLS_DIR} · source policy: ${HLS_SOURCE_POLICY}`);
-  console.log(`⚙️ HLS Transcode:      ${HLS_SEGMENT_SECONDS}s segments · max ${HLS_MAX_CONCURRENT} concurrent`);
+  console.log(`⚙️ HLS Transcode:      ${HLS_ENABLED ? 'ENABLED' : 'disabled (set HLS_ENABLED=1)'} · ${HLS_SEGMENT_SECONDS}s segments · max ${HLS_MAX_CONCURRENT} concurrent`);
   console.log(`🩺 Health check:       http://localhost:${PORT}/health`);
   console.log(`====================================================`);
 });
