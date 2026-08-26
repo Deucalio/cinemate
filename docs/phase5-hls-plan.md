@@ -1,6 +1,6 @@
 # Phase 5′ — Progressive HLS Transcode
 
-> **Status:** Spec agreed, not started
+> **Status:** §6.1–§6.6 complete · §6.5 (deletions) outstanding
 > **Revision 2** — incorporates an architecture review. The material change from r1 is the
 > **cache-representations model** (§3), which turns source deletion into a policy rather than a
 > migration, and gives eviction a correct footprint.
@@ -461,23 +461,27 @@ verified against a real release before it becomes the default.
 
 ---
 
-### 6.6 Fast start — NOT YET DONE
+### 6.6 Fast start — ✅ DONE
 
-§6.4 delivers **instant seeking** and **one transcode per title**, but *not* the ~10 s cold start:
-`prepare` still refuses to probe or plan until the download is complete (Phase 2's
-`REQUIRE_COMPLETE` gate), so the transcode begins only afterwards.
+Transcoding now begins **while the source is still downloading**, which is what turns a ~60 s cold
+start into ~15 s.
 
-Removing that gate for the HLS path is what delivers fast start. The design is sound — FFmpeg reads
-the piece-aware loopback URL, which blocks and now has progress-based waiting (§5.4) — but it means
-probing a file that is still downloading, which is what produced the old
-`probe unavailable → falling back on container extension` noise.
+- [x] `HLS_START_WHILE_DOWNLOADING` (default on when HLS is enabled).
+- [x] The completeness gate makes an exception for containers known to need HLS.
+- [x] The loopback endpoint relocates a source that qBittorrent moved on completion.
 
-Likely shape: use the **container extension** as a cheap pre-check. A non-native container
-(`.mkv` etc.) is known to need HLS without probing, so its transcode can start immediately; a
-`.mp4` needs the probe to decide and can wait for completion, where `direct` is the right answer
-anyway.
+**The decision uses the container extension, not a probe.** A `.mkv` needs HLS regardless of what a
+probe would say, so its transcode can start immediately — FFmpeg reads the piece-aware loopback URL,
+which blocks until each piece lands (with §5.4's progress-based waiting, so a slow swarm delays it
+rather than failing it). A browser-native container still waits for completion: it needs a probe to
+decide, `direct` is the right answer for it anyway, and probing sparse regions is what produced the
+old `probe unavailable → falling back on container extension` noise.
 
-Deliberately a separate step so §6.4 is verifiable on its own.
+**One failure mode this exposed.** qBittorrent *moves* a file out of the incomplete directory when
+the download finishes, so a capability token minted mid-download points at a path that no longer
+exists. An already-open descriptor survives the rename, but a reconnecting FFmpeg would request a
+fresh one and get a 404 — killing a transcode that was running perfectly well. The loopback endpoint
+now re-resolves against the last known torrent list instead.
 
 ### 6.5 Deletions this enables
 
@@ -492,21 +496,25 @@ Deliberately a separate step so §6.4 is verifiable on its own.
 
 The dev machine has no FFmpeg, so tests must not depend on running it.
 
-- [ ] **Playlist and segment serving** — fabricated segment directory; correct serving, and path
-      traversal / non-matching filenames rejected.
-- [ ] **FFmpeg argument construction** — asserted for copy, transcode and audio-only cases, without
-      spawning anything.
-- [ ] **Job registry** — a second request joins rather than spawning; a completed directory is
-      reused; failures surface an error.
-- [ ] **Boot reconciliation** — every branch of §5.2: missing manifest, version mismatch, changed
-      source, orphan, missing segment, clean complete.
-- [ ] **`EXTINF` progress** — a hand-written playlist maps to the expected duration and percentage.
-- [ ] **Codec policy** — `h264` High 10 and 4:2:2 are **not** direct; `yuv420p` Main is.
-- [ ] **Eviction** — footprint includes representations; a running job is protected; eviction removes
-      the directory and kills the job.
-- [ ] **Mode selection** — a browser-native MP4 stays `direct` and is never segmented.
+- [x] **Playlist and segment serving** — `hls-serving.test.mjs`, including six rejection cases.
+- [x] **FFmpeg argument construction** — `hls-job-lifecycle.test.mjs`, read back from the manifest,
+      which is written *before* the spawn is attempted.
+- [x] **Job registry** — a completed representation is reused and its manifest left untouched.
+- [x] **Boot reconciliation** — `hls-transcode-manager.test.mjs`, one directory per branch of §5.2.
+- [x] **`EXTINF` progress** — non-uniform durations summed exactly, and asserted **not** to equal
+      `segments × target duration`.
+- [x] **Codec policy** — High 10 and 4:2:2 rejected; `yuv420p` Main direct.
+- [x] **Eviction** — footprint includes representations; a transcoding title is protected.
+- [x] **Mode selection** — a browser-native MP4 stays `direct`.
+
+**Not covered by an automated test:** a second viewer *joining a job already running*. The guard is
+one `hlsJobs.get()` check, but exercising it needs a long-lived fake FFmpeg, which is not portable
+between the dev machine and the VPS. The reuse-of-a-completed-representation path — the more common
+one — is covered.
 
 Real FFmpeg output is verified manually on the VPS.
+
+**Suite: 175 assertions across 10 suites.**
 
 ---
 

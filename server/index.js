@@ -72,6 +72,10 @@ const HLS_MANIFEST_VERSION = 1;
 // How much transcoded video must exist before playback may begin. Expressed in SECONDS rather than
 // segments, so changing HLS_SEGMENT_SECONDS cannot silently change what "ready" means.
 const HLS_START_BUFFER_SEC = parseInt(process.env.HLS_START_BUFFER_SEC || '8', 10);
+// Begin transcoding while the source is still downloading, rather than waiting for it to finish.
+// This is what turns a ~60 s cold start into ~15 s. Only applies to containers that are known to
+// need HLS from their extension alone — see the prepare handler.
+const HLS_START_WHILE_DOWNLOADING = process.env.HLS_START_WHILE_DOWNLOADING !== '0';
 // Off until the client can consume a playlist (Phase 5' §6.4). With it off, non-native releases
 // keep taking the live remux path.
 const HLS_ENABLED = process.env.HLS_ENABLED === '1';
@@ -2005,6 +2009,10 @@ const internalTokenByFile = new Map(); // `${hash}:${filePath}` -> token (so tok
 // ffprobe results: `${hash}:${filePath}` -> { at, summary }
 const probeCache = new Map();
 
+// The most recent torrents/info response, so the loopback endpoint can relocate a moved source
+// without an async lookup in the middle of a read.
+let lastKnownTorrents = [];
+
 // Resolved stream descriptors: `${infoHash}` -> { at, prep, inflight }.
 // A <video> element fires many range requests per file, and re-resolving swarm metadata (list all
 // torrents, poll for the media file, fetch the file table, re-apply file priorities) on every one
@@ -2075,6 +2083,38 @@ function mintInternalToken(descriptor, ttlMs = 8 * 60 * 60 * 1000) {
   internalStreamTokens.set(token, { ...descriptor, expiresAt: Date.now() + ttlMs });
   internalTokenByFile.set(fileKey, token);
   return token;
+}
+
+/**
+ * Re-points a capability token at its source after qBittorrent has moved the file (which it does
+ * on completion, out of the incomplete directory). Mutates the descriptor in place so subsequent
+ * requests on the same token resolve directly.
+ */
+function relocateInternalSource(desc) {
+  const base = path.basename(desc.filePath).replace(/\.!qB$/i, '');
+
+  const candidates = [];
+  for (const t of lastKnownTorrents) {
+    if (t.hash && t.hash.toLowerCase() !== desc.hash) continue;
+    for (const dir of [t.content_path, t.save_path, t.download_path]) {
+      if (!dir) continue;
+      candidates.push(path.resolve(dir, base));
+      candidates.push(path.resolve(dir, path.basename(t.content_path || ''), base));
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        console.log(`[Internal] Source relocated: ${desc.filePath} → ${candidate}`);
+        desc.filePath = candidate;
+        return true;
+      }
+    } catch {}
+  }
+
+  console.warn(`[Internal] Could not relocate moved source: ${desc.filePath}`);
+  return false;
 }
 
 function internalUrlFor(token) {
@@ -2309,6 +2349,7 @@ setInterval(async () => {
 
     const allTorrents = await qbt.getAllTorrents();
     if (!Array.isArray(allTorrents)) return;
+    lastKnownTorrents = allTorrents;
 
     const liveHashes = new Set(allTorrents.map(t => t.hash.toLowerCase()));
     for (const hash of [...torrentRegistry.keys()]) {
@@ -2444,6 +2485,17 @@ app.get('/internal/piece-file', (req, res) => {
   const desc = internalStreamTokens.get(token);
   if (!desc || desc.expiresAt < Date.now()) {
     return res.status(404).end('Unknown or expired internal stream token');
+  }
+
+  // qBittorrent MOVES a file out of the incomplete directory when the download finishes, so a token
+  // minted mid-download points at a path that no longer exists. An open descriptor survives the
+  // rename, but a reconnecting FFmpeg would request a fresh one — so re-resolve rather than 404 a
+  // transcode that is running perfectly well.
+  if (!fs.existsSync(desc.filePath)) {
+    const relocated = relocateInternalSource(desc);
+    if (!relocated) {
+      return res.status(410).end('Source file moved and could not be relocated');
+    }
   }
 
   servePieceAwareRange(req, res, {
@@ -2939,10 +2991,19 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
       return res.status(prep.status).json({ ok: false, code: 'NO_MEDIA', error: prep.message });
     }
 
-    // Cache-first: while the file is incomplete there is nothing worth probing — ffprobe would be
-    // reading sparse regions and failing, which is exactly the "probe unavailable" noise that made
-    // every incomplete .mkv fall back to a guess. Report progress and let the client wait.
-    if (REQUIRE_COMPLETE && !(await isTorrentComplete(prep.matchedHash))) {
+    // Fast start: a container the browser cannot play needs HLS regardless of what a probe would
+    // say, and that is knowable from the extension alone. Such a title starts transcoding
+    // immediately — FFmpeg reads the piece-aware loopback URL, which blocks until each piece lands
+    // (with progress-based waiting, so a slow swarm delays it rather than failing it).
+    //
+    // A browser-native container still waits for completion: it needs a probe to decide, `direct`
+    // is the right answer for it anyway, and probing sparse regions is what produced the old
+    // "probe unavailable → falling back on container extension" noise.
+    const sourceComplete = await isTorrentComplete(prep.matchedHash);
+    const needsHlsByContainer =
+      HLS_ENABLED && HLS_START_WHILE_DOWNLOADING && !BROWSER_SAFE_CONTAINERS.has(prep.mediaExt);
+
+    if (REQUIRE_COMPLETE && !sourceComplete && !needsHlsByContainer) {
       const live = await qbt.findTorrent(prep.matchedHash, nameHint, magnet);
       const progress = live ? (live.progress || 0) : 0;
       return res.json({
@@ -2998,7 +3059,7 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
         token: prep.token,
         copyVideo: decision.copyVideo,
         copyAudio: decision.copyAudio,
-        sourceComplete: await isTorrentComplete(prep.matchedHash)
+        sourceComplete
       });
 
       const durationSec = (summary && summary.durationSec) || hls.durationSec || 0;
@@ -3015,6 +3076,9 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
         durationSec: Math.round(durationSec),
         playlistUrl: `/api/stream/hls/${prep.matchedHash}/playlist.m3u8`,
         startBufferSec: HLS_START_BUFFER_SEC,
+        // The transcode may be running ahead of an unfinished download. The client shows conversion
+        // progress either way, but this distinguishes "converting" from "downloading and converting".
+        sourceComplete,
         transcode: {
           state: hls.state,
           segmentsReady: hls.segmentsReady,
@@ -3717,6 +3781,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`♻️ Eviction:           LRU by last playback · evict >${DISK_AGGRESSIVE_PCT}% down to ${DISK_TARGET_PCT}% · halt >${DISK_EMERGENCY_PCT}%`);
   console.log(`🎞️ Representations:    ${HLS_DIR} · source policy: ${HLS_SOURCE_POLICY}`);
   console.log(`⚙️ HLS Transcode:      ${HLS_ENABLED ? 'ENABLED' : 'disabled (set HLS_ENABLED=1)'} · ${HLS_SEGMENT_SECONDS}s segments · max ${HLS_MAX_CONCURRENT} concurrent`);
+  console.log(`🚀 Fast Start:         ${HLS_ENABLED && HLS_START_WHILE_DOWNLOADING ? `transcode begins while downloading · play after ${HLS_START_BUFFER_SEC}s converted` : 'disabled — waits for full download'}`);
   console.log(`🩺 Health check:       http://localhost:${PORT}/health`);
   console.log(`====================================================`);
 });

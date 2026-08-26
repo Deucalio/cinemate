@@ -28,6 +28,7 @@ export class PlayerModalManager {
     this._pendingLoad = null;   // { generation, startSec } while waiting for the download
     this._hls = null;           // hls.js instance, when playing a segmented representation
     this._transcodedDurationSec = 0;
+    this._transcodeComplete = false;
     this._hlsStartBufferSec = 8;
     this._seekWaitingForSec = null;  // a seek accepted beyond the transcode head
   }
@@ -454,14 +455,21 @@ export class PlayerModalManager {
       this._startStatusPolling();
     });
 
-    video.addEventListener('playing', () => {
+    // Polling may only stop when nothing it reports can still change.
+    //
+    // In HLS mode the transcode continues in the background and the seek boundary moves with it, so
+    // stopping here froze _transcodedDurationSec at whatever it happened to be when playback began.
+    // A later seek then compared against a stale boundary, decided the target was already
+    // transcoded, and seeked into segments that did not exist — surfacing as
+    // MEDIA_ERR_SRC_NOT_SUPPORTED.
+    const stopPollingIfSettled = () => {
       this._hideBufferingHUD();
+      if (this.currentStreamMode === 'hls' && !this._transcodeComplete) return;
       this._stopStatusPolling();
-    });
-    video.addEventListener('canplay', () => {
-      this._hideBufferingHUD();
-      this._stopStatusPolling();
-    });
+    };
+
+    video.addEventListener('playing', stopPollingIfSettled);
+    video.addEventListener('canplay', stopPollingIfSettled);
     video.addEventListener('progress', () => {
       this._updateBufferedRange();
       this._updateTranscodedRange();
@@ -702,6 +710,7 @@ export class PlayerModalManager {
     this._remuxAttempted = false;
     this._pendingLoad = null;
     this._transcodedDurationSec = 0;
+    this._transcodeComplete = false;
     this._seekWaitingForSec = null;
     this._hlsPlaylistUrl = null;
     this._destroyHls();
@@ -960,6 +969,11 @@ export class PlayerModalManager {
    * FFmpeg remuxer. Anything else is reported instead of retried in a loop.
    */
   _handleVideoError() {
+    // While hls.js is attached it owns error handling: the element's own error event is a
+    // downstream symptom of something _handleHlsError has already seen and may be recovering from.
+    // Reporting both meant a recoverable segment fetch surfaced as "Stream Unavailable".
+    if (this._hls) return;
+
     const mediaError = this.videoElement ? this.videoElement.error : null;
     const code = mediaError ? mediaError.code : 0;
     const label = {
@@ -1062,7 +1076,11 @@ export class PlayerModalManager {
 
       if (status.transcode) {
         this._transcodedDurationSec = status.transcode.transcodedDurationSec || 0;
+        this._transcodeComplete = status.transcode.state === 'complete';
         this._updateTranscodedRange();
+
+        // Nothing further will change once conversion is done.
+        if (this._transcodeComplete && !this.videoElement?.paused) this._stopStatusPolling();
       }
 
       const pending = this._pendingLoad;
@@ -1316,9 +1334,11 @@ export class PlayerModalManager {
       // covers it. Beyond the head the segment does not exist yet, so the seek is ACCEPTED and
       // deferred rather than refused: the scrubber should not lie about where you can go.
       const head = this._transcodedDurationSec;
-      const complete = head > 0 && head >= this._totalDuration() - 1;
+      const complete = this._transcodeComplete || (head > 0 && head >= this._totalDuration() - 1);
 
-      if (!complete && head > 0 && clamped > head) {
+      // head === 0 means the boundary is not known yet, which is NOT the same as "everything is
+      // available". Treating it as the latter is what caused seeks into non-existent segments.
+      if (!complete && clamped > head) {
         this._seekWaitingForSec = clamped;
         try { video.currentTime = Math.max(0, head - 1); } catch {}
         this._showBufferingHUD(
