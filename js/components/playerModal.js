@@ -1147,14 +1147,22 @@ export class PlayerModalManager {
 
     if (showTranscode) {
       const percent = typeof transcode.progressPercent === 'number' ? transcode.progressPercent : 0;
+      // A head-only probe may not have established the duration, in which case a percentage is
+      // meaningless. Showing "0.0% converted" next to "51m 33s ready to watch" reads as a fault
+      // rather than as a missing figure.
+      const knowsDuration = transcode.durationSec > 0;
 
       if (bar) {
-        bar.classList.remove('is-indeterminate');
-        bar.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+        bar.classList.toggle('is-indeterminate', !knowsDuration);
+        bar.style.width = knowsDuration ? `${Math.min(100, Math.max(0, percent))}%` : '';
       }
 
       if (stats) stats.style.display = 'flex';
-      if (progressEl) progressEl.innerHTML = `<strong>${percent.toFixed(1)}%</strong> converted`;
+      if (progressEl) {
+        progressEl.innerHTML = knowsDuration
+          ? `<strong>${percent.toFixed(1)}%</strong> converted`
+          : 'converting...';
+      }
       if (speedEl) {
         speedEl.innerHTML = transcode.transcodedDurationSec
           ? `<strong>${this._formatDuration(transcode.transcodedDurationSec)}</strong> ready to watch`

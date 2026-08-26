@@ -76,6 +76,9 @@ const HLS_START_BUFFER_SEC = parseInt(process.env.HLS_START_BUFFER_SEC || '8', 1
 // This is what turns a ~60 s cold start into ~15 s. Only applies to containers that are known to
 // need HLS from their extension alone — see the prepare handler.
 const HLS_START_WHILE_DOWNLOADING = process.env.HLS_START_WHILE_DOWNLOADING !== '0';
+// How much of a still-downloading file a quick probe may see. Enough for any container header,
+// small enough that sequential download has certainly delivered it.
+const HLS_PROBE_HEAD_BYTES = parseInt(process.env.HLS_PROBE_HEAD_BYTES || String(24 * 1024 * 1024), 10);
 // Off until the client can consume a playlist (Phase 5' §6.4). With it off, non-native releases
 // keep taking the live remux path.
 const HLS_ENABLED = process.env.HLS_ENABLED === '1';
@@ -1175,7 +1178,10 @@ function probeMedia(url, { timeoutMs = 30000, quick = false, label = '' } = {}) 
 }
 
 function summarizeProbe(probe) {
-  if (!probe || !Array.isArray(probe.streams)) return null;
+  // A truncated (head-only) probe reports codecs but often no duration. That is still everything
+  // the delivery decision needs, so it must not be treated as a failed probe — only the absence of
+  // any stream information is a failure.
+  if (!probe || !Array.isArray(probe.streams) || probe.streams.length === 0) return null;
 
   const video = probe.streams.find(st => st.codec_type === 'video' && st.disposition && st.disposition.attached_pic !== 1)
     || probe.streams.find(st => st.codec_type === 'video');
@@ -1710,9 +1716,17 @@ function startHlsJob({ hash, name, sourcePath, sourceStat, summary, inputUrl, so
     if (code === 0) {
       const current = readHlsManifest(dir) || manifest;
       current.hls.completedAt = new Date().toISOString();
-      try { writeHlsManifest(dir, current); } catch {}
 
       const done = parseHlsPlaylist(hlsPlaylistPath(dir));
+
+      // A head-only probe may not have known the duration. The finished playlist does — it is the
+      // sum of every EXTINF — so record it rather than leaving progress dividing by zero forever.
+      if (!current.media.durationSec && done.transcodedDurationSec > 0) {
+        current.media.durationSec = Math.round(done.transcodedDurationSec);
+        console.log(`[HLS] Duration for "${name}" resolved from the finished playlist: ${current.media.durationSec}s`);
+      }
+
+      try { writeHlsManifest(dir, current); } catch {}
       console.log(
         `[HLS] Completed "${name}" — ${done.segments.length} segments, ` +
         `${Math.round(done.transcodedDurationSec)}s, ` +
@@ -2134,8 +2148,9 @@ function relocateInternalSource(desc) {
   return false;
 }
 
-function internalUrlFor(token) {
-  return `${INTERNAL_BASE_URL}/internal/piece-file?token=${token}`;
+function internalUrlFor(token, { maxBytes = 0 } = {}) {
+  const base = `${INTERNAL_BASE_URL}/internal/piece-file?token=${token}`;
+  return maxBytes > 0 ? `${base}&maxBytes=${maxBytes}` : base;
 }
 
 /**
@@ -2166,7 +2181,13 @@ async function getProbeSummary(hash, filePath, token, quick = false) {
   if (cached && cached.inflight) return cached.inflight;
   if (cached) return cached.summary;
 
-  const inflight = probeMedia(internalUrlFor(token), { quick, timeoutMs: quick ? 12000 : 30000, label: path.basename(filePath) })
+  // A quick probe sees only the first 24 MB, which is comfortably past any container header and
+  // well within what sequential download has already delivered.
+  const probeUrl = quick
+    ? internalUrlFor(token, { maxBytes: HLS_PROBE_HEAD_BYTES })
+    : internalUrlFor(token);
+
+  const inflight = probeMedia(probeUrl, { quick, timeoutMs: quick ? 15000 : 30000, label: path.basename(filePath) })
     .then((probe) => {
       const summary = summarizeProbe(probe);
       probeCache.set(key, { at: Date.now(), summary, inflight: null });
@@ -2515,12 +2536,27 @@ app.get('/internal/piece-file', (req, res) => {
     }
   }
 
+  // `maxBytes` presents a TRUNCATED view of the file.
+  //
+  // This exists for probing a still-downloading source. Matroska keeps its Cues near the END, so
+  // ffprobe seeks there for duration — and at 60% downloaded those pieces do not exist, so the
+  // reader blocks and ffprobe is killed by its timeout. Measured: 12,012 ms and a failure against
+  // an incomplete file versus 100 ms against the same file complete.
+  //
+  // Capping the advertised length means ffprobe cannot seek past the head. It reads the container
+  // header, reports the codecs — which is all the delivery decision needs — and returns promptly.
+  // Duration may come back absent, which the caller handles.
+  const requestedMax = parseInt(req.query.maxBytes || '0', 10);
+  const effectiveSize = requestedMax > 0
+    ? Math.min(desc.fileSize, requestedMax)
+    : desc.fileSize;
+
   servePieceAwareRange(req, res, {
     filePath: desc.filePath,
     hash: desc.hash,
     pieceSize: desc.pieceSize,
     fileOffsetInTorrent: desc.fileOffsetInTorrent,
-    fileSize: desc.fileSize,
+    fileSize: effectiveSize,
     contentType: 'application/octet-stream'
   });
 });
