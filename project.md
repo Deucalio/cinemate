@@ -487,10 +487,11 @@ curl -s http://localhost:8899/health | python3 -m json.tool
 ### Test suite
 
 ```bash
-cd server && npm test        # 96 assertions across 6 suites
+cd server && npm test        # 185 assertions across 11 suites
 ```
 
-Every suite runs the **real bridge** against a mock qBittorrent — no swarm, no FFmpeg, no database.
+Every suite runs the **real bridge** against a mock qBittorrent — no swarm, no database. Most need
+no FFmpeg either; `probe-head-gate` deliberately requires a real one and skips without it.
 
 | Suite                           | Covers                                                                                                                                                                            |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -500,6 +501,11 @@ Every suite runs the **real bridge** against a mock qBittorrent — no swarm, no
 | `media-discovery.test.mjs`    | `.!qB` suffix, samples losing to the feature, `.mkv` never served direct, ISO-only torrents failing fast, refusing to guess a piece size                                      |
 | `gc-and-resume.test.mjs`      | Restart not wiping torrents; resuming stopped torrents; sequential mode forced on and never toggled twice                                                                         |
 | `lru-eviction.test.mjs`       | Eviction order, pinned survival, restart-restored history,`/api/cache`, the pin endpoint                                                                                        |
+| `cache-representations.test.mjs` | The `CacheEntry` model — source plus derived representations, and the footprint they sum to                                                                                |
+| `hls-transcode-manager.test.mjs` | Job admission, concurrency ceiling, manifest identity (path/size/mtime) and `ffmpegArgs`                                                                                   |
+| `hls-serving.test.mjs`      | Playlist and segment delivery, `EXTINF` progress, promotion to VOD on `#EXT-X-ENDLIST`                                                                                          |
+| `hls-job-lifecycle.test.mjs` | Boot reconciliation against the filesystem, resumption, and reuse of a finished representation                                                                                    |
+| `probe-head-gate.test.mjs`  | Probing a still-downloading source: the head-readiness gate, and that a failed probe is retried rather than latched (§9.7). **Uses real ffprobe**                                |
 
 Suites that exercise the **progressive** path set `REQUIRE_COMPLETE=0` explicitly, so they cannot
 pass for the wrong reason. Each uses its own `LRU_STATE_PATH`, since a shared default made them
@@ -598,10 +604,51 @@ is guesswork.
 | 38 | **qBittorrent's queueing parked torrents in `queuedDL`** and they downloaded nothing                                                                                                                                                                            | Disabled in the dedicated instance's config                                                                          |
 | 39 | **Credentials were hardcoded in client source** and committed to git history                                                                                                                                                                                      | Moved to`.env.local` via `import.meta.env`. **The exposed TMDB and Prowlarr keys should still be rotated** |
 
+### 9.7 Fast start never engaged — the probe was blocking on an undownloaded head
+
+Investigated as an integration problem, with a real MKV fixture and real ffprobe, before any code
+changed. The measurements are in the header comment of `server/test/probe-head-gate.test.mjs`.
+
+**What was assumed and turned out to be false.** The earlier fix (commit `87eda32`) reasoned that
+Matroska keeps its Cues near the end of the file, so ffprobe must seek there for `duration`, and
+capped the probe's view to the first 24 MB to prevent it. Neither half holds:
+
+- ffprobe issues **exactly one** request for a Matroska source — `Range: bytes=0-` — and reads
+  forward. Across 16 probes at cut points from 1 MB to the whole file it never once requested the
+  tail.
+- A plain 1 MB head probes **completely**, `duration` included, because Matroska stores Duration in
+  the Info element at the *start* of the segment. Truncation was never the problem.
+
+**What actually broke it.** The probe's demand is small and near enough bitrate-independent — 1.00 MB
+at 5.7 Mbps, 1.56 MB at 20.9 Mbps, unchanged by extra audio and subtitle tracks. What matters is
+whether those bytes are **verified**. Serving from a frontier below that hangs ffprobe, because
+`waitForPiece` resets its stall deadline whenever the torrent verifies *any* piece — so a perfectly
+healthy download blocks the read indefinitely and only ffprobe's own timeout ends it:
+
+| download frontier | result |
+| ------------------ | ------- |
+| 0 / 64 KB / 128 KB / 256 KB / 512 KB | **timed out**, no fields at all |
+| 1 MB / 2 MB / 4 MB | ok in ~90 ms, every field present |
+
+That is the production log verbatim: `ffprobe FAILED after 12012ms (quick)` at 04:23:21, seconds
+after the torrent was added and before a single piece had been verified.
+
+| #  | Root cause | Fix |
+| -- | ----------- | ---- |
+| 40 | **The quick probe was spawned without checking whether the head had downloaded**, so a `prepare` issued moments after a torrent was added burned the entire ffprobe timeout and returned nothing | Piece states are checked first (`PROBE_HEAD_READY_BYTES`, 4 MB — ~2.5× the worst measured demand). Below that the probe is deferred, not attempted. Measured: **15,069 ms → 34 ms** |
+| 41 | **`probeCache` had no TTL**, so that null latched under `hash:filePath`. Every later `prepare` reused the failure without re-probing, and the title reported `downloading` for the life of the process — *this is why nothing played until the download finished* | Successes are still cached indefinitely; failures expire after `PROBE_FAILURE_TTL_MS` (15 s), because “could not probe” is not a conclusion |
+| 42 | **A complete source was probed through the loopback piece-aware endpoint**, routing a local read back through piece gating and stalling whenever piece states were unavailable or stale | Read the file directly when the source is complete, exactly as the transcode input already does |
+| 43 | **`maxBytes` was documented with a rationale that does not hold.** It does nothing for Matroska | Kept, with its real justification: it bounds the one shape that *does* seek to the tail — an MP4 whose `moov` atom sits at the end — turning a full-timeout hang into a prompt failure. Verified: such a file requests the last ~90 KB and blocks at every frontier below complete |
+
+Regression coverage: `server/test/probe-head-gate.test.mjs` (10 assertions) drives the real bridge
+against a mock qBittorrent whose download frontier it moves between calls, and uses real ffprobe —
+mocking it would only assert our assumptions back at us. It fails against the pre-fix code with
+`FAILED after 15030ms` and no second probe at all.
+
 ### 9.6 Known limitations
 
-- **Cold start waits for the full download** (~60 s for 2–3 GB). Deliberate. A rewatch is instant.
-  [Phase 5′](docs/phase5-hls-plan.md) reduces this to ~10 s.
+- **Cold start waits for the first few MB to download**, then fast start begins transcoding while
+  the rest arrives (see §9.7). A rewatch is instant.
 - **Seeking in remux mode restarts FFmpeg**, costing seconds. Direct mode seeks natively.
   [Phase 5′](docs/phase5-hls-plan.md) removes this entirely.
 - **HEVC / x265 cannot play in a browser.** Real-time transcoding will not keep up on this VPS, so

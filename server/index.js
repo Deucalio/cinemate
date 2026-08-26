@@ -76,9 +76,21 @@ const HLS_START_BUFFER_SEC = parseInt(process.env.HLS_START_BUFFER_SEC || '8', 1
 // This is what turns a ~60 s cold start into ~15 s. Only applies to containers that are known to
 // need HLS from their extension alone — see the prepare handler.
 const HLS_START_WHILE_DOWNLOADING = process.env.HLS_START_WHILE_DOWNLOADING !== '0';
-// How much of a still-downloading file a quick probe may see. Enough for any container header,
-// small enough that sequential download has certainly delivered it.
+// How much of a still-downloading file a quick probe may see.
+//
+// Measured against real ffprobe: it makes ONE `Range: bytes=0-` request for a Matroska source and
+// reads forward, consuming 1.00 MB at 5.7 Mbps and 1.56 MB at 20.9 Mbps — extra audio and subtitle
+// tracks did not raise it. The cap therefore is not what makes a quick probe work; it exists only
+// to bound the one container shape that DOES seek to the tail (an MP4 whose moov atom sits at the
+// end), where it turns a full-timeout hang into a prompt failure.
 const HLS_PROBE_HEAD_BYTES = parseInt(process.env.HLS_PROBE_HEAD_BYTES || String(24 * 1024 * 1024), 10);
+// How much of the file must be VERIFIED before a quick probe is worth attempting. This is the
+// number that actually decides success: below what ffprobe consumes, the piece-aware reader blocks
+// mid-response and ffprobe hangs until its own timeout. 4 MB is ~2.5x the worst measured demand.
+const PROBE_HEAD_READY_BYTES = parseInt(process.env.PROBE_HEAD_READY_BYTES || String(4 * 1024 * 1024), 10);
+// A probe that could not run is retried rather than remembered forever, but not on every request:
+// an unprobeable source (moov-at-end MP4 mid-download) would otherwise cost a timeout each time.
+const PROBE_FAILURE_TTL_MS = parseInt(process.env.PROBE_FAILURE_TTL_MS || '15000', 10);
 // Off until the client can consume a playlist (Phase 5' §6.4). With it off, non-native releases
 // keep taking the live remux path.
 const HLS_ENABLED = process.env.HLS_ENABLED === '1';
@@ -2172,20 +2184,77 @@ function probeOverrideFor(filePath) {
   }
 }
 
-async function getProbeSummary(hash, filePath, token, quick = false) {
+/**
+ * Whether the first `bytes` of the file are actually downloaded.
+ *
+ * ffprobe reads a still-downloading source through the piece-aware reader, which waits for missing
+ * pieces rather than failing — and `waitForPiece` resets its stall deadline whenever the torrent
+ * verifies ANY piece, so a healthy download blocks the read indefinitely. Spawning a probe before
+ * the head has landed therefore cannot fail fast; it burns the full ffprobe timeout and returns
+ * nothing. Checking the piece states first costs one cached API call.
+ */
+async function headBytesVerified(desc, bytes) {
+  if (!desc || !desc.pieceSize) return false;
+
+  const firstPiece = Math.floor(desc.fileOffsetInTorrent / desc.pieceSize);
+  const lastByte = Math.min(desc.fileSize, bytes) - 1;
+  if (lastByte < 0) return false;
+  const lastPiece = Math.floor((desc.fileOffsetInTorrent + lastByte) / desc.pieceSize);
+
+  let states;
+  try {
+    states = await qbt.getPieceStates(desc.hash);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(states) || states.length === 0) return false;
+
+  for (let p = firstPiece; p <= lastPiece; p++) {
+    if (states[p] !== 2) return false;
+  }
+  return true;
+}
+
+async function getProbeSummary(hash, filePath, token, { quick = false, sourceComplete = false } = {}) {
   const override = probeOverrideFor(filePath);
   if (override) return summarizeProbe(override);
 
   const key = `${hash}:${filePath}`;
   const cached = probeCache.get(key);
   if (cached && cached.inflight) return cached.inflight;
-  if (cached) return cached.summary;
+  if (cached) {
+    // Successes are stable for a given file and kept. Failures are not conclusions — the head may
+    // simply not have arrived yet — so they expire, otherwise the first doomed probe latches the
+    // title into "wait for the full download" for the life of the process.
+    if (cached.summary) return cached.summary;
+    if (Date.now() - cached.at < PROBE_FAILURE_TTL_MS) return null;
+    probeCache.delete(key);
+  }
 
-  // A quick probe sees only the first 24 MB, which is comfortably past any container header and
-  // well within what sequential download has already delivered.
-  const probeUrl = quick
-    ? internalUrlFor(token, { maxBytes: HLS_PROBE_HEAD_BYTES })
-    : internalUrlFor(token);
+  // A quick probe runs against a source that is still downloading. Only attempt it once the bytes
+  // ffprobe will actually read are present; otherwise report "not yet" cheaply and let the caller
+  // ask again. This is the difference between a 15-second block and an immediate answer.
+  if (quick) {
+    const desc = internalStreamTokens.get(token);
+    if (!(await headBytesVerified(desc, PROBE_HEAD_READY_BYTES))) {
+      console.log(
+        `[Probe] Head of "${path.basename(filePath)}" not downloaded yet ` +
+        `(need first ${Math.round(PROBE_HEAD_READY_BYTES / (1024 * 1024))} MB verified) — deferring the probe.`
+      );
+      return null;
+    }
+  }
+
+  // A complete source is just a file. Probing it through the loopback endpoint sends a local read
+  // back through piece gating, which asks qBittorrent to confirm pieces it does not need to confirm
+  // — and on a torrent whose piece states are unavailable or stale, that stalls a probe that would
+  // otherwise take milliseconds. Read it directly, exactly as the transcode input does.
+  // The existsSync guard covers the window where qBittorrent has moved the file out of its
+  // incomplete directory and `filePath` is stale; the loopback endpoint can relocate, so defer to it.
+  const localSource = sourceComplete && fs.existsSync(filePath);
+  const probeUrl = localSource
+    ? filePath
+    : (quick ? internalUrlFor(token, { maxBytes: HLS_PROBE_HEAD_BYTES }) : internalUrlFor(token));
 
   const inflight = probeMedia(probeUrl, { quick, timeoutMs: quick ? 15000 : 30000, label: path.basename(filePath) })
     .then((probe) => {
@@ -2538,14 +2607,15 @@ app.get('/internal/piece-file', (req, res) => {
 
   // `maxBytes` presents a TRUNCATED view of the file.
   //
-  // This exists for probing a still-downloading source. Matroska keeps its Cues near the END, so
-  // ffprobe seeks there for duration — and at 60% downloaded those pieces do not exist, so the
-  // reader blocks and ffprobe is killed by its timeout. Measured: 12,012 ms and a failure against
-  // an incomplete file versus 100 ms against the same file complete.
+  // Its purpose is narrower than it looks. A Matroska probe never benefits from it: ffprobe issues
+  // a single `bytes=0-` and reads forward, so there is nothing past the head for a cap to prevent.
+  // What the cap does prevent is the MP4-with-moov-at-the-end case, where ffprobe genuinely does
+  // request the last ~90 KB of the file. Mid-download those pieces do not exist, the reader waits,
+  // and ffprobe hangs for its whole timeout. Advertising a shorter file makes that seek
+  // unsatisfiable, so it fails in milliseconds instead — the same outcome, reached promptly.
   //
-  // Capping the advertised length means ffprobe cannot seek past the head. It reads the container
-  // header, reports the codecs — which is all the delivery decision needs — and returns promptly.
-  // Duration may come back absent, which the caller handles.
+  // A cap cannot rescue a probe whose HEAD is missing; only waiting for those pieces does, which is
+  // what PROBE_HEAD_READY_BYTES gates on before ffprobe is spawned at all.
   const requestedMax = parseInt(req.query.maxBytes || '0', 10);
   const effectiveSize = requestedMax > 0
     ? Math.min(desc.fileSize, requestedMax)
@@ -3074,7 +3144,7 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
 
     const ext = prep.mediaExt;
     const summary = await getProbeSummary(
-      prep.matchedHash, prep.targetFilePath, prep.token, /* quick */ !sourceComplete
+      prep.matchedHash, prep.targetFilePath, prep.token, { quick: !sourceComplete, sourceComplete }
     );
 
     // Fast start must not proceed on guesses. Without a probe we do not know whether the video can
@@ -3088,9 +3158,12 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
     if (!summary && !sourceComplete && needsHlsByContainer) {
       const live = await qbt.findTorrent(prep.matchedHash, nameHint, magnet);
       const progress = live ? (live.progress || 0) : 0;
+      // Not a dead end: the probe is retried on the next prepare, and the usual reason for landing
+      // here is simply that the head has not downloaded yet. Saying "waiting for the full file"
+      // would misreport a few seconds of waiting as a decision to abandon fast start.
       console.warn(
-        `[Prepare] Could not probe "${prep.torrentName}" while downloading — waiting for the ` +
-        `full file rather than guessing its codecs.`
+        `[Prepare] No usable probe for "${prep.torrentName}" yet (${Math.round(progress * 1000) / 10}% ` +
+        `downloaded) — holding fast start rather than guessing its codecs; will retry.`
       );
       return res.json({
         ok: true,
@@ -3333,7 +3406,7 @@ app.get('/api/stream', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MIN, 60000
 
     // Decide how to deliver this specific file, from its LOGICAL extension.
     const ext = prep.mediaExt;
-    const summary = await getProbeSummary(matchedHash, targetFilePath, token);
+    const summary = await getProbeSummary(matchedHash, targetFilePath, token, { sourceComplete: isComplete });
     const auto = decideStreamMode(summary, ext);
     const mode = (requestedMode === 'direct' || requestedMode === 'remux') ? requestedMode : auto.mode;
 
