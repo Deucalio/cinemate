@@ -436,11 +436,21 @@ export class PlayerModalManager {
 
     video.addEventListener('waiting', () => {
       if (!this.currentMagnet) return;
-      this._showBufferingHUD(
-        'Buffering Stream...',
-        'The player has caught up with the download. Waiting for more of the file...'
-      );
-      // Stalling mid-playback is a download problem again — show the real numbers.
+
+      // What the player is waiting FOR depends on the delivery mode. Reporting a download stall
+      // while the HUD also says "100.0% downloaded" is a straight contradiction.
+      if (this.currentStreamMode === 'hls') {
+        this._showBufferingHUD(
+          'Waiting for the transcoder...',
+          'Playback has caught up with conversion. It will resume as more is converted.'
+        );
+      } else {
+        this._showBufferingHUD(
+          'Buffering Stream...',
+          'The player has caught up with the download. Waiting for more of the file...'
+        );
+      }
+
       this._startStatusPolling();
     });
 
@@ -1107,6 +1117,34 @@ export class PlayerModalManager {
     if (status.state === 'resolving') {
       if (bar) { bar.classList.add('is-indeterminate'); bar.style.width = ''; }
       if (stats) stats.style.display = 'none';
+      return;
+    }
+
+    // Once the download is done, the transcode is what the viewer is actually waiting on — so that
+    // is what the numbers should describe.
+    const transcode = status.transcode;
+    const showTranscode = Boolean(
+      transcode && transcode.state !== 'absent' && (status.ready || this.currentStreamMode === 'hls')
+    );
+
+    if (showTranscode) {
+      const percent = typeof transcode.progressPercent === 'number' ? transcode.progressPercent : 0;
+
+      if (bar) {
+        bar.classList.remove('is-indeterminate');
+        bar.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+      }
+
+      if (stats) stats.style.display = 'flex';
+      if (progressEl) progressEl.innerHTML = `<strong>${percent.toFixed(1)}%</strong> converted`;
+      if (speedEl) {
+        speedEl.innerHTML = transcode.transcodedDurationSec
+          ? `<strong>${this._formatDuration(transcode.transcodedDurationSec)}</strong> ready to watch`
+          : 'starting conversion...';
+      }
+      if (etaEl) {
+        etaEl.innerHTML = transcode.state === 'complete' ? 'conversion complete' : '';
+      }
       return;
     }
 

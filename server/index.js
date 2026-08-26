@@ -1526,12 +1526,15 @@ function validateHlsDirectory(dir, source) {
  * Builds the FFmpeg argument list. Separated out so it can be asserted without spawning anything —
  * the dev machine has no FFmpeg.
  */
-function buildHlsFfmpegArgs({ inputUrl, dir, copyVideo, copyAudio, segmentSeconds = HLS_SEGMENT_SECONDS }) {
+function buildHlsFfmpegArgs({ inputUrl, dir, copyVideo, copyAudio, isLocalFile = false,
+                              segmentSeconds = HLS_SEGMENT_SECONDS }) {
   const args = ['-hide_banner', '-loglevel', 'error'];
 
-  // Reading over loopback HTTP so FFmpeg can seek to the container header, and so the piece-aware
-  // reader can block while the download catches up.
-  args.push('-seekable', '1', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '10');
+  // The HTTP options only apply to the loopback reader, which is used while the source is still
+  // downloading. A complete file is opened directly — no reconnect logic, no per-chunk gating.
+  if (!isLocalFile) {
+    args.push('-seekable', '1', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '10');
+  }
   args.push('-i', inputUrl);
 
   args.push('-map', '0:v:0?', '-map', '0:a:0?');
@@ -1600,7 +1603,7 @@ function hlsStatus(hash, durationSec = 0) {
  * Idempotent by design: a second viewer joins the running job rather than starting another. This is
  * what retires the per-session FFmpeg supersede logic.
  */
-function startHlsJob({ hash, name, sourcePath, sourceStat, summary, inputUrl, copyVideo, copyAudio }) {
+function startHlsJob({ hash, name, sourcePath, sourceStat, summary, inputUrl, sourceComplete, copyVideo, copyAudio }) {
   const key = String(hash || '').toLowerCase();
 
   const existing = hlsJobs.get(key);
@@ -1616,7 +1619,7 @@ function startHlsJob({ hash, name, sourcePath, sourceStat, summary, inputUrl, co
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   fs.mkdirSync(dir, { recursive: true });
 
-  const args = buildHlsFfmpegArgs({ inputUrl, dir, copyVideo, copyAudio });
+  const args = buildHlsFfmpegArgs({ inputUrl, dir, copyVideo, copyAudio, isLocalFile: sourceComplete });
 
   const manifest = {
     version: HLS_MANIFEST_VERSION,
@@ -1663,7 +1666,7 @@ function startHlsJob({ hash, name, sourcePath, sourceStat, summary, inputUrl, co
   console.log(
     `[HLS] Transcoding "${name}" → ${dir} ` +
     `(video=${copyVideo ? 'copy' : 'libx264'} audio=${copyAudio ? 'copy' : 'aac-stereo'}, ` +
-    `${hlsJobs.size}/${HLS_MAX_CONCURRENT} slots)`
+    `input=${sourceComplete ? 'local-file' : 'loopback'}, ${hlsJobs.size}/${HLS_MAX_CONCURRENT} slots)`
   );
 
   proc.stderr.on('data', (d) => {
@@ -1711,7 +1714,7 @@ function startHlsJob({ hash, name, sourcePath, sourceStat, summary, inputUrl, co
  * Makes sure a usable HLS representation exists (or is being produced) for a title, and reports
  * where it has got to. Idempotent — safe to call on every prepare.
  */
-function ensureHlsRepresentation({ hash, name, sourcePath, summary, token, copyVideo, copyAudio }) {
+function ensureHlsRepresentation({ hash, name, sourcePath, summary, token, copyVideo, copyAudio, sourceComplete }) {
   const key = String(hash || '').toLowerCase();
   const dir = representationDir('hls', key);
 
@@ -1734,9 +1737,17 @@ function ensureHlsRepresentation({ hash, name, sourcePath, summary, token, copyV
   let sourceStat = null;
   try { sourceStat = fs.statSync(sourcePath); } catch {}
 
+  // Against a COMPLETE source, FFmpeg reads the file directly.
+  //
+  // The loopback endpoint exists so FFmpeg can block while pieces are still arriving. On a finished
+  // file that is pure overhead: every 256 KB chunk goes through piece verification and an HTTP
+  // round-trip, which for a 1.7 GB file is thousands of gated reads. The transcode then crawls, and
+  // playback — which starts after only 8 seconds of output — catches up and stalls repeatedly.
+  const inputUrl = sourceComplete ? sourcePath : internalUrlFor(token);
+
   const started = startHlsJob({
     hash: key, name, sourcePath, sourceStat, summary,
-    inputUrl: internalUrlFor(token), copyVideo, copyAudio
+    inputUrl, sourceComplete, copyVideo, copyAudio
   });
 
   const status = hlsStatus(key, summary ? summary.durationSec : 0);
@@ -2986,7 +2997,8 @@ app.get('/api/stream/prepare', checkRateLimit('stream', STREAM_RATE_LIMIT_PER_MI
         summary,
         token: prep.token,
         copyVideo: decision.copyVideo,
-        copyAudio: decision.copyAudio
+        copyAudio: decision.copyAudio,
+        sourceComplete: await isTorrentComplete(prep.matchedHash)
       });
 
       const durationSec = (summary && summary.durationSec) || hls.durationSec || 0;
